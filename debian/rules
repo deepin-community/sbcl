@@ -1,0 +1,93 @@
+#!/usr/bin/make -f
+
+include /usr/share/dpkg/default.mk
+
+export DH_VERBOSE=1
+
+# Try to build with clisp by default on archs for which sbcl has not yet been bootstrapped
+# (or with ecl if clisp is not available).
+# Those lists must be kept in sync with the Build-Depends field.
+# As soon as a new arch is bootstrapped, the lists should be updated.
+# See https://bugs.debian.org/954031
+ifeq (,$(filter amd64 arm64 armel armhf i386 kfreebsd-amd64 powerpc ppc64 ppc64el, $(DEB_HOST_ARCH)))
+ifneq (,$(filter riscv64 sh4, $(DEB_HOST_ARCH)))
+        BOOTSTRAPLISP := /usr/bin/ecl --norc
+else
+	BOOTSTRAPLISP := /usr/bin/clisp -norc
+endif
+endif
+
+ifeq (,$(BOOTSTRAPLISP))
+	BOOTSTRAPLISP := /usr/bin/sbcl --disable-debugger --no-sysinit --no-userinit
+endif
+
+# Fix architecture detection on ppc64, see #939453
+ifeq (ppc64,$(DEB_HOST_ARCH))
+	export SBCL_ARCH=ppc64
+endif
+
+FEATURES := --fancy
+
+ifneq (,$(filter amd64 i386, $(DEB_HOST_ARCH)))
+	FEATURES += --with-sb-linkable-runtime
+endif
+
+ifneq (,$(filter kfreebsd-%,$(DEB_HOST_ARCH)))
+	FEATURES += --with-os-provides-dlopen --with-sb-pthread-futex
+endif
+
+%:
+	dh $@
+
+override_dh_auto_configure:
+	# See doc/PACKAGING-SBCL.txt
+	echo "\"$(DEB_VERSION_UPSTREAM).debian\"" > version.lisp-expr
+
+override_dh_auto_build:
+	# Create stage 1
+	./make.sh --xc-host="$(BOOTSTRAPLISP)" --prefix=$(CURDIR)/stage1 $(FEATURES)
+	./install.sh
+	chmod 100 stage1 # Make stage 1 unreadable (only executable), to avoid messing with the stage 2
+	./clean.sh
+
+	# Create stage 2
+	./make.sh --xc-host="$(CURDIR)/stage1/bin/sbcl --disable-debugger --no-sysinit --no-userinit" --prefix=/usr $(FEATURES)
+
+	# Set the source location in core image
+	HOME="$(CURDIR)" src/runtime/sbcl --core output/sbcl.core --no-sysinit --no-userinit \
+                         --eval '(sb-ext:set-sbcl-source-location "/usr/share/sbcl-source/")' \
+	                 --eval '(sb-ext:save-lisp-and-die "output/sbcl.core")'
+
+	chmod 700 stage1 # Do not leave stage1 unreadable (to avoid FTBFS on some Ubuntu buildds)
+
+ifeq (,$(filter nodoc,$(DEB_BUILD_OPTIONS)))
+	make -C doc/internals all html
+	cd doc/manual && make docstrings && make
+endif
+
+# Run the testsuite, and fail on errors only on amd64, arm64 and i386
+override_dh_auto_test:
+	{ cd tests && ./run-tests.sh; } || { [ "$(DEB_HOST_ARCH)" != amd64 ] && [ "$(DEB_HOST_ARCH)" != arm64 ] && [ "$(DEB_HOST_ARCH)" != i386 ]; }
+
+override_dh_auto_clean:
+	-chmod 700 stage1
+	rm -rf stage1
+	./clean.sh
+	rm -f version.lisp-expr
+
+override_dh_auto_install:
+	INSTALL_ROOT="$(CURDIR)/debian/tmp/usr" ./install.sh
+
+execute_after_dh_install-arch:
+	cp debian/binfmt debian/sbcl/usr/share/binfmts/sbcl
+
+execute_after_dh_install-indep:
+	find debian/sbcl-source/usr/share/sbcl-source -type f \( -name \*.fasl -or -name \*.o -or -name \*.log -or -name \*.so -or -name *.a -or -name a.out -or -name LICENSE -or -name COPYING \) -delete
+	rm -f debian/sbcl-source/usr/share/sbcl-source/src/runtime/sbcl \
+		debian/sbcl-source/usr/share/sbcl-source/src/runtime/sbcl.nm \
+		debian/sbcl-source/usr/share/sbcl-source/src/runtime/shrinkwrap-sbcl \
+		debian/sbcl-source/usr/share/sbcl-source/src/runtime/heap-reloc-test
+
+execute_before_dh_gencontrol:
+	# Add the FASL version of this release to substvars
+	HOME="$(CURDIR)" src/runtime/sbcl --core output/sbcl.core --no-sysinit --no-userinit --load "debian/fasl-version.lisp"

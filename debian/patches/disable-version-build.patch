@@ -1,0 +1,19 @@
+Description: Never try to recreate version-lisp.expr from git
+ Otherwise this could interfere with the version generation done from
+ debian/rules .
+Forwarded: not-needed
+Reviewed-by: Sébastien Villemot <sebastien@debian.org>
+Last-Update: 2018-04-07
+---
+This patch header follows DEP-3: http://dep.debian.net/deps/dep3/
+--- a/generate-version.sh
++++ b/generate-version.sh
+@@ -5,7 +5,7 @@ git_available_p() {
+     if ( command -v git >/dev/null && git describe >/dev/null 2>/dev/null && \
+        test -f `git rev-parse --show-toplevel`/run-sbcl.sh)
+     then
+-        echo "ok"
++        echo ""
+     else
+         echo ""
+     fi

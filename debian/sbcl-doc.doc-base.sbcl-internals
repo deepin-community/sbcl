@@ -1,0 +1,16 @@
+Document: sbcl-internals
+Title: SBCL Internals Manual
+Author: William Harold Newman
+Abstract: This manual describes the internals of SBCL
+Section: Programming
+
+Format: HTML
+Index: /usr/share/doc/sbcl/sbcl-internals/index.html
+Files: /usr/share/doc/sbcl/sbcl-internals/*.html
+
+Format: Info
+Index: /usr/share/info/sbcl-internals.info.gz
+Files: /usr/share/info/sbcl-internals.info*.gz
+
+Format: PDF
+Files: /usr/share/doc/sbcl/sbcl-internals.pdf.gz

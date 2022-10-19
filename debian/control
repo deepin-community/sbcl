@@ -1,0 +1,91 @@
+Source: sbcl
+Maintainer: Debian Common Lisp Team <debian-common-lisp@lists.debian.org>
+Uploaders: Peter Van Eynde <pvaneynd@debian.org>,
+           Christoph Egger <christoph@debian.org>,
+           Sébastien Villemot <sebastien@debian.org>
+Section: lisp
+Priority: optional
+Build-Depends: debhelper-compat (= 13),
+               debhelper (>= 12.8~),
+# Arch list to keep in sync with debian/rules
+               clisp [!amd64 !arm64 !armel !armhf !i386 !kfreebsd-amd64 !powerpc !ppc64 !ppc64el !riscv64 !sh4],
+               ecl [riscv64 sh4],
+               sbcl [amd64 arm64 armel armhf i386 kfreebsd-amd64 powerpc ppc64 ppc64el],
+               sbcl-source,
+               texinfo,
+               zlib1g-dev,
+               texlive-extra-utils,
+               texlive,
+               graphviz,
+               ghostscript,
+               texlive-plain-generic,
+               texlive-font-utils,
+               cm-super-minimal,
+               time,
+               netbase,
+               ed,
+               strace [!kfreebsd-amd64 !kfreebsd-i386]
+Standards-Version: 4.6.0
+Vcs-Browser: https://salsa.debian.org/common-lisp-team/sbcl
+Vcs-Git: https://salsa.debian.org/common-lisp-team/sbcl.git
+Homepage: http://www.sbcl.org
+Rules-Requires-Root: no
+
+Package: sbcl
+Architecture: any
+Depends: ${shlibs:Depends},
+         ${misc:Depends}
+Recommends: binfmt-support
+Suggests: sbcl-doc,
+          sbcl-source,
+          slime
+Breaks: cl-asdf (<< 2:3.3.3-4~),
+        cl-cffi (<< 1:0.22.1-1~),
+        cl-nibbles (<< 20210520.gitdad2524-1~)
+Provides: lisp-compiler,
+          ${sbcl:fasl-version}
+Description: Common Lisp compiler and development system
+ SBCL is a development environment for the ANSI Common Lisp language.
+ It provides a native-code compiler and an integrated debugger, as well
+ as all the features in the ANSI specification.
+ .
+ SBCL also contains other extensions to the ANSI specification, including
+ a foreign-function interface, a pseudo-server API, user-extensible
+ stream functionality, a Meta-Object Protocol, and an ability to run
+ external processes.
+ .
+ To browse SBCL source definitions with development environments,
+ install the sbcl-source package. For documentation on SBCL's usage
+ and internals, the package sbcl-doc is provided.
+
+Package: sbcl-doc
+Architecture: all
+Multi-Arch: foreign
+Section: doc
+Depends: ${misc:Depends}
+Description: Documentation for Steel Bank Common Lisp
+ This package provides documentation for SBCL -- a development
+ environment for the ANSI Common Lisp language.
+ .
+ The documents in this package cover SBCL-specific extensions to the
+ language, explain how to use this Common Lisp implementation and how
+ it differs from the ANSI standard.
+ .
+ The manual about SBCL's internals is also included in this package
+ and may be of interest for people who intent to work with SBCL's
+ source code.
+
+Package: sbcl-source
+Architecture: all
+Multi-Arch: foreign
+Depends: ${misc:Depends}
+Description: Source code files for SBCL
+ This package provides the source code for SBCL -- a development
+ environment for the ANSI Common Lisp language.
+ .
+ The source code is useful in conjunction with development
+ environments and debuggers like SLIME, that allow macro expansion and
+ lookup of source definitions.
+ .
+ Installing this package enables your source browser to dig deeply
+ into the core of Steel Bank Common Lisp.

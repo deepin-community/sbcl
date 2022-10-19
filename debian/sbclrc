@@ -1,0 +1,3 @@
+;;; -*- lisp -*-
+;;; System-wide startup file for sbcl
+

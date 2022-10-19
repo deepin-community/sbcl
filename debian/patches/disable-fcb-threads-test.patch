@@ -1,0 +1,24 @@
+Description: Disable a test in fcb-threads.impure on all architectures
+ This test randomly fails on i386 and arm64:
+ https://buildd.debian.org/status/fetch.php?pkg=sbcl&arch=arm64&ver=2%3A2.0.10-1&stamp=1604935633&raw=0
+ https://buildd.debian.org/status/fetch.php?pkg=sbcl&arch=i386&ver=2%3A2.0.11-1&stamp=1606727478&raw=0
+ https://buildd.debian.org/status/fetch.php?pkg=sbcl&arch=i386&ver=2%3A2.0.11-1&stamp=1606722457&raw=0
+ https://buildd.debian.org/status/fetch.php?pkg=sbcl&arch=i386&ver=2%3A2.0.11-1&stamp=1606686960&raw=0
+ https://buildd.debian.org/status/fetch.php?pkg=sbcl&arch=i386&ver=2%3A2.0.11-1&stamp=1606686960&raw=0
+Author: Sébastien Villemot <sebastien@debian.org>
+Bug: https://bugs.launchpad.net/sbcl/+bug/1907252
+Last-Update: 2020-12-09
+---
+This patch header follows DEP-3: http://dep.debian.net/deps/dep3/
+--- a/tests/fcb-threads.impure.lisp
++++ b/tests/fcb-threads.impure.lisp
+@@ -142,7 +142,8 @@
+   (setq *print-greetings-and-salutations* nil))
+ 
+ (with-test (:name :call-me-from-many-threads-and-gc
+-            :skipped-on (or :interpreter (and :x86 :win32)))
++            :skipped-on (or :interpreter (and :x86 :win32))
++            :broken-on :sbcl)
+   ;; two trials, 5 threads, 40 calls each
+   (f 2 5 40 t)
+   ;; one trial, 10 threads, 10 calls

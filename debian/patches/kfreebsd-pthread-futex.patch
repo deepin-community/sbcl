@@ -1,0 +1,28 @@
+Description: Fix build on kfreebsd-*
+Author: Christoph Egger <christoph@debian.org>
+Forwarded: no
+Last-Update: 2018-04-07
+---
+This patch header follows DEP-3: http://dep.debian.net/deps/dep3/
+--- a/src/runtime/Config.x86-64-gnu-kfreebsd
++++ b/src/runtime/Config.x86-64-gnu-kfreebsd
+@@ -19,6 +19,6 @@ OS_LIBS += -lutil -ldl -Wl,-no-as-needed
+ 
+ # use libthr (1:1 threading).  libpthread (m:n threading) does not work.
+ ifdef LISP_FEATURE_SB_THREAD
+-  #OS_LIBS += -lpthread
+-  OS_LIBS += -lthr
++  OS_LIBS += -lpthread
++  #OS_LIBS += -lthr
+ endif
+--- a/src/runtime/thread.c
++++ b/src/runtime/thread.c
+@@ -706,7 +706,7 @@ static void attach_os_thread(init_thread
+ # else
+     pthread_attr_t attr;
+     pthread_attr_init(&attr);
+-#   if defined LISP_FEATURE_FREEBSD || defined LISP_FEATURE_DRAGONFLY
++#   if (defined LISP_FEATURE_FREEBSD || defined LISP_FEATURE_DRAGONFLY) && !defined(__GLIBC__)
+     pthread_attr_get_np(th->os_thread, &attr);
+ #   else
+     int pthread_getattr_np(pthread_t, pthread_attr_t *);

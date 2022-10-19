@@ -1,0 +1,26 @@
+Description: Fix chill.test.sh in the Debian-specific context
+ chill.test.sh loads src/cold/chill.lisp, which itself loads
+ src/compiler/vop-existsp.lisp, but using the SYS logical pathname host.
+ This fails at build time because debian/rules has initialized the SYS logical
+ host to /usr/share/sbcl-source/ in the Lisp image (and this will also break
+ in the autopkgtest because the sbcl-source package is not installed there).
+ .
+ This patch therefore switches back the SYS logical host to the current build
+ directory.
+Author: Sébastien Villemot <sebastien@debian.org>
+Forwarded: not-needed
+Last-Update: 2021-08-25
+---
+This patch header follows DEP-3: http://dep.debian.net/deps/dep3/
+--- a/tests/chill.test.sh
++++ b/tests/chill.test.sh
+@@ -4,7 +4,8 @@ set -e
+ cd .. # for package-data-list
+ # The function SB-C:LOCATION-NUMBER does not get defined for all backends,
+ # and may get dropped by the tree shaker.
+-run_sbcl --load src/cold/chill.lisp \
++run_sbcl --eval "(sb-ext:set-sbcl-source-location \"$SBCL_PWD/..\")" \
++  --load src/cold/chill.lisp \
+   --eval '(assert (eq :external (nth-value 1 (find-symbol "LOCATION-NUMBER" "SB-C"))))' \
+   --quit
+ 

@@ -1,0 +1,12 @@
+build-features.lisp-expr
+src/runtime/Config
+contrib/sb-bsd-sockets/foo.c
+contrib/sb-posix/foo.c
+doc/manual/variables.texinfo
+customize-target-features.lisp
+src/runtime/ldso-stubs.S
+doc/internals/sbcl-internals.cps
+whitespace-stamp
+doc/manual/version.html
+src/runtime/sbcl.mk
+tests/last-random-state.lisp-expr

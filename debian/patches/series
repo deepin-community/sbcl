@@ -1,0 +1,8 @@
+kfreebsd-pthread-futex.patch
+disable-version-build.patch
+testsuite-homedir.patch
+armhf-is-not-v5.patch
+disable-timer-test.patch
+skip-some-autopkgtests.patch
+disable-fcb-threads-test.patch
+fix-chill-test.patch

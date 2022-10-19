@@ -1,0 +1,45 @@
+Description: Skip some tests when run with autopkgtest
+ - elfcore.test.sh and relocation.test.sh need to rebuild either libsbcl.a or
+   shrinkwrap-sbcl, which can’t easily be done within autopkgtest.
+ - run-sbcl.test.sh does not make sense in an autopkgtest context, since its
+   purpose is to test a not-yet-installed sbcl binary.
+Author: Sébastien Villemot <sebastien@debian.org>
+Forwarded: not-needed
+Last-Update: 2021-08-25
+---
+This patch header follows DEP-3: http://dep.debian.net/deps/dep3/
+--- a/tests/elfcore.test.sh
++++ b/tests/elfcore.test.sh
+@@ -23,7 +23,7 @@ run_sbcl --noinform <<EOF
+  (exit :code 2) ; otherwise
+ EOF
+ status=$?
+-if [ $status != 0 ]; then # test can't be executed
++if [ $status != 0 ] || [ -n "${AUTOPKGTEST_TMP:-}" ]; then # test can't be executed
+     # we don't have a way to exit shell tests with "inapplicable" as the result
+     exit $EXIT_TEST_WIN
+ fi
+--- a/tests/relocation.test.sh
++++ b/tests/relocation.test.sh
+@@ -6,7 +6,7 @@
+ # FIXME: This test _should_ work on any architecture, but it doesn't,
+ #        so there must have been a regression in the heap relocator.
+ run_sbcl --eval '(exit :code (or #+linux 0 1))'
+-if [ $? -eq 1 ]
++if [ $? -eq 1 ] || [ -n "${AUTOPKGTEST_TMP:-}" ]
+ then
+     # shell tests don't have a way of exiting as "not applicable"
+     exit $EXIT_TEST_WIN
+--- a/tests/run-sbcl.test.sh
++++ b/tests/run-sbcl.test.sh
+@@ -1,5 +1,10 @@
+ set -e
+ 
++if [ -n "${AUTOPKGTEST_TMP:-}" ]
++then
++    exit $EXIT_TEST_WIN
++fi
++
+ . ./subr.sh
+ 
+ # run-sbcl.sh's pathname munging turns out always to have been

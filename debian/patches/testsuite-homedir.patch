@@ -1,0 +1,27 @@
+Description: Fix tests that check homedir attributes
+ When building Debian packages, the variable HOME may be set to a nonexistent
+ directory (see Policy §9.2.3).
+ .
+ In order to avoid test failures at build time, this patch replaces HOME by /tmp
+ in two tests.
+Author: Sébastien Villemot <sebastien@debian.org>
+Forwarded: not-needed
+Last-Update: 2017-12-12
+---
+This patch header follows DEP-3: http://dep.debian.net/deps/dep3/
+--- a/tests/filesys.pure.lisp
++++ b/tests/filesys.pure.lisp
+@@ -282,11 +282,11 @@
+ 
+ (with-test (:name (file-author stringp))
+   #-win32
+-  (assert (stringp (file-author (user-homedir-pathname))))
++  (assert (stringp (file-author #p"/tmp")))
+   #+win32
+   (assert (not (file-author (user-homedir-pathname)))))
+ (with-test (:name (file-write-date integerp))
+-  (assert (integerp (file-write-date (user-homedir-pathname)))))
++  (assert (integerp (file-write-date #p"/tmp"))))
+ 
+ ;;; Generated with
+ ;;; (loop for exist in '(nil t)

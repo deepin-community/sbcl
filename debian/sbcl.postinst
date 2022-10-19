@@ -1,0 +1,13 @@
+#! /bin/sh
+# postinst script for sbcl
+set -e
+
+if [ "$1" = "configure" ] && command -v update-binfmts >/dev/null; then
+    update-binfmts --import sbcl || true
+fi
+
+#DEBHELPER#
+
+exit 0
+
+

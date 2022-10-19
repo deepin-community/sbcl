@@ -1,0 +1,5 @@
+usr/bin/sbcl
+usr/lib/sbcl/
+usr/share/man/man1/sbcl.1
+debian/sbclrc /etc
+debian/sbcl-run /usr/lib/sbcl

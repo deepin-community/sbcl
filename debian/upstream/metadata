@@ -1,0 +1,7 @@
+Archive: SourceForge
+Repository: git://git.code.sf.net/p/sbcl/sbcl
+Repository-Browse: https://sourceforge.net/p/sbcl/sbcl/ci/master/tree/
+Bug-Database: https://bugs.launchpad.net/sbcl
+Bug-Submit: https://bugs.launchpad.net/sbcl/+filebug
+Documentation: http://sbcl.org/manual/index.html
+Changelog: http://sbcl.org/all-news.html

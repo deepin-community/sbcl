@@ -1,0 +1,20 @@
+Description: Disable a test in timer.impure on all architectures
+ Upstream disabled it on i386, but it also fails randomly on amd64 and arm64.
+ (e.g. on arm64: https://ci.debian.net/data/autopkgtest/testing/arm64/s/sbcl/4152499/log.gz)
+Author: Sébastien Villemot <sebastien@debian.org>
+Bug: https://bugs.launchpad.net/sbcl/+bug/1221339
+Bug-Debian: https://bugs.debian.org/919806
+Last-Update: 2020-02-05
+---
+This patch header follows DEP-3: http://dep.debian.net/deps/dep3/
+--- a/tests/timer.impure.lisp
++++ b/tests/timer.impure.lisp
+@@ -271,7 +271,7 @@
+ 
+ (with-test (:name (:timer :threaded-stress)
+             :skipped-on (not :sb-thread)
+-            :broken-on :x86
++            :broken-on :sbcl
+             :fails-on :win32)
+   #+win32
+   (error "fixme")

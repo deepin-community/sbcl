@@ -1,0 +1,20 @@
+Description: Do not enforce armv5 on armhf
+ gcc-9 deprecates armv5. Also, this should give a better optimized binary for
+ the armhf port.
+Author: Sébastien Villemot <sebastien@debian.org>
+Bug: https://bugs.launchpad.net/sbcl/+bug/1839783
+Bug-Debian: https://bugs.debian.org/931795
+Last-Update: 2019-08-12
+---
+This patch header follows DEP-3: http://dep.debian.net/deps/dep3/
+--- a/src/runtime/Config.arm-linux
++++ b/src/runtime/Config.arm-linux
+@@ -9,7 +9,7 @@
+ # provided with absolutely no warranty. See the COPYING and CREDITS
+ # files for more information.
+ 
+-CFLAGS += -marm -march=armv5
++CFLAGS += -marm
+ 
+ ASSEM_SRC = arm-assem.S
+ ARCH_SRC = arm-arch.c
