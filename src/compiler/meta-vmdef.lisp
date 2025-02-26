@@ -218,9 +218,7 @@
        (/show "doing !DEF-PRIMITIVE-TYPE" ,(string name))
        (assert (not (gethash ',name *backend-primitive-type-names*)))
        (setf (gethash ',name *backend-primitive-type-names*)
-             (make-primitive-type :name ',name
-                                  :scs ',scns
-                                  :specifier ',type))
+             (make-primitive-type ',name ',scns ',type))
        (/show0 "done with !DEF-PRIMITIVE-TYPE")
        ',name)))
 
@@ -260,7 +258,7 @@
   ;; This is only meaningful in :ARGUMENT and :TEMPORARY operands.
   (target nil :type (or symbol null) :read-only t)
   ;; TEMP is a temporary that holds the TN-REF for this operand.
-  (temp (make-operand-parse-temp) :type symbol :read-only t)
+  (temp (make-operand-parse-temp) :type symbol)
   ;; the time that this operand is first live and the time at which it
   ;; becomes dead again. These are TIME-SPECs, as returned by
   ;; PARSE-TIME-SPEC.
@@ -276,7 +274,8 @@
   ;; this operand is allowed into. If NIL, there is no restriction.
   (scs nil :type (or symbol list) :read-only t)
   ;; If non-null, we are a temp wired to this offset in SC.
-  (offset nil :type (or unsigned-byte null) :read-only t))
+  (offset nil :type (or unsigned-byte null) :read-only t)
+  (unused-if nil))
 (declaim (freeze-type operand-parse))
 
 (defun operand-parse-sc (parse) ; Enforce a single symbol
@@ -341,10 +340,9 @@
   (save-p nil :type (member t nil :compute-only :force-to-stack))
   ;; info about how to emit MOVE-ARG VOPs for the &MORE operand in
   ;; call/return VOPs
-  (move-args nil :type (member nil :local-call :full-call :known-return))
-  (args-var '.args. :type symbol)
-  (results-var '.results. :type symbol)
-  (before-load :unspecified :type (or (member :unspecified) list)))
+  (move-args nil :type (member nil :local-call :full-call :known-return :fixed))
+  (before-load :unspecified :type (or (member :unspecified) list))
+  (gc-barrier nil))
 (declaim (freeze-type vop-parse))
 (defprinter (vop-parse)
   name
@@ -372,9 +370,9 @@
 ;;; The list of slots in the structure, not including the OPERANDS slot.
 ;;; Order here is insignificant; it happens to be alphabetical.
 (defglobal vop-parse-slot-names
-    '(arg-types args args-var before-load body conditional-p cost guard ignores info-args inherits
+    '(arg-types args before-load body conditional-p cost gc-barrier guard ignores info-args inherits
       ltn-policy more-args more-results move-args name node-var note optional-results result-types
-      results results-var save-p source-location temps translate variant variant-vars vop-var))
+      results save-p source-location temps translate variant variant-vars vop-var))
 ;; A sanity-check. Of course if this fails, the likelihood is that you can't even
 ;; get this far in cross-compilaion. So it's probably not worth much.
 (eval-when (#+sb-xc :compile-toplevel)
@@ -624,34 +622,36 @@
 (defun find-move-funs (op load-p)
   (collect ((funs))
     (dolist (sc-name (operand-parse-scs op))
-      (let* ((sc (sc-or-lose sc-name))
-             (scn (sc-number sc))
-             (load-scs (append (when load-p
-                                 (sc-constant-scs sc))
-                               (sc-alternate-scs sc))))
-        (cond
-         (load-scs
-          (dolist (alt load-scs)
-            (unless (member (sc-name alt) (operand-parse-scs op) :test #'eq)
-              (let* ((altn (sc-number alt))
-                     (name (if load-p
-                               (svref (sc-move-funs sc) altn)
-                               (svref (sc-move-funs alt) scn)))
-                     (found (or (assoc alt (funs) :test #'member)
-                                (rassoc name (funs)))))
-                (unless name
-                  (error "no move function defined to ~:[save~;load~] SC ~S ~
+      (unless (or (consp sc-name)
+                  (getf *backend-cond-scs* sc-name))
+        (let* ((sc (sc-or-lose sc-name))
+               (scn (sc-number sc))
+               (load-scs (append (when load-p
+                                   (sc-constant-scs sc))
+                                 (sc-alternate-scs sc))))
+          (cond
+            (load-scs
+             (dolist (alt load-scs)
+               (unless (member (sc-name alt) (operand-parse-scs op) :test #'eq)
+                 (let* ((altn (sc-number alt))
+                        (name (if load-p
+                                  (svref (sc-move-funs sc) altn)
+                                  (svref (sc-move-funs alt) scn)))
+                        (found (or (assoc alt (funs) :test #'member)
+                                   (rassoc name (funs)))))
+                   (unless name
+                     (error "no move function defined to ~:[save~;load~] SC ~S ~
                           ~:[to~;from~] from SC ~S"
-                         load-p sc-name load-p (sc-name alt)))
-                (cond (found
-                       (pushnew alt (car found)))
-                      (t
-                       (funs (cons (list alt) name))))))))
-         ((member (sb-kind (sc-sb sc)) '(:non-packed :unbounded)))
-         (t
-          (error "SC ~S has no alternate~:[~; or constant~] SCs, yet it is~@
+                            load-p sc-name load-p (sc-name alt)))
+                   (cond (found
+                          (pushnew alt (car found)))
+                         (t
+                          (funs (cons (list alt) name))))))))
+            ((member (sb-kind (sc-sb sc)) '(:non-packed :unbounded)))
+            (t
+             (error "SC ~S has no alternate~:[~; or constant~] SCs, yet it is~@
                   mentioned in the restriction for operand ~S"
-                 sc-name load-p (operand-parse-name op))))))
+                    sc-name load-p (operand-parse-name op)))))))
     (funs)))
 
 ;;; Return a form to load/save the specified operand when it has a
@@ -726,8 +726,6 @@
 (defun make-generator-function (parse)
   (declare (type vop-parse parse))
   (let ((n-vop (vop-parse-vop-var parse))
-        (n-args (vop-parse-args-var parse))
-        (n-results (vop-parse-results-var parse))
         (operands (vop-parse-operands parse))
         (n-info (gensym)) (n-variant (gensym))
         (dummy (gensym)))
@@ -753,14 +751,13 @@
           ((:more-argument :more-result))))
 
       `(named-lambda (vop ,(vop-parse-name parse)) (,n-vop)
-         (let* ((,n-args (vop-args ,n-vop))
-                (,n-results (vop-results ,n-vop))
-                ,@(access-operands (vop-parse-args parse)
+         (declare (ignorable ,n-vop))
+         (let* (,@(access-operands (vop-parse-args parse)
                                    (vop-parse-more-args parse)
-                                   n-args)
+                                   `(vop-args ,n-vop))
                 ,@(access-operands (vop-parse-results parse)
                                    (vop-parse-more-results parse)
-                                   n-results)
+                                   `(vop-results ,n-vop))
                 ,@(access-operands (vop-parse-temps parse) nil
                                    `(vop-temps ,n-vop))
                 ,@(when (vop-parse-info-args parse)
@@ -779,24 +776,66 @@
                 ,@(binds))
            (declare (ignore ,@(vop-parse-ignores parse)
                             ,@(and (neq (vop-parse-before-load parse) :unspecified)
-                                   `(,dummy)))
-                    (ignorable ,n-args ,n-results))
+                                   `(,dummy))))
            ,@(loads)
            ;; RETURN-FROM can exit the ASSEMBLE while continuing on with saves.
            (block ,(vop-parse-name parse)
              (assemble ()
                ,@(vop-parse-body parse)))
            ,@(saves))))))
+
+(defun make-after-sc-function (parse)
+  (let ((unused-temps
+          (remove-if-not #'operand-parse-unused-if
+                         (vop-parse-temps parse))))
+    (when unused-temps
+      (let* ((n-vop (vop-parse-vop-var parse))
+             (n-info (gensym))
+             (n-variant (gensym))
+             (bindings
+               `(,@(access-operands (vop-parse-args parse)
+                                    (vop-parse-more-args parse)
+                                    `(vop-args ,n-vop))
+                 ,@(access-operands (vop-parse-results parse)
+                                    (vop-parse-more-results parse)
+                                    `(vop-results ,n-vop))
+                 ,@(and unused-temps
+                        (access-operands (vop-parse-temps parse) nil
+                                         `(vop-temps ,n-vop)))
+                 ,@(when (vop-parse-info-args parse)
+                     `((,n-info (vop-codegen-info ,n-vop))
+                       ,@(mapcar (lambda (x) `(,x (pop ,n-info)))
+                                 (vop-parse-info-args parse))))
+                 ,@(when (vop-parse-variant-vars parse)
+                     `((,n-variant (vop-info-variant (vop-info ,n-vop)))
+                       ,@(mapcar (lambda (x) `(,x (pop ,n-variant)))
+                                 (vop-parse-variant-vars parse))))
+                 ,@(loop for op in (vop-parse-operands parse)
+                         when
+                         (ecase (operand-parse-kind op)
+                           ((:argument :result)
+                            `(,(operand-parse-name op)
+                              (tn-ref-tn ,(operand-parse-temp op))))
+                           (:temporary
+                            (and (operand-parse-unused-if op)
+                                 `(,(operand-parse-name op)
+                                   (tn-ref-tn ,(operand-parse-temp op)))))
+                           ((:more-argument :more-result)))
+                         collect it))))
+        `(lambda (,n-vop)
+           (let* ,bindings
+             (declare (ignorable ,@(mapcar #'car bindings)))
+             ,@(loop for op in unused-temps
+                     collect `(when ,(operand-parse-unused-if op)
+                                (setf (tn-kind ,(operand-parse-name op)) :unused)))))))))
 
 (defvar *parse-vop-operand-count*)
 (defun make-operand-parse-temp ()
-  (without-package-locks
-   (intern (format nil "OPERAND-PARSE-TEMP-~D" *parse-vop-operand-count*)
-           #.(find-package "SB-C"))))
+  (symbolicate! #.(find-package "SB-C") "OPERAND-PARSE-TEMP-"
+                *parse-vop-operand-count*))
 (defun make-operand-parse-load-tn ()
-  (without-package-locks
-   (intern (format nil "OPERAND-PARSE-LOAD-TN-~D" *parse-vop-operand-count*)
-           #.(find-package "SB-C"))))
+  (symbolicate! #.(find-package "SB-C")
+                "OPERAND-PARSE-LOAD-TN-" *parse-vop-operand-count*))
 
 ;;; Given a list of operand specifications as given to DEFINE-VOP,
 ;;; return a list of OPERAND-PARSE structures describing the fixed
@@ -933,6 +972,7 @@
                (unless (= (length scs) 1)
                  (error "must specify exactly one SC for a temporary"))
                (setf value (first scs))))
+            (:unused-if)
             (t
              (error "unknown temporary option: ~S" opt)))
           (setf (getf res key) value)))
@@ -968,19 +1008,27 @@
 
 ;;; the top level parse function: clobber PARSE to represent the
 ;;; specified options.
-(defun parse-define-vop (parse specs)
+(defun parse-define-vop (parse specs inherits)
   (declare (type vop-parse parse) (list specs))
-  (let ((*parse-vop-operand-count* (compute-parse-vop-operand-count parse)))
+  (let ((*parse-vop-operand-count* (compute-parse-vop-operand-count parse))
+        args-p
+        results-p
+        arg-refs
+        arg-refs-p
+        result-refs
+        result-refs-p)
     (dolist (spec specs)
       (unless (consp spec)
         (error "malformed option specification: ~S" spec))
       (case (first spec)
         (:args
+         (setf args-p t)
          (multiple-value-bind (fixed more)
              (parse-vop-operands parse (rest spec) :argument)
            (setf (vop-parse-args parse) fixed)
            (setf (vop-parse-more-args parse) more)))
         (:results
+         (setf results-p t)
          (multiple-value-bind (fixed more)
              (parse-vop-operands parse (rest spec) :result)
            (setf (vop-parse-results parse) fixed)
@@ -994,8 +1042,8 @@
         (:temporary
          (parse-temporary spec parse))
         (:generator
-            (setf (vop-parse-cost parse)
-                  (vop-spec-arg spec 'unsigned-byte 1 nil))
+         (setf (vop-parse-cost parse)
+               (vop-spec-arg spec 'unsigned-byte 1 nil))
          (setf (vop-parse-body parse) (cddr spec)))
         (:before-load
          (setf (vop-parse-before-load parse) (cdr spec)))
@@ -1016,14 +1064,16 @@
          (setf (vop-parse-cost parse) (vop-spec-arg spec 'unsigned-byte)))
         (:vop-var
          (setf (vop-parse-vop-var parse) (vop-spec-arg spec 'symbol)))
-        (:args-var
-         (setf (vop-parse-args-var parse) (vop-spec-arg spec 'symbol)))
-        (:results-var
-         (setf (vop-parse-results-var parse) (vop-spec-arg spec 'symbol)))
+        (:arg-refs
+         (setf arg-refs-p t
+               arg-refs (cdr spec)))
+        (:result-refs
+         (setf result-refs-p t
+               result-refs (cdr spec)))
         (:move-args
          (setf (vop-parse-move-args parse)
                (vop-spec-arg spec '(member nil :local-call :full-call
-                                    :known-return))))
+                                    :known-return :fixed))))
         (:node-var
          (setf (vop-parse-node-var parse) (vop-spec-arg spec 'symbol)))
         (:note
@@ -1044,8 +1094,8 @@
         ;; architecture, since the renaming would be a change to the
         ;; interface between
         (:policy
-         (setf (vop-parse-ltn-policy parse)
-               (vop-spec-arg spec 'ltn-policy)))
+            (setf (vop-parse-ltn-policy parse)
+                  (vop-spec-arg spec 'ltn-policy)))
         (:save-p
          (setf (vop-parse-save-p parse)
                (vop-spec-arg spec
@@ -1054,8 +1104,40 @@
          (setf (vop-parse-optional-results parse)
                (append (vop-parse-optional-results parse)
                        (rest spec))))
+        (:gc-barrier
+         (setf (vop-parse-gc-barrier parse) (rest spec)))
         (t
          (error "unknown option specifier: ~S" (first spec)))))
+    (cond (arg-refs-p
+           (loop with refs = arg-refs
+                 for arg in (if args-p
+                                (vop-parse-args parse)
+                                (setf (vop-parse-args parse)
+                                      (mapcar #'copy-structure (vop-parse-args parse))))
+                 for ref = (pop refs)
+                 when ref
+                 do (setf (operand-parse-temp arg) ref)))
+          ((and inherits
+                args-p)
+           (loop for inherited-arg in (vop-parse-args inherits)
+                 for arg in (vop-parse-args parse)
+                 do (setf (operand-parse-temp arg)
+                          (operand-parse-temp inherited-arg)))))
+    (cond (result-refs-p
+           (loop with refs = result-refs
+                 for result in (if results-p
+                                (vop-parse-results parse)
+                                (setf (vop-parse-results parse)
+                                      (mapcar #'copy-structure (vop-parse-results parse))))
+                 for ref = (pop refs)
+                 when ref
+                 do (setf (operand-parse-temp result) ref)))
+          ((and inherits
+                results-p)
+           (loop for inherited-result in (vop-parse-results inherits)
+                 for result in (vop-parse-results parse)
+                 do (setf (operand-parse-temp result)
+                          (operand-parse-temp inherited-result)))))
     (values)))
 
 ;;;; making costs and restrictions
@@ -1072,50 +1154,70 @@
   (declare (type operand-parse op))
   (let ((scs (operand-parse-scs op))
         (costs (make-array sb-vm:sc-number-limit :initial-element nil))
-        (load-scs (make-array sb-vm:sc-number-limit :initial-element nil)))
+        (load-scs (make-array sb-vm:sc-number-limit :initial-element nil))
+        (cond-scs))
     (dolist (sc-name (reverse scs))
-      (let* ((load-sc (sc-or-lose sc-name))
-             (load-scn (sc-number load-sc)))
-        (setf (svref costs load-scn) 0)
-        (setf (svref load-scs load-scn) t)
-        (dolist (op-sc (append (when load-p
-                                 (sc-constant-scs load-sc))
-                               (sc-alternate-scs load-sc)))
-          (let* ((op-scn (sc-number op-sc))
-                 (load (if load-p
-                           (aref (sc-load-costs load-sc) op-scn)
-                           (aref (sc-load-costs op-sc) load-scn))))
-            (unless load
-              (error "no move function defined to move ~:[from~;to~] SC ~
+      (let ((load-sc (gethash sc-name *backend-sc-names*)))
+        (cond (load-sc
+               (let* ((load-scn (sc-number load-sc)))
+                 (setf (svref costs load-scn) 0)
+                 (setf (svref load-scs load-scn) t)
+                 (dolist (op-sc (append (when load-p
+                                          (sc-constant-scs load-sc))
+                                        (sc-alternate-scs load-sc)))
+                   (let* ((op-scn (sc-number op-sc))
+                          (load (if load-p
+                                    (aref (sc-load-costs load-sc) op-scn)
+                                    (aref (sc-load-costs op-sc) load-scn))))
+                     (unless load
+                       (error "no move function defined to move ~:[from~;to~] SC ~
                       ~S~%~:[to~;from~] alternate or constant SC ~S"
-                     load-p sc-name load-p (sc-name op-sc)))
+                              load-p sc-name load-p (sc-name op-sc)))
 
-            (let ((op-cost (svref costs op-scn)))
-              (when (or (not op-cost) (< load op-cost))
-                (setf (svref costs op-scn) load)))
+                     (let ((op-cost (svref costs op-scn)))
+                       (when (or (not op-cost) (< load op-cost))
+                         (setf (svref costs op-scn) load)))
 
-            (let ((op-load (svref load-scs op-scn)))
-              (unless (eq op-load t)
-                (pushnew load-scn (svref load-scs op-scn))))))
+                     (let ((op-load (svref load-scs op-scn)))
+                       (unless (eq op-load t)
+                         (pushnew load-scn (svref load-scs op-scn))))))
 
-        (dotimes (i sb-vm:sc-number-limit)
-          (unless (svref costs i)
-            (let ((op-sc (svref *backend-sc-numbers* i)))
-              (when op-sc
-                (let ((cost (if load-p
-                                (svref (sc-move-costs load-sc) i)
-                                (svref (sc-move-costs op-sc) load-scn))))
-                  (when cost
-                    (setf (svref costs i) cost)))))))))
+                 (dotimes (i sb-vm:sc-number-limit)
+                   (unless (svref costs i)
+                     (let ((op-sc (svref *backend-sc-numbers* i)))
+                       (when op-sc
+                         (let ((cost (if load-p
+                                         (svref (sc-move-costs load-sc) i)
+                                         (svref (sc-move-costs op-sc) load-scn))))
+                           (when cost
+                             (setf (svref costs i) cost)))))))))
+              ((let ((cond-sc (getf *backend-cond-scs* sc-name)))
+                 (when cond-sc
+                   (push cond-sc cond-scs))))
+              ((consp sc-name)
+               (push sc-name cond-scs))
+              (t
+               (error "~S is not a defined storage class." sc-name)))))
 
-    (values costs load-scs)))
+    (values costs load-scs
+            (loop for (cond-sc . test) in cond-scs
+                  collect
+                  (let* ((load-sc (sc-or-lose cond-sc))
+                         (load-scn (sc-number load-sc)))
+                    `(setf (svref load-scs ,load-scn)
+                           ,(if (symbolp test)
+                                `(,test ',(svref load-scs load-scn))
+                                `(lambda (tn)
+                                   (if (progn ,@test)
+                                       t
+                                       ',(svref load-scs load-scn))))))))))
 
 (defconstant-eqx +no-costs+
-    #.(make-array sb-vm:sc-number-limit :initial-element 0)
+  (make-array sb-vm:sc-number-limit :initial-element 0)
   #'equalp)
 
 (defconstant-eqx +no-loads+
-    #.(make-array sb-vm:sc-number-limit :initial-element t)
+  (make-array sb-vm:sc-number-limit :initial-element t)
   #'equalp)
 
 ;;; Pick off the case of operands with no restrictions.
@@ -1127,38 +1229,49 @@
 
 (defun compute-costs-and-restrictions-list (ops load-p)
   (declare (list ops))
-  (collect ((costs)
-            (scs))
-    (dolist (op ops)
-      (multiple-value-bind (costs scs) (compute-loading-costs-if-any op load-p)
-        (costs costs)
-        (scs scs)))
-    (values (costs) (scs))))
+  (let ((fixups))
+   (collect ((costs)
+             (scs))
+     (dolist (op ops)
+       (multiple-value-bind (costs scs fixup) (compute-loading-costs-if-any op load-p)
+         (costs costs)
+         (cond (fixup
+                (setf fixups t)
+                (scs `(let ((load-scs (vector ,@(loop for sc across scs
+                                                      collect `',sc))))
+                        ,@fixup
+                        load-scs)))
+               (t
+                (scs scs)))))
+     (values (costs) (scs) fixups))))
 
 (defun make-costs-and-restrictions (parse)
-  (multiple-value-bind (arg-costs arg-scs)
+  (multiple-value-bind (arg-costs arg-scs fixups)
       (compute-costs-and-restrictions-list (vop-parse-args parse) t)
     (multiple-value-bind (result-costs result-scs)
         (compute-costs-and-restrictions-list (vop-parse-results parse) nil)
-      `(
-        :cost ,(vop-parse-cost parse)
+      (multiple-value-bind (more-arg-costs more-arg-scs)
+          (and (vop-parse-more-args parse)
+               (compute-loading-costs-if-any (vop-parse-more-args parse) t))
+          `(:cost ,(vop-parse-cost parse)
 
-        :arg-costs ',arg-costs
-        :arg-load-scs ',arg-scs
-        :result-costs ',result-costs
-        :result-load-scs ',result-scs
+            :arg-costs ',arg-costs
+            :arg-load-scs ,(if fixups
+                               `(list ,@arg-scs)
+                               `',arg-scs)
+            :result-costs ',result-costs
+            :result-load-scs ',result-scs
 
-        :more-arg-costs
-        ',(if (vop-parse-more-args parse)
-              (compute-loading-costs-if-any (vop-parse-more-args parse) t)
-              nil)
+            :more-arg-costs ',more-arg-costs
+            :more-arg-load-scs ',(unless (eq more-arg-costs +no-costs+)
+                                   (substitute-if nil #'listp more-arg-scs))
 
-        :more-result-costs
-        ',(if (vop-parse-more-results parse)
-              (compute-loading-costs-if-any (vop-parse-more-results parse) nil)
-              nil)
-        :optional-results ',(loop for name in (vop-parse-optional-results parse)
-                                collect (position name (vop-parse-results parse) :key #'operand-parse-name))))))
+            :more-result-costs
+            ',(if (vop-parse-more-results parse)
+                  (compute-loading-costs-if-any (vop-parse-more-results parse) nil)
+                  nil)
+            :optional-results ',(loop for name in (vop-parse-optional-results parse)
+                                      collect (position name (vop-parse-results parse) :key #'operand-parse-name)))))))
 
 ;;;; operand checking and stuff
 
@@ -1239,9 +1352,16 @@
         (unless (or (eq type '*)
                     (dolist (ptype ptypes nil)
                       (when (sc-allowed-by-primitive-type
-                             (sc-or-lose sc)
+                             (or (gethash (if (consp sc)
+                                              (car sc)
+                                              sc)
+                                          *backend-sc-names*)
+                                 (sc-or-lose (car (getf *backend-cond-scs* sc)))
+                                 (error "~S is not a defined storage class." sc))
                              (primitive-type-or-lose ptype))
-                        (return t))))
+                        (return t)))
+                    #+arm64
+                    (eq sc 'sb-vm::zero))
           (warn "~:[Result~;Argument~] ~A to VOP ~S~@
                  has SC restriction ~S which is ~
                  not allowed by the operand type:~%  ~S"
@@ -1409,7 +1529,10 @@
                     it
                     `(lambda (node) (declare (ignore node)) ,it)))
       :note ',(vop-parse-note parse)
-      :info-arg-count ,(length (vop-parse-info-args parse))
+      :info-arg-count ,(- (length (vop-parse-info-args parse))
+                          (if (vop-parse-gc-barrier parse)
+                              1
+                              0))
       :ltn-policy ',(vop-parse-ltn-policy parse)
       :save-p ',(vop-parse-save-p parse)
       :move-args ',(vop-parse-move-args parse)
@@ -1420,7 +1543,11 @@
                (equal (vop-parse-body parse) (vop-parse-body iparse)))
           (unless (eq (vop-parse-body parse) :unspecified)
             (make-generator-function parse)))
-      :variant (list ,@variant))))
+      :variant (list ,@variant)
+      :after-sc-selection
+      ;; TODO: inherit it?
+      ,(make-after-sc-function parse)
+      :gc-barrier ',(vop-parse-gc-barrier parse))))
 
 ;;; Define the symbol NAME to be a Virtual OPeration in the compiler.
 ;;; If specified, INHERITS is the name of a VOP that we default
@@ -1582,6 +1709,9 @@
 ;;;     Indicates if and how the more args should be moved into a
 ;;;     different frame.
 (defmacro define-vop ((&optional name inherits) &body specs)
+  (%define-vop name inherits specs t))
+
+(defun %define-vop (name inherits specs set)
   (declare (type symbol name))
   ;; Parse the syntax into a VOP-PARSE structure, and then expand into
   ;; code that creates the appropriate VOP-INFO structure at load time.
@@ -1597,11 +1727,12 @@
       (let ((clause (assoc :translate specs)))
         (when (singleton-p (cdr clause))
           (setf name (cadr clause)))))
-    (aver (typep name '(and symbol (not null))))
-    (setf (vop-parse-name parse) name)
+    (when set
+      (aver (typep name '(and symbol (not null))))
+      (setf (vop-parse-name parse) name))
     (setf (vop-parse-inherits parse) inherits)
 
-    (parse-define-vop parse specs)
+    (parse-define-vop parse specs inherited-parse)
     (set-vop-parse-operands parse)
     (check-operand-types parse
                          (vop-parse-args parse)
@@ -1613,79 +1744,183 @@
                          (vop-parse-more-results parse)
                          (vop-parse-result-types parse)
                          nil)
-    `(progn
-       (eval-when (:compile-toplevel)
-         (setf (gethash ',name *backend-parsed-vops*) ',parse))
-       (register-vop-parse
-        ,@(macrolet
-              ((quotify-slots ()
-                 (collect ((forms))
-                   (dolist (x vop-parse-slot-names (cons 'list (forms)))
-                     (let ((reader (package-symbolicate (sb-xc:symbol-package 'vop-parse)
-                                                        "VOP-PARSE-" x)))
-                       (forms
-                        (case x
-                          (source-location ''(source-location))
-                          ((temps args results) `(quotify-list (,reader parse)))
-                          ((more-args more-results) `(quotify (,reader parse)))
-                          (t `(list 'quote (,reader parse))))))))))
-            (labels ((quotify (operand-or-nil)
-                       (when operand-or-nil
-                         (list 'quote (quotify-1 operand-or-nil))))
-                     (quotify-list (operands)
-                       (list 'quote (mapcar #'quotify-1 operands)))
-                     (quotify-1 (x) ; Return everything except the KIND, quoted
-                       `(,(operand-parse-name x)
-                         ,(operand-parse-target x) ,(operand-parse-temp x)
-                         ,(operand-parse-born x) ,(operand-parse-dies x)
-                         ,(operand-parse-load-tn x) ,(operand-parse-load x)
-                         ,(operand-parse-scs x) ,(operand-parse-offset x))))
-              (quotify-slots))))
-       ,@(unless (eq (vop-parse-body parse) :unspecified)
-           `((let ((,n-res ,(set-up-vop-info inherited-parse parse)))
-               (store-vop-info ,n-res)
-               ,@(set-up-fun-translation parse n-res))))
-       ',name)))
+    (if set
+        `(progn
+           (eval-when (:compile-toplevel)
+             (setf (gethash ',name *backend-parsed-vops*) ',parse))
+           (register-vop-parse
+            ,@(macrolet
+                  ((quotify-slots ()
+                     (collect ((forms))
+                       (dolist (x vop-parse-slot-names (cons 'list (forms)))
+                         (let ((reader (package-symbolicate (sb-xc:symbol-package 'vop-parse)
+                                                            "VOP-PARSE-" x)))
+                           (forms
+                            (case x
+                              (source-location ''(source-location))
+                              ((temps args results) `(quotify-list (,reader parse)))
+                              ((more-args more-results) `(quotify (,reader parse)))
+                              (t `(list 'quote (,reader parse))))))))))
+                (labels ((quotify (operand-or-nil)
+                           (when operand-or-nil
+                             (list 'quote (quotify-1 operand-or-nil))))
+                         (quotify-list (operands)
+                           (list 'quote (mapcar #'quotify-1 operands)))
+                         (quotify-1 (x) ; Return everything except the KIND, quoted
+                           `(,(operand-parse-name x)
+                             ,(operand-parse-target x) ,(operand-parse-temp x)
+                             ,(operand-parse-born x) ,(operand-parse-dies x)
+                             ,(operand-parse-load-tn x) ,(operand-parse-load x)
+                             ,(operand-parse-scs x) ,(operand-parse-offset x))))
+                  (quotify-slots))))
+           ,@(unless (eq (vop-parse-body parse) :unspecified)
+               `((let ((,n-res ,(set-up-vop-info inherited-parse parse)))
+                   (store-vop-info ,n-res)
+                   ,@(set-up-fun-translation parse n-res))))
+           ',name)
+        `(let ((info ,(set-up-vop-info inherited-parse parse)))
+           (setf (vop-info-type info)
+                 (specifier-type (template-type-specifier info)))
+           info))))
+
+;;; (inline-vop
+;;;     (((param unsigned-reg unsigned-num :to :save) arg)
+;;;      ((temp unsigned-reg unsigned-num))
+;;;      ((temp2))) ;; will reuse the previous specifications
+;;;     ((result unsigned-reg unsigned-num))
+;;;   (inst x result temp param))
+(defmacro inline-vop (vars results &body body)
+  (collect ((input)
+            (args)
+            (arg-types)
+            (infos)
+            (temps)
+            (results)
+            (result-types))
+    (flet ((sc-to-primtype (sc)
+             (case sc
+               (sb-vm::any-reg
+                'fixnum)
+               (sb-vm::unsigned-reg
+                'sb-vm::unsigned-num)
+               (sb-vm::signed-reg
+                'sb-vm::signed-num)
+               (sb-vm::sap-reg
+                'system-area-pointer)
+               (sb-vm::descriptor-reg
+                t)
+               (sb-vm::single-reg
+                'single-float)
+               (sb-vm::double-reg
+                'double-float)
+               (sb-vm::complex-double-reg
+                'complex-double-float)
+               (sb-vm::complex-single-reg
+                'complex-single-float)
+               (t
+                '*)))
+           (primtype-to-type (type)
+             (case type
+               (sb-vm::unsigned-num
+                'word)
+               (sb-vm::signed-num
+                'sb-vm:signed-word)
+               (sb-vm::tagged-num
+                'fixnum)
+               (complex-double-float
+                '(complex double-float))
+               (complex-single-float
+                '(complex single-float))
+               (* t)
+               (t (primitive-type-specifier (primitive-type-or-lose type))))))
+      (loop for (var arg) in vars
+            for (name this-sc) = var
+            for (nil sc type . rest) = (if this-sc
+                                           var
+                                           prev)
+            for prev = (if this-sc
+                           var
+                           prev)
+            do (cond ((eq name :info)
+                      (infos this-sc)
+                      (input arg))
+                     (arg
+                      (args (list* name :scs (list sc) rest))
+                      (let ((type (or type (sc-to-primtype sc))))
+                        (arg-types type)
+                        (input `(the ,(primtype-to-type type) ,arg))))
+                     (t
+                      (temps `(:temporary (:sc ,sc ,@rest)
+                                          ,name)))))
+      (loop for result in results
+            for (name this-sc) = result
+            for (nil sc type . rest) = (if this-sc
+                                           result
+                                           prev)
+            for prev = (if this-sc
+                           result
+                           prev)
+            do (results (list* name :scs (list sc) rest))
+               (result-types (or type (sc-to-primtype sc))))
+      `(truly-the
+        (values ,@(mapcar #'primtype-to-type (result-types)) &optional)
+        (inline-%primitive
+         ,(eval (%define-vop nil nil
+                             (delete nil
+                                     (list* (and (args)
+                                                 (list* :args (args)))
+                                            (and (arg-types)
+                                                 (list* :arg-types (arg-types)))
+                                            (and (results)
+                                                 (list* :results (results)))
+                                            (and (result-types)
+                                                 (list* :result-types (result-types)))
+                                            (and (infos)
+                                                 (list* :info (infos)))
+                                            (list* :generator 0 body)
+                                            (temps)))
+                             nil))
+         ,@(input))))))
 
 (macrolet
-   ((def ()
-     `(defun register-vop-parse ,vop-parse-slot-names
-       ;; Try to share each OPERAND-PARSE structure with a similar existing one.
-       (labels ((share-list (operand-specs accessor kind)
-                  (let ((new (mapcar (lambda (x) (share x kind)) operand-specs)))
-                    (dohash ((key parse) *backend-parsed-vops* :result new)
-                      (declare (ignore key))
-                      (when (equal (funcall accessor parse) new)
-                        (return (funcall accessor parse))))))
-                (share (operand-spec kind)
-                  ;; OPERAND-PARSE structures are immutable. Scan all vops for one
-                  ;; with an operand matching OPERAND-SPEC, and use that if found.
-                  (destructuring-bind (name targ temp born dies load-tn load scs offs)
-                      operand-spec
-                    (let ((op (make-operand-parse
-                               :name name :kind kind :target targ :temp temp
-                               :born born :dies dies :load-tn load-tn :load load
-                               :scs scs :offset offs)))
-                      (dohash ((key parse) *backend-parsed-vops* :result op)
-                        (declare (ignore key))
-                        (awhen (find op (vop-parse-operands parse) :test #'operand=)
-                          (return it))))))
-                (operand= (a b)
-                  ;; EQUALP is too weak a comparator for arbitrary sexprs,
-                  ;; since (EQUALP "foo" #(#\F #\O #\O)) is T, not that
-                  ;; we expect such weirdness in the LOAD-IF expression.
-                  (and (equal (operand-parse-load a) (operand-parse-load b))
-                       (equalp a b))))
-         (setq temps (share-list temps #'vop-parse-temps :temporary)
-               args (share-list args #'vop-parse-args :argument)
-               results (share-list results #'vop-parse-results :result))
-         (when more-args (setq more-args (share more-args :more-argument)))
-         (when more-results (setq more-results (share more-results :more-result))))
-       (let ((parse
-              (make-vop-parse ,@(mapcan (lambda (x) (list (keywordicate x) x))
-                                        vop-parse-slot-names))))
-         (set-vop-parse-operands parse)
-         (setf (gethash name *backend-parsed-vops*) parse)))))
+    ((def ()
+       `(defun register-vop-parse ,vop-parse-slot-names
+          ;; Try to share each OPERAND-PARSE structure with a similar existing one.
+          (labels ((share-list (operand-specs accessor kind)
+                     (let ((new (mapcar (lambda (x) (share x kind)) operand-specs)))
+                       (dohash ((key parse) *backend-parsed-vops* :result new)
+                         (declare (ignore key))
+                         (when (equal (funcall accessor parse) new)
+                           (return (funcall accessor parse))))))
+                   (share (operand-spec kind)
+                     ;; OPERAND-PARSE structures are immutable. Scan all vops for one
+                     ;; with an operand matching OPERAND-SPEC, and use that if found.
+                     (destructuring-bind (name targ temp born dies load-tn load scs offs)
+                         operand-spec
+                       (let ((op (make-operand-parse
+                                  :name name :kind kind :target targ :temp temp
+                                  :born born :dies dies :load-tn load-tn :load load
+                                  :scs scs :offset offs)))
+                         (dohash ((key parse) *backend-parsed-vops* :result op)
+                           (declare (ignore key))
+                           (awhen (find op (vop-parse-operands parse) :test #'operand=)
+                             (return it))))))
+                   (operand= (a b)
+                     ;; EQUALP is too weak a comparator for arbitrary sexprs,
+                     ;; since (EQUALP "foo" #(#\F #\O #\O)) is T, not that
+                     ;; we expect such weirdness in the LOAD-IF expression.
+                     (and (equal (operand-parse-load a) (operand-parse-load b))
+                          (equalp a b))))
+            (setq temps (share-list temps #'vop-parse-temps :temporary)
+                  args (share-list args #'vop-parse-args :argument)
+                  results (share-list results #'vop-parse-results :result))
+            (when more-args (setq more-args (share more-args :more-argument)))
+            (when more-results (setq more-results (share more-results :more-result))))
+          (let ((parse
+                  (make-vop-parse ,@(mapcan (lambda (x) (list (keywordicate x) x))
+                                            vop-parse-slot-names))))
+            (set-vop-parse-operands parse)
+            (setf (gethash name *backend-parsed-vops*) parse)))))
   (def))
 
 (defun store-vop-info (vop-info)
@@ -1780,12 +2015,18 @@
     (let ((n-head nil)
           (n-prev nil))
       (dolist (op fixed)
-        (let ((n-ref (gensym)))
-          (binds `(,n-ref (reference-tn ,op ,write-p)))
-          (if n-prev
-              (forms `(setf (tn-ref-across ,n-prev) ,n-ref))
-              (setq n-head n-ref))
-          (setq n-prev n-ref)))
+        (multiple-value-bind (op lvar)
+            (if (typep op '(cons (eql :lvar)))
+                (values (third op) (second op))
+                op)
+          (let ((n-ref (gensym)))
+            (binds `(,n-ref (reference-tn ,op ,write-p)))
+            (when lvar
+              (forms `(setf (tn-ref-type ,n-ref) (lvar-type ,lvar))))
+            (if n-prev
+                (forms `(setf (tn-ref-across ,n-prev) ,n-ref))
+                (setq n-head n-ref))
+            (setq n-prev n-ref))))
 
       (when more
         (let ((n-more (gensym)))
@@ -1822,10 +2063,13 @@
   (let* ((parse (vop-parse-or-lose name))
          (arg-count (length (vop-parse-args parse)))
          (result-count (length (vop-parse-results parse)))
-         (info-count (length (vop-parse-info-args parse)))
+         (info-count (- (length (vop-parse-info-args parse))
+                        (if (vop-parse-gc-barrier parse)
+                            1
+                            0)))
          (noperands (+ arg-count result-count info-count))
-         (n-node (sb-xc:gensym))
-         (n-block (sb-xc:gensym))
+         (n-node (gensym))
+         (n-block (gensym))
          (n-template (gensym)))
 
     (when (or (vop-parse-more-args parse) (vop-parse-more-results parse))
@@ -1842,7 +2086,7 @@
         (collect ((ibinds)
                   (ivars))
           (dolist (info (subseq operands arg-count (+ arg-count info-count)))
-            (let ((temp (sb-xc:gensym)))
+            (let ((temp (gensym)))
               (ibinds `(,temp ,info))
               (ivars temp)))
 
@@ -1884,7 +2128,7 @@
          (fixed-args (butlast args))
          (fixed-results (butlast results))
          (n-node (gensym))
-         (n-block (sb-xc:gensym))
+         (n-block (gensym))
          (n-template (gensym)))
 
     (unless (or (vop-parse-more-args parse)
@@ -1999,17 +2243,18 @@
                    (when (and ,tn-var (not (eq ,tn-var :more)))
                      (,bod ,tn-var)))))))))))
 
-;;; Iterate over all the IR2 blocks in PHYSENV, in emit order.
-(defmacro do-physenv-ir2-blocks ((block-var physenv &optional result)
-                                 &body body)
-  (once-only ((n-physenv physenv))
-    (once-only ((n-first `(lambda-block (physenv-lambda ,n-physenv))))
+;;; Iterate over all the IR2 blocks in the environment ENV, in emit
+;;; order.
+(defmacro do-environment-ir2-blocks ((block-var env &optional result)
+                                     &body body)
+  (once-only ((n-env env))
+    (once-only ((n-first `(lambda-block (environment-lambda ,n-env))))
       (once-only ((n-tail `(block-info
                             (component-tail
                              (block-component ,n-first)))))
         `(do ((,block-var (block-info ,n-first)
                           (ir2-block-next ,block-var)))
              ((or (eq ,block-var ,n-tail)
-                  (not (eq (ir2-block-physenv ,block-var) ,n-physenv)))
+                  (not (eq (ir2-block-environment ,block-var) ,n-env)))
               ,result)
            ,@body)))))

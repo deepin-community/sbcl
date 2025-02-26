@@ -45,18 +45,20 @@ evaluated expressions.
 " #'equal)
 
 (defun %inspect (*inspected* s)
-  (named-let redisplay () ; "LAMBDA, the ultimate GOTO":-|
-    (multiple-value-bind (description named-p elements)
-        (inspected-parts *inspected*)
-      (tty-display-inspected-parts description named-p elements s)
-      (named-let reread ()
-        (format s "~&> ")
-        (force-output)
-        (let* (;; newly-consed object for hermetic protection against
-               ;; mischievous input like #.*EOF-OBJECT*:
-               (eof (cons *eof-object* nil))
-               (command (read *standard-input* nil eof)))
-          (when (eq command eof)
+  (let ((*print-vector-length* 1000)
+        (*print-length* 100))
+   (named-let redisplay ()            ; "LAMBDA, the ultimate GOTO":-|
+     (multiple-value-bind (description named-p elements)
+         (inspected-parts *inspected*)
+       (tty-display-inspected-parts description named-p elements s)
+       (named-let reread ()
+         (format s "~&> ")
+         (force-output)
+         (let* (;; newly-consed object for hermetic protection against
+                ;; mischievous input like #.*EOF-OBJECT*:
+                (eof (cons *eof-object* nil))
+                (command (read *standard-input* nil eof)))
+           (when (eq command eof)
              ;; currently-undocumented feature: EOF is handled as Q.
              ;; If there's ever consensus that this is *the* right
              ;; thing to do (as opposed to e.g. handling it as U), we
@@ -64,45 +66,45 @@ evaluated expressions.
              ;; do this than to signal an error.
              (/show0 "THROWing QUIT-INSPECT for EOF")
              (throw 'quit-inspect nil))
-          (typecase command
-            (integer
-             (let ((elements-length (length elements)))
-               (cond ((< -1 command elements-length)
-                      (let* ((element (nth command elements))
-                             (value (if named-p (cdr element) element)))
-                        (cond ((eq value sb-pcl:+slot-unbound+)
-                               (format s "~%That slot is unbound.~%")
-                               (return-from %inspect (reread)))
-                              (t
-                               (%inspect value s)
-                               ;; If we ever return, then we should be
-                               ;; looking at *INSPECTED* again.
-                               (return-from %inspect (redisplay))))))
-                     ((zerop elements-length)
-                      (format s "~%The object contains nothing to inspect.~%")
-                      (return-from %inspect (reread)))
-                     (t
-                      (format s "~%Enter a valid index (~:[0-~W~;0~]).~%"
-                              (= elements-length 1) (1- elements-length))
-                      (return-from %inspect (reread))))))
-            (symbol
-             (case (find-symbol (symbol-name command) *keyword-package*)
-               ((:q :e)
-                (/show0 "THROWing QUIT-INSPECT for :Q or :E")
-                (throw 'quit-inspect nil))
-               (:u
-                (return-from %inspect))
-               (:r
-                (return-from %inspect (redisplay)))
-               ((:h :? :help)
-                (write-string +help-for-inspect+ s)
-                (return-from %inspect (reread)))
-               (t
-                (eval-for-inspect command s)
-                (return-from %inspect (reread)))))
-            (t
-             (eval-for-inspect command s)
-             (return-from %inspect (reread)))))))))
+           (typecase command
+             (integer
+              (let ((elements-length (length elements)))
+                (cond ((< -1 command elements-length)
+                       (let* ((element (nth command elements))
+                              (value (if named-p (cdr element) element)))
+                         (cond ((eq value sb-pcl:+slot-unbound+)
+                                (format s "~%That slot is unbound.~%")
+                                (return-from %inspect (reread)))
+                               (t
+                                (%inspect value s)
+                                ;; If we ever return, then we should be
+                                ;; looking at *INSPECTED* again.
+                                (return-from %inspect (redisplay))))))
+                      ((zerop elements-length)
+                       (format s "~%The object contains nothing to inspect.~%")
+                       (return-from %inspect (reread)))
+                      (t
+                       (format s "~%Enter a valid index (~:[0-~W~;0~]).~%"
+                               (= elements-length 1) (1- elements-length))
+                       (return-from %inspect (reread))))))
+             (symbol
+              (case (find-symbol (symbol-name command) *keyword-package*)
+                ((:q :e)
+                 (/show0 "THROWing QUIT-INSPECT for :Q or :E")
+                 (throw 'quit-inspect nil))
+                (:u
+                 (return-from %inspect))
+                (:r
+                 (return-from %inspect (redisplay)))
+                ((:h :? :help)
+                 (write-string +help-for-inspect+ s)
+                 (return-from %inspect (reread)))
+                (t
+                 (eval-for-inspect command s)
+                 (return-from %inspect (reread)))))
+             (t
+              (eval-for-inspect command s)
+              (return-from %inspect (reread))))))))))
 
 (defun eval-for-inspect (command stream)
   (let ((result-list (restart-case
@@ -116,7 +118,8 @@ evaluated expressions.
   (let ((*suppress-print-errors*
          (if (subtypep 'serious-condition *suppress-print-errors*)
              *suppress-print-errors*
-             'serious-condition)))
+             'serious-condition))
+        (unbound (load-time-value (make-unprintable-object "unbound slot") t)))
     (format stream "~%~A" description)
     (loop for element in elements
        for index from 0
@@ -124,10 +127,9 @@ evaluated expressions.
               (if named-p
                   (values (cdr element) (car element))
                   element)
-            (format stream "~W. ~@[~A: ~]~W~%"
-                    index name (if (eq value sb-pcl:+slot-unbound+)
-                                   "unbound"
-                                   value))))))
+            (when (unbound-marker-p value)
+              (setf value unbound))
+            (format stream "~W. ~@[~A: ~]~W~%" index name value)))))
 
 ;;;; INSPECTED-PARTS
 
@@ -165,12 +167,13 @@ evaluated expressions.
 
 (defun inspected-structure-elements (object)
   (let ((parts-list '())
-        (info (wrapper-info (sb-kernel:wrapper-of object))))
+        (info (layout-info (sb-kernel:layout-of object))))
     (when (sb-kernel::defstruct-description-p info)
       (dolist (dd-slot (dd-slots info) (nreverse parts-list))
-        (push (cons (dsd-name dd-slot)
-                    (funcall (dsd-accessor-name dd-slot) object))
-              parts-list)))))
+        (let* ((reader (dsd-reader dd-slot (neq (dd-type info) 'structure)))
+               (index (dsd-index dd-slot))
+               (value (funcall reader object index)))
+          (push (cons (dsd-name dd-slot) value) parts-list))))))
 
 (defmethod inspected-parts ((object structure-object))
   (values (format nil "The object is a STRUCTURE-OBJECT of type ~S.~%"
@@ -243,12 +246,14 @@ evaluated expressions.
 (defmethod inspected-parts ((object vector))
   (let ((length (min (length object) *inspect-length*)))
     (values (format nil
-                    "The object is a ~:[~;displaced ~]VECTOR of length ~W.~%"
+                    "The object is a ~:[~;displaced ~](VECTOR ~a) of length ~W.~%"
                     (and (array-header-p object)
                          (%array-displaced-p object))
+                    (array-element-type object)
                     (length object))
             nil
-            (coerce (subseq object 0 length) 'list))))
+            (unless (typep object '(simple-array nil))
+             (coerce (subseq object 0 length) 'list)))))
 
 (defun inspected-index-string (index rev-dimensions)
   (if (null rev-dimensions)
@@ -267,12 +272,13 @@ evaluated expressions.
                                       :displaced-to object))
          (dimensions (array-dimensions object))
          (reversed-elements nil))
-    (dotimes (i length)
-      (push (cons (format nil
-                          "~A "
-                          (inspected-index-string i (reverse dimensions)))
-                  (aref reference-array i))
-            reversed-elements))
+    (unless (typep object '(simple-array nil))
+      (dotimes (i length)
+        (push (cons (format nil
+                            "~A "
+                            (inspected-index-string i (reverse dimensions)))
+                    (aref reference-array i))
+              reversed-elements)))
     (values (format nil "The object is ~:[an~;a displaced~] ARRAY of ~A.~%~
                          Its dimensions are ~:S.~%"
                     (and (array-header-p object)

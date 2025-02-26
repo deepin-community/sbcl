@@ -41,10 +41,10 @@
     (:al . 14))
   #'equal)
 (defconstant-eqx +condition-name-vec+
-  #.(let ((vec (make-array 16 :initial-element nil)))
-      (dolist (cond +conditions+ vec)
-        (when (null (aref vec (cdr cond)))
-          (setf (aref vec (cdr cond)) (car cond)))))
+  (let ((vec (make-array 16 :initial-element nil)))
+    (dolist (cond +conditions+ vec)
+      (when (null (aref vec (cdr cond)))
+        (setf (aref vec (cdr cond)) (car cond)))))
   #'equalp)
 
 (defun conditional-opcode (condition)
@@ -1205,7 +1205,7 @@
   (:vop-var vop)
   (:emitter
    (emit-back-patch
-    segment 12
+    segment 16
     (lambda (segment position)
       (assemble (segment vop)
         ;; Calculate the address of the code component.  This is an
@@ -1221,11 +1221,9 @@
                                   other-pointer-lowtag)))
         ;; Next, we read the function header.
         (inst ldr temp (@ lip (- other-pointer-lowtag)))
+        (inst bic temp temp widetag-mask)
         ;; And finally we use the header value (a count in words),
-        ;; plus the fact that the top two bits of the widetag are
-        ;; clear (SIMPLE-FUN-WIDETAG is #x2A and
-        ;; RETURN-PC-WIDETAG is #x36) to compute the boxed
-        ;; address of the code component.
+        ;; to compute the boxed address of the code component.
         (inst sub code lip (lsr temp (- 8 word-shift))))))))
 
 ;;; Compute the address of a nearby LRA object by dead reckoning from
@@ -1789,13 +1787,15 @@
        (setf (sap-ref-32 sap offset) value))))
   nil)
 
-(define-instruction store-coverage-mark (segment path-index temp)
+(define-instruction store-coverage-mark (segment mark-index temp)
   (:emitter
    ;; No backpatch is needed to compute the offset into the code header
    ;; because COMPONENT-HEADER-LENGTH is known at this point.
    (let* ((offset (+ (component-header-length)
-                     n-word-bytes ; skip over jump table word
-                     path-index
+                     ;; skip over jump table word and entries
+                     (* (1+ (component-n-jump-table-entries))
+                        n-word-bytes)
+                     mark-index
                      (- other-pointer-lowtag)))
           (addr
            (@ sb-vm::code-tn

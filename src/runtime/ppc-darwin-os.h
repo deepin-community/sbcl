@@ -4,7 +4,6 @@
 #include "darwin-os.h"
 
 typedef unsigned int os_context_register_t;
-#include "arch-os-generic.inc"
 
 /* On OS X 10.5, the field names for the thread state have changed and
  * now are prepended with __. Use some #define hackery to deal with
@@ -23,5 +22,7 @@ typedef ppc_thread_state_t ppc_ss_struct_t;
 typedef ppc_saved_state_t ppc_ss_struct_t;
 
 #endif /* __DARWIN_UNIX03 */
+
+#define OS_CONTEXT_PC(context) context->uc_mcontext->PPC_DARWIN_REGIFY(ss).PPC_DARWIN_REGIFY(srr0)
 
 #endif /* _PPC_DARWIN_OS_H */

@@ -66,6 +66,12 @@
   (assert-error (upgraded-complex-part-type 'some-undef-type))
   (assert (subtypep (upgraded-complex-part-type 'fixnum) 'real)))
 
+(with-test (:name (upgraded-complex-part-type nil))
+  (assert (type-evidently-= 'nil (upgraded-complex-part-type nil))))
+
+(with-test (:name (upgraded-complex-part-type (eql 0)))
+  (assert (subtypep '(eql 0) (upgraded-complex-part-type '(eql 0)))))
+
 ;;; Do reasonable things with undefined types, and with compound types
 ;;; built from undefined types.
 (with-test (:name (typep :undefined :compound))
@@ -110,7 +116,11 @@
 ;;; bug 12: type system didn't grok nontrivial intersections
 (with-test (:name (subtypep and :bug-12))
   (assert-tri-eq t   t (subtypep '(and symbol (satisfies keywordp)) 'symbol))
+  ;; I'm not sure this next test was saying what it thinks it's saying.
   (assert-tri-eq nil t (subtypep '(and symbol (satisfies keywordp)) 'null))
+  (assert-tri-eq nil t (subtypep '(and symbol (satisfies keywordp)) 'nil))
+  ;; would be nice if this one could say T
+  (assert-tri-eq nil nil (subtypep '(satisfies keywordp) 'nil))
   (assert-tri-eq t   t (subtypep 'keyword 'symbol))
   (assert-tri-eq nil t (subtypep 'symbol 'keyword))
   (assert-tri-eq t   t (subtypep 'ratio 'real))
@@ -299,6 +309,14 @@
 (define-condition condition-foo2 (condition-foo1) ())
 (define-condition condition-foo3 (condition-foo2) ())
 (define-condition condition-foo4 (condition-foo3) ())
+(with-test (:name :add-subclassoid)
+  (flet ((has-subs (name n)
+           (= n (length (sb-kernel:classoid-subclasses
+                         (sb-kernel:find-classoid name))))))
+  (assert (has-subs 'condition-foo1 3)) ; has foo{2,3,4}
+  (assert (has-subs 'condition-foo2 2)) ; has foo{3,4}
+  (assert (has-subs 'condition-foo3 1)) ; has foo4
+  (assert (has-subs 'condition-foo4 0))))
 
 ;;; inline type tests
 (format t "~&/setting up *TESTS-OF-INLINE-TYPE-TESTS*~%")
@@ -583,7 +601,11 @@
                            '(or fixnum vector end-of-file parse-error fixnum simple-string))))
 
 (with-test (:name (subtypep function compiled-function :interpreted-function))
-  (assert-tri-eq t t (subtypep '(and function (not compiled-function)
+  (assert-tri-eq nil t (subtypep 'compiled-function nil)) ; lp#1537003
+  ;; It is no longer the case that COMPILED-FUNCTION and INTERPRETED-FUNCTION
+  ;; form an exhaustive partition of FUNCTION.
+  ;; CLHS: "Implementations are free to define other subtypes of FUNCTION"
+  (assert-tri-eq nil nil (subtypep '(and function (not compiled-function)
                                  (not sb-kernel:interpreted-function))
                                nil)))
 
@@ -922,32 +944,6 @@
                (sb-kernel:specifier-type `(or bit-vector ,@(u 1))))
               'vector)))))
 
-(with-test (:name :source-transform-union-of-arrays-typep)
-  ;; Ensure we don't pessimize rank 1 specialized array.
-  ;; (SIMPLE unboxed vector is done differently)
-  (let* ((hair (sb-kernel:specifier-type '(sb-kernel:unboxed-array 1)))
-         (xform (sb-c::source-transform-union-typep 'myobj hair)))
-    (assert (equal xform
-                   '(or (typep myobj
-                               '(and vector (not (array t)) (not (array nil))))))))
-
-  ;; Exclude one subtype at a time and make sure they all work.
-  (dotimes (i (length sb-vm:*specialized-array-element-type-properties*))
-    (let* ((excluded-type
-            (sb-vm:saetp-specifier
-             (aref sb-vm:*specialized-array-element-type-properties* i)))
-           (hair
-            (loop for x across sb-vm:*specialized-array-element-type-properties*
-                  for j from 0
-                  unless (eql i j)
-                  collect `(array ,(sb-vm:saetp-specifier x))))
-           (xform
-             (sb-c::source-transform-union-typep 'myobj
-             (sb-kernel:specifier-type `(or ,@(shuffle hair) fixnum)))))
-      (assert (equal xform
-                     `(or (typep myobj '(and array (not (array ,excluded-type))))
-                          (typep myobj 'fixnum)))))))
-
 (with-test (:name :interned-type-specifiers)
   ;; In general specifiers can repeatedly parse the same due to
   ;; the caching in VALUES-SPECIFIER-TYPE, provided that the entry
@@ -1023,3 +1019,20 @@
     (assert-tri-eq nil nil (sb-kernel:type= (sb-kernel:specifier-type 'float) unk))
     (assert-tri-eq nil nil (sb-kernel:type= (sb-kernel:specifier-type 'pathname) unk))
     (assert-tri-eq nil nil (sb-kernel:type= (sb-kernel:specifier-type 'sequence) unk))))
+
+(with-test (:name :lp-308938) ; got silently fixed in git rev ef8c95377a55
+  (multiple-value-bind (answer certain)
+      (subtypep '(or (satisfies x) string)
+                '(or (satisfies x) integer))
+    (assert (and (not answer) (not certain))))
+  (multiple-value-bind (answer certain)
+      (subtypep 'string '(or (satisfies x) integer))
+    (assert (and (not answer) (not certain)))))
+
+(deftype jn-even () '(and integer (or (eql 0) (satisfies f))))
+(deftype jn-odd () '(and integer (or (eql 1) (satisfies g))))
+(with-test (:name :lp-1528837) ; probably the same as the preceding fix
+  (multiple-value-bind (answer certain) (subtypep 'jn-odd 'jn-even)
+    (assert (and (not answer) (not certain))))
+  (multiple-value-bind (answer certain) (subtypep 'jn-even 'jn-odd)
+    (assert (and (not answer) (not certain)))))

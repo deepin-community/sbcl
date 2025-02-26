@@ -111,8 +111,8 @@
 
 ;;; If true, this is the node which is used as context in compiler warning
 ;;; messages.
-(declaim (type (or null compiler-error-context node
-                   lvar-annotation) *compiler-error-context*))
+(declaim (type (or list compiler-error-context node
+                   lvar-annotation ctran) *compiler-error-context*))
 (defvar *compiler-error-context* nil)
 
 ;;; a plist mapping macro names to source context parsers. Each parser
@@ -217,7 +217,10 @@
                 (when (and (>= (length name) 3) (string= name "DEF" :end1 3))
                   (context (source-form-context form))))))
           (when (null current) (return))
-          (setq form (nth (pop current) form)))
+         (let ((cons (nthcdr (pop current) form)))
+           (setq form (if (comma-p cons)
+                          (comma-expr cons)
+                          (car cons)))))
 
         (cond ((context)
                (values form (context)))
@@ -255,7 +258,13 @@
         (let* ((path (cond ((node-p context)
                             (node-source-path context))
                            ((lvar-annotation-p context)
-                            (lvar-annotation-source-path context))
+                            (let ((path (lvar-annotation-source-path context)))
+                             (if (typep path '(cons (eql detail)))
+                                 (third path)
+                                 path)))
+                           ((ctran-p context)
+                            (ctran-source-path context))
+                           ((consp context) context)
                            ((boundp '*current-path*)
                             *current-path*)))
                (old
@@ -277,9 +286,9 @@
                       :original-form form
                       :format-args args
                       :context src-context
-                      :file-name (if (symbolp (file-info-truename file-info)) ; :LISP or :STREAM
+                      :file-name (if (member (file-info-%truename file-info) '(:lisp :stream))
                                      ;; (pathname will be NIL in those two cases)
-                                     (file-info-truename file-info)
+                                     (file-info-%truename file-info)
                                      (file-info-pathname file-info))
                       :file-position
                       (nth-value 1 (find-source-root tlf *source-info*))
@@ -474,50 +483,12 @@ has written, having proved that it is unreachable."))
              (compiler-macro-application-missed-warning-count condition)
              (compiler-macro-application-missed-warning-function condition)))))
 
-(macrolet ((with-condition ((condition datum args) &body body)
-             (with-unique-names (block)
-               `(block ,block
-                  (let ((,condition
-                          (apply #'coerce-to-condition ,datum
-                                 'simple-compiler-note 'with-condition
-                                 ,args)))
-                    (restart-case
-                        (signal ,condition)
-                      (muffle-warning ()
-                        (return-from ,block (values))))
-                    ,@body
-                    (values))))))
-
-  (defun compiler-notify (datum &rest args)
-    (unless (if *compiler-error-context*
-              (policy *compiler-error-context* (= inhibit-warnings 3))
-              (policy *lexenv* (= inhibit-warnings 3)))
-      (with-condition (condition datum args)
-        (incf *compiler-note-count*)
-        (print-compiler-message
-         *error-output*
-         (format nil "note: ~~A")
-         (list (princ-to-string condition)))))
-    (values))
-
-  ;; Issue a note when we might or might not be in the compiler.
-  (defun maybe-compiler-notify (datum &rest args)
-    (if (boundp '*lexenv*) ; if we're in the compiler
-        (apply #'compiler-notify datum args)
-        (with-condition (condition datum args)
-          (let ((stream *error-output*))
-            (pprint-logical-block (stream nil :per-line-prefix ";")
-              (format stream " note: ~3I~_")
-              (pprint-logical-block (stream nil)
-                (format stream "~A" condition)))
-            ;; (outside logical block, no per-line-prefix)
-            (fresh-line stream))))))
-
 ;;; The politically correct way to print out progress messages and
 ;;; such like. We clear the current error context so that we know that
 ;;; it needs to be reprinted, and we also FORCE-OUTPUT so that the
 ;;; message gets seen right away.
 (defun compiler-mumble (control &rest args)
+  (declare (explicit-check))
   (let ((stream *standard-output*))
     (note-message-repeats stream)
     (setq *last-error-context* nil)
@@ -546,14 +517,6 @@ has written, having proved that it is unreachable."))
 
 ;;;; condition system interface
 
-;;; Keep track of how many times each kind of condition happens.
-(defvar *compiler-error-count*)
-(defvar *compiler-warning-count*)
-(defvar *compiler-style-warning-count*)
-(defvar *compiler-note-count*)
-
-(defvar *methods-in-compilation-unit*)
-
 ;;; Keep track of whether any surrounding COMPILE or COMPILE-FILE call
 ;;; should return WARNINGS-P or FAILURE-P.
 (defvar *failure-p*)
@@ -564,24 +527,67 @@ has written, having proved that it is unreachable."))
 ;;; counter and print the error message.
 (defun compiler-error-handler (condition)
   (signal condition)
-  (incf *compiler-error-count*)
+  (incf (cu-error-count *compilation-unit*))
   (setf *warnings-p* t
         *failure-p* t)
   (print-compiler-condition condition)
   (continue condition))
 (defun compiler-warning-handler (condition)
   (signal condition)
-  (incf *compiler-warning-count*)
+  (incf (cu-warning-count *compilation-unit*))
   (setf *warnings-p* t
         *failure-p* t)
   (print-compiler-condition condition)
   (muffle-warning condition))
 (defun compiler-style-warning-handler (condition)
   (signal condition)
-  (incf *compiler-style-warning-count*)
+  (incf (cu-style-warning-count *compilation-unit*))
   (setf *warnings-p* t)
   (print-compiler-condition condition)
   (muffle-warning condition))
+
+(macrolet ((with-condition ((condition datum args) &body body)
+             (with-unique-names (block)
+               `(block ,block
+                  (let ((,condition
+                          (apply #'coerce-to-condition ,datum
+                                 'simple-compiler-note 'with-condition
+                                 ,args)))
+                    (restart-case
+                        (signal ,condition)
+                      (muffle-warning ()
+                        (return-from ,block (values))))
+                    ,@body
+                    (values))))))
+
+  (defun compiler-notify (datum &rest args)
+    (unless (if *compiler-error-context*
+                (policy (if (ctran-p *compiler-error-context*)
+                            (ctran-next *compiler-error-context*)
+                            *compiler-error-context*)
+                    (= inhibit-warnings 3))
+                (policy *lexenv* (= inhibit-warnings 3)))
+      (with-condition (condition datum args)
+        (incf (cu-note-count *compilation-unit*))
+        (print-compiler-message
+         *error-output*
+         (format nil "note: ~~A")
+         (list (princ-to-string condition)))))
+    (values))
+
+  ;; Issue a note when we might or might not be in the compiler.
+  (defun maybe-compiler-notify (datum &rest args)
+    (if (boundp '*lexenv*) ; if we're in the compiler
+        (apply #'compiler-notify datum args)
+        (with-condition (condition datum args)
+          (let ((stream *error-output*))
+            (pprint-logical-block (stream nil :per-line-prefix ";")
+              (format stream " note: ~3I~_")
+              (pprint-logical-block (stream nil)
+                (format stream "~A" condition)))
+            ;; (outside logical block, no per-line-prefix)
+            (fresh-line stream))))))
+
 
 ;;;; undefined warnings
 
@@ -601,11 +607,14 @@ has written, having proved that it is unreachable."))
 ;;; the compiler, hence the BOUNDP check.
 (defun note-undefined-reference (name kind)
   #+sb-xc-host
-  ;; Allowlist functions are looked up prior to UNCROSS,
-  ;; so that we can distinguish CL:SOMEFUN from SB-XC:SOMEFUN.
-  (when (and (eq kind :function)
-             (gethash name sb-cold:*undefined-fun-allowlist*))
-    (return-from note-undefined-reference (values)))
+  (progn
+    ;; Allowlist functions are looked up prior to UNCROSS,
+    ;; so that we can distinguish CL:SOMEFUN from SB-XC:SOMEFUN.
+    (when (and (eq kind :function)
+               (gethash name sb-cold:*undefined-fun-allowlist*))
+      (return-from note-undefined-reference (values)))
+    (when (eq kind :variable)
+      (error "Ref to undefined variable ~S disallowed" name)))
   (setq name (uncross name))
   (unless (and
            ;; Check for boundness so we don't blow up if we're called
@@ -630,8 +639,8 @@ has written, having proved that it is unreachable."))
                (:variable (make-condition 'warning))
                ((:function :type) (make-condition 'style-warning))))))
     (let* ((found (dolist (warning *undefined-warnings* nil)
-                    (when (and (equal (undefined-warning-name warning) name)
-                               (eq (undefined-warning-kind warning) kind))
+                    (when (and (eq (undefined-warning-kind warning) kind)
+                               (equal (undefined-warning-name warning) name))
                       (return warning))))
            (res (or found
                     (make-undefined-warning :name name :kind kind))))
@@ -644,6 +653,12 @@ has written, having proved that it is unreachable."))
             (push context (undefined-warning-warnings res)))
           (incf (undefined-warning-count res))))))
   (values))
+
+(defun maybe-note-undefined-variable-reference (var name)
+  (when (and (global-var-p var)
+             (eq (global-var-kind var) :unknown)
+             (not (deprecated-thing-p 'variable name)))
+    (note-undefined-reference name :variable)))
 
 (defun note-key-arg-mismatch (name keys)
   (let* ((found (find name
@@ -699,7 +714,7 @@ has written, having proved that it is unreachable."))
 ;;
 (defun warn-if-compiler-macro-dependency-problem (name)
   (unless (compiler-macro-function name)
-    (let ((status (car (info :function :emitted-full-calls name)))) ; TODO use emitted-full-call-count?
+    (let ((status (get-emitted-full-calls name)))
       (when (and (integerp status) (oddp status))
         ;; Show the total number of calls, because otherwise the warning
         ;; would be worded rather obliquely: "N calls were compiled
@@ -718,7 +733,7 @@ has written, having proved that it is unreachable."))
 ;;
 (defun warn-if-inline-failed/proclaim (name new-inlinep)
   (when (eq new-inlinep 'inline)
-    (let ((warning-count (sb-impl::emitted-full-call-count name)))
+    (let ((warning-count (emitted-full-call-count name)))
       (when (and warning-count
                  ;; Warn only if the the compiler did not have the expansion.
                  (not (fun-name-inline-expansion name))
@@ -760,10 +775,10 @@ and defining the function before its first potential use.~@:>"
 ;; that intervening callers know it to be proclaimed inline, and would have
 ;; liked to have a definition, but didn't.
 ;;
-(defun warn-if-inline-failed/call (name lexenv count-cell)
+(defun warn-if-inline-failed/call (name lexenv count)
   ;; Do nothing if the inline expansion is known - it wasn't used
   ;; because of the expansion limit, which is a different problem.
-  (unless (or (logtest 2 (car count-cell)) ; warn at most once per name
+  (unless (or (logtest 2 count) ; warn at most once per name
               (fun-name-inline-expansion name))
     ;; This function is only called by PONDER-FULL-CALL when NAME
     ;; is not lexically NOTINLINE, so therefore if it is globally INLINE,
@@ -777,7 +792,7 @@ and defining the function before its first potential use.~@:>"
       ;; Set a bit saying that a warning about the call was generated,
       ;; which suppresses the warning about either a later
       ;; call or a later proclamation.
-      (setf (car count-cell) (logior (car count-cell) 2))
+      (setf (gethash name (cu-emitted-full-calls *compilation-unit*)) (logior count 2))
       ;; While there could be a different style-warning for
       ;;   "You should put the DEFUN after the DECLAIM"
       ;; if they appeared reversed, it's not ideal to warn as soon as that.

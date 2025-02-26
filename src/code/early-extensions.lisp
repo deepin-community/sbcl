@@ -13,6 +13,15 @@
 
 (in-package "SB-IMPL")
 
+;;; Like DEFUN, but hides itself in the backtrace. This is meant for
+;;; trivial functions which just do some argument parsing and call
+;;; ERROR for real. Hence, having them and their locals in the
+;;; backtrace would add no useful information pertaining to the error.
+(defmacro define-error-wrapper (name lambda-list &body body)
+  `(defun ,name (,@lambda-list
+                 &aux #-sb-xc-host (sb-debug:*stack-top-hint* (or sb-debug:*stack-top-hint* ',name)))
+     ,@body))
+
 ;;; FIXME: a lot of places in the code that should use ARRAY-RANGE
 ;;; instead use INDEX and vice-versa, but the thing is, we have
 ;;; a ton of fenceposts errors all over the place regardless.
@@ -104,7 +113,7 @@
 ;;; have cycles and isn't too large.
 (defun coalesce-tree-p (x)
   (let ((depth-limit 12)
-        (size-limit (expt 2 25)))
+        (size-limit (expt 2 12)))
     (declare (fixnum size-limit))
     (and (consp x)
          (labels ((safe-cddr (cons)
@@ -171,7 +180,9 @@
 ;;;; comment from CMU CL: "the ultimate collection macro..."
 
 ;;; helper function for COLLECT, which becomes the expander of the
-;;; MACROLET definitions created by COLLECT if collecting a list.
+;;; MACROLET definitions created by COLLECT if collecting a list
+;;; and an INITIAL-VALUE was specified, so we don't know at each step
+;;; whether the tail is NIL or not.
 ;;; N-TAIL is the pointer to the current tail of the list,  or NIL
 ;;; if the list is empty.
 (eval-when (#-sb-xc :compile-toplevel :load-toplevel :execute)
@@ -198,37 +209,67 @@
 ;;; the collection macro with no arguments.
 ;;;
 ;;; INITIAL-VALUE is the value that the collection starts out with,
-;;; which defaults to NIL. FUNCTION is the function which does the
+;;; which defaults to NIL. COLLECTOR is the function which does the
 ;;; collection. It is a function which will accept two arguments: the
 ;;; value to be collected and the current collection. The result of
 ;;; the function is made the new value for the collection. As a
-;;; totally magical special-case, FUNCTION may be COLLECT, which tells
-;;; us to build a list in forward order; this is the default. If an
-;;; INITIAL-VALUE is supplied for COLLECT, the stuff will be RPLACD'd
-;;; onto the end. Note that FUNCTION may be anything that can appear
-;;; in the functional position, including macros and lambdas.
+;;; special-case, omitting COLLECTOR causes a list to be built in forward
+;;; order. If INITIAL-VALUE is supplied for the default usage, new items
+;;; will be RPLACD'd onto the end.
+;;; Note that COLLECTOR may be anything that can appear in the functional
+;;; position, including macros and lambdas.
+;;; Also note that invocation of the collector macro for effect, i.e. other
+;;; than with 0 arguments, is not prescribed to have any particular value.
 (defmacro collect (collections &body body)
   (let ((macros ())
         (binds ())
+        (dx ())
         (ignores ()))
     (dolist (spec collections)
-      (destructuring-bind (name &optional default collector
-                                &aux (n-value (copy-symbol name))) spec
-        (push `(,n-value ,default) binds)
+      (destructuring-bind (name &optional initial-value (collector nil collectorp)
+                                &aux (n-value (copy-symbol name)))
+          spec
+        (push `(,n-value ,(if (or initial-value collectorp)
+                              initial-value
+                              `(#-sb-xc-host unaligned-dx-cons
+                                #+sb-xc-host list
+                                nil)))
+              binds)
         (let ((macro-body
-               (if (or (null collector) (eq collector 'collect))
-                   (let ((n-tail (gensymify* name "-TAIL")))
-                     (push n-tail ignores)
-                     (push `(,n-tail ,(if default `(last ,n-value))) binds)
-                     `(collect-list-expander ',n-value ',n-tail args))
+               (cond
+                 (collectorp
                    ``(progn
                        ,@(mapcar (lambda (x)
                                    `(setq ,',n-value (,',collector ,x ,',n-value)))
                                  args)
-                       ,',n-value))))
+                       ,',n-value))
+                 ((not initial-value)
+                  ;; Use a dummy cons to skip the test for TAIL being NIL with each
+                  ;; inserted item.
+                  (push n-value dx)
+                  (let ((n-tail (gensymify* name "-TAIL")))
+                    (push n-tail ignores)
+                    (push `(,n-tail ,n-value) binds)
+                    `(if args
+                         `(progn
+                            ,@(mapcar (lambda (x)
+                                        `(setf ,',n-tail (setf (cdr ,',n-tail)
+                                                               (list ,x))))
+                                      args))
+                         `(cdr ,',n-value))))
+                 ;; collecting a list given a list to start with.
+                 ;; It's possible to use the "fancy" strategy to avoid testing for NIL
+                 ;; at each step but I choose not to.  The initializer would have to be
+                 ;; (cons nil initial-value). It's unimportant.
+                 (initial-value
+                  (let ((n-tail (gensymify* name "-TAIL")))
+                    (push n-tail ignores)
+                    (push `(,n-tail (last ,n-value)) binds)
+                    `(collect-list-expander ',n-value ',n-tail args))))))
           (push `(,name (&rest args) ,macro-body) macros))))
     `(macrolet ,macros
        (let* ,(nreverse binds)
+         ,@(if dx `((declare (dynamic-extent ,@dx))))
          ;; Even if the user reads each collection result,
          ;; reader conditionals might statically eliminate all writes.
          ;; Since we don't know, all the -n-tail variable are ignorable.
@@ -236,16 +277,6 @@
          ,@body))))
 
 ;;; Functions for compatibility sake:
-
-(defun memq (item list)
-  "Return tail of LIST beginning with first element EQ to ITEM."
-  (declare (inline member))
-  (member item list :test #'eq))
-
-(defun assq (item alist)
-  "Return the first pair of alist where item is EQ to the key of pair."
-  (declare (inline assoc))
-  (assoc item alist :test #'eq))
 
 ;;; Delete just one item
 (defun delq1 (item list)
@@ -324,6 +355,19 @@
                (error "malformed plist, odd number of elements"))
              (setq ,val (pop ,tail))
              (progn ,@body)))))
+
+;;; Like GETHASH if HASH-TABLE contains an entry for KEY.
+;;; Otherwise, evaluate DEFAULT, store the resulting value in
+;;; HASH-TABLE and return two values: 1) the result of evaluating
+;;; DEFAULT 2) NIL.
+(defmacro ensure-gethash (key hash-table default)
+  (with-unique-names (n-key n-hash-table value foundp)
+    `(let ((,n-key ,key)
+           (,n-hash-table ,hash-table))
+       (multiple-value-bind (,value ,foundp) (gethash ,n-key ,n-hash-table)
+         (if ,foundp
+             (values ,value t)
+             (values (setf (gethash ,n-key ,n-hash-table) ,default) nil))))))
 
 ;;; (binding* ({(names initial-value [flag])}*) body)
 ;;; FLAG may be NIL or :EXIT-IF-NULL
@@ -463,12 +507,16 @@ NOTE: This interface is experimental and subject to change."
 (define-load-time-global *cache-vector-symbols* nil)
 
 (defun drop-all-hash-caches ()
+  #+sb-xc-host (values-specifier-type-cache-clear) ; it's not like the rest
   (dolist (name *cache-vector-symbols*)
     (set name nil)))
+
+(defmacro sb-int-package () (find-package "SB-INT"))
 
 ;; Make a new hash-cache and optionally create the statistics vector.
 (defun alloc-hash-cache (size symbol)
   (declare (type index size))
+  (declare (sb-c::tlab :system))
   (let (cache)
     ;; It took me a while to figure out why infinite recursion could occur
     ;; in VALUES-SPECIFIER-TYPE. It's because SET calls VALUES-SPECIFIER-TYPE.
@@ -483,8 +531,7 @@ NOTE: This interface is experimental and subject to change."
                  ;; it is inconsequential to performance.
                  (if *profile-hash-cache*
                      `(let ((statistics
-                             (let ((*package* (sb-xc:symbol-package symbol)))
-                               (symbolicate symbol "STATISTICS"))))
+                             (package-symbolicate (sb-int-package) symbol "-STATS")))
                         (unless (boundp statistics)
                           (set! statistics
                                 (make-array 3 :element-type 'fixnum
@@ -520,6 +567,7 @@ NOTE: This interface is experimental and subject to change."
                `(progn
                   (declaim (ftype ,ftype ,fn))
                   (defun ,fn ,args
+                    (declare (sb-c::tlab :system))
                     (declare (optimize (safety 0)))
                     ,(if (<= n 3)
                          `(list* ,@args)
@@ -530,50 +578,80 @@ NOTE: This interface is experimental and subject to change."
   (def 5)
   (def 6))
 
-(defmacro !define-hash-cache (name args aux-vars
+(defmacro !define-hash-cache (name args
                               &key hash-function hash-bits memoizer
-                              flush-function (values 1))
+                              (values 1))
   (declare (ignore memoizer))
   (dolist (arg args)
+    ;; Each arg is (VARNAME EQUIVALENCE-TEST &OPTIONAL EXPR-TO-CACHE)
+    ;; EXPR-TO-CACHE says how to copy a dynamic-extent arg into the cache line
+    ;; (the default is to store each argument as-is)
     (unless (<= 2 (length arg) 3)
       (error "bad argument spec: ~S" arg)))
-  (assert (typep hash-bits '(integer 5 14))) ; reasonable bounds
-  (let* ((fun-name (symbolicate "!" name "-MEMO-WRAPPER"))
-         (var-name (symbolicate "**" name "-CACHE-VECTOR**"))
+  ;; Disallow >12 hash bits. Supposing a 32-bit machine, a ctype hash uses 5
+  ;; reserved bits for the type-class index, and then we need 2 independent
+  ;; choices of hash, so supposing that's 12 bits each, we're at 29 bits.
+  ;; But I want to take 2 bits for flags, so that's 31 bits.
+  (assert (typep hash-bits '(integer 5 12))) ; reasonable bounds
+  (unless (integerp values) ; non-numeric was only for CTYPE-OF-ARRAY
+    (error "Values ~S unsupported" values))
+  (let* ((var-name (symbolicate "**" name "-CACHE-VECTOR**"))
+         (statistics-name (package-symbolicate (sb-int-package) var-name "-STATS"))
+         (cache-type `(simple-vector ,(ash 1 hash-bits))))
+    `(progn
+       (eval-when (:compile-toplevel :execute)
+         (setf (get ',name '!cache-definition)
+               (list ',hash-bits ',hash-function ',args ',values)))
+       (pushnew ',var-name *cache-vector-symbols*)
+       (define-load-time-global ,var-name nil)
+       ,@(when *profile-hash-cache*
+           `((declaim (type (simple-array fixnum (3)) ,statistics-name))
+             (defvar ,statistics-name)))
+       (declaim (type (or null ,cache-type) ,var-name))
+       (defun ,(symbolicate name "-CACHE-CLEAR") () (setq ,var-name nil))
+       ',var-name)))
+
+(#+sb-xc-host defmacro #-sb-xc-host sb-xc:defmacro
+ with-cache ((fun-name &rest actual-args) &body computation)
+  (let* ((var-name (package-symbolicate (cl:symbol-package fun-name)
+                                        "**" fun-name "-CACHE-VECTOR**"))
+         (cache-params (get fun-name '!cache-definition))
          (statistics-name
           (when *profile-hash-cache*
-            (symbolicate var-name "STATISTICS")))
-         (nargs (length args))
+            (package-symbolicate (sb-int-package) var-name "-STATS")))
+         (hash-bits (first cache-params))
+         (hashfun (second cache-params))
+         (arg-specs (third cache-params))
+         (nargs (length arg-specs))
+         (values (fourth cache-params))
          (size (ash 1 hash-bits))
          (hashval (make-symbol "HASH"))
          (cache (make-symbol "CACHE"))
          (entry (make-symbol "LINE"))
-         (thunk (make-symbol "THUNK"))
-         (arg-vars (mapcar #'first args))
          (nvalues (if (listp values) (length values) values))
          (result-temps
           (if (listp values)
               values ; use the names provided by the user
               (loop for i from 1 to nvalues ; else invent some names
                     collect (make-symbol (format nil "R~D" i)))))
-         (temps (append (mapcar (lambda (x) (make-symbol (string x)))
-                                arg-vars)
-                        result-temps))
+         (temps (append (mapcar #'copy-symbol actual-args) result-temps))
          ;; Mnemonic: (FIND x SEQ :test #'f) calls f with x as the LHS
-         (tests (mapcar (lambda (spec temp) ; -> (EQx ARG #:ARG)
-                          `(,(cadr spec) ,(car spec) ,temp))
-                        args temps))
+         (tests (mapcar (lambda (spec temp actual) ; -> (EQx #:ARG ARG)
+                          `(,(cadr spec) ,temp ,actual))
+                        arg-specs temps actual-args))
          (cache-type `(simple-vector ,size))
          (line-type (let ((n (+ nargs nvalues)))
                       (if (<= n 3) 'cons `(simple-vector ,n))))
-         (bind-hashval
-          `((,hashval (the sb-xc:fixnum
-                           (funcall ,hash-function ,@arg-vars)))
-            (,cache ,var-name)))
+         ;; It's not really necessary to factor out PROBE-IT,
+         ;; but it used to be possible to probe for an entry to forcefully
+         ;; evict (unmemoize) it. That capability is no longer needed.
          (probe-it
-          (lambda (ignore action)
+          (lambda (action)
             `(when ,cache
-               (let ((,hashval ,hashval) ; gets clobbered in probe loop
+               ;; Shift out 2 low bits because they won't be as random as other bits,
+               ;; at least not for single-argument cached functions. They might be OK
+               ;; for functions that involve mixing.
+               (let ((,hashval (ash ,hashval -2)) ; gets clobbered in probe loop
                      (,cache (truly-the ,cache-type ,cache)))
                  ;; FIXME: redundant?
                  (declare (type sb-xc:fixnum ,hashval))
@@ -582,78 +660,61 @@ NOTE: This interface is experimental and subject to change."
                               (svref ,cache
                                      (ldb (byte ,hash-bits 0) ,hashval))))
                          (unless (eql ,entry 0)
-                           ;; This barrier is a no-op on all multi-threaded SBCL
-                           ;; architectures. No CPU except Alpha will move a
-                           ;; load prior to a load on which it depends.
-                           (sb-thread:barrier (:data-dependency))
-                           (locally (declare (type ,line-type ,entry))
-                             (let* ,(case (length temps)
+                           (let* ((,entry (truly-the ,line-type ,entry))
+                                  ,@(case (length temps)
                                      (2 `((,(first temps) (car ,entry))
                                           (,(second temps) (cdr ,entry))))
-                                     (3 (let ((arg-temp (sb-xc:gensym "ARGS")))
+                                     (3 (let ((arg-temp (gensym "ARGS")))
                                           `((,arg-temp (cdr ,entry))
                                             (,(first temps) (car ,entry))
                                             (,(second temps)
                                              (car (truly-the cons ,arg-temp)))
                                             (,(third temps) (cdr ,arg-temp)))))
                                      (t (loop for i from 0 for x in temps
-                                              collect `(,x (svref ,entry ,i)))))
-                               ,@ignore
-                               (when (and ,@tests) ,action))))
-                         (setq ,hashval (ash ,hashval ,(- hash-bits)))))))))
-         (fun
-          `(defun ,fun-name (,thunk ,@arg-vars ,@aux-vars)
-             ,@(when *profile-hash-cache* ; count seeks
-                 `((when (boundp ',statistics-name)
-                     (incf (aref ,statistics-name 0)))))
-             (let ,bind-hashval
-               ,(funcall probe-it nil
-                         `(return-from ,fun-name (values ,@result-temps)))
-               (multiple-value-bind ,result-temps (funcall ,thunk)
-                 (let ((,entry
-                        (,(hash-cache-line-allocator (+ nargs nvalues))
-                         ,@(mapcar (lambda (spec) (or (caddr spec) (car spec)))
-                                   args)
-                         ,@result-temps))
-                       (,cache
-                        (truly-the ,cache-type
-                         (or ,cache (alloc-hash-cache ,size ',var-name))))
-                       (idx1 (ldb (byte ,hash-bits 0) ,hashval))
-                       (idx2 (ldb (byte ,hash-bits ,hash-bits) ,hashval)))
-                   ,@(when *profile-hash-cache*
-                       `((incf (aref ,statistics-name 1)))) ; count misses
+                                              collect `(,x (svref ,entry ,i))))))
+                               (when (and ,@tests) ,action)))
+                         (setq ,hashval (ash ,hashval ,(- hash-bits))))))))))
+    `(let ((,hashval (the sb-xc:fixnum (funcall ,hashfun ,@actual-args)))
+           (,cache ,var-name))
+       #-sb-xc-host (declare (optimize (sb-c::insert-array-bounds-checks 0)))
+       ,@(when *profile-hash-cache* ; count seeks
+           `((when (boundp ',statistics-name) (incf (aref ,statistics-name 0)))))
+       (block seek
+         ,(funcall probe-it `(return-from seek (values ,@result-temps)))
+         (multiple-value-bind ,result-temps (progn ,@computation)
+           ;; Decide if cacheable result. Lambda expressions and strings always are.
+           ;; Parsing a type specifier nonlocally exits from COMPUTATION if it
+           ;; wants not to cache. And of course CTYPE-OF always returns a good type.
+           ;; It's unfortunate that this macro macro bakes in such knowledge.
+           (when ,(if (member fun-name '(sb-format::tokenize-control-string
+                                         sb-alien::coerce-to-interpreted-function
+                                         values-specifier-type
+                                         ctype-of))
+                      t
+                      `(and ,@(mapcar (lambda (x) `(sb-kernel::ok-to-memoize-p ,x))
+                                      actual-args)))
+             (let ((,entry (,(hash-cache-line-allocator (+ nargs nvalues))
+                            ,@(mapcar (lambda (spec actual) (or (caddr spec) actual))
+                                      arg-specs actual-args)
+                            ,@result-temps))
+                   (,cache (truly-the ,cache-type
+                                      (or ,cache (alloc-hash-cache ,size ',var-name))))
+                   (idx1 (ldb (byte ,hash-bits 2) ,hashval))
+                   (idx2 (ldb (byte ,hash-bits ,(+ 2 hash-bits)) ,hashval)))
+               ,@(when *profile-hash-cache*
+                   `((incf (aref ,statistics-name 1)))) ; count misses
                    ;; Why a barrier: the pointer to 'entry' (a cons or vector)
                    ;; MUST NOT be observed by another thread before its cells
                    ;; are filled. Equally bad, the 'output' cells in the line
                    ;; could be 0 while the 'input' cells matched something.
-                   (sb-thread:barrier (:write))
-                   (cond ((eql (svref ,cache idx1) 0)
-                          (setf (svref ,cache idx1) ,entry))
-                         ((eql (svref ,cache idx2) 0)
-                          (setf (svref ,cache idx2) ,entry))
-                         (t
-                           ,@(when *profile-hash-cache* ; count evictions
-                               `((incf (aref ,statistics-name 2))))
-                           (setf (svref ,cache idx1) ,entry))))
-                 (values ,@result-temps))))))
-    `(progn
-       (pushnew ',var-name *cache-vector-symbols*)
-       (define-load-time-global ,var-name nil)
-       ,@(when *profile-hash-cache*
-           `((declaim (type (simple-array fixnum (3)) ,statistics-name))
-             (defvar ,statistics-name)))
-       (declaim (type (or null ,cache-type) ,var-name))
-       (defun ,(symbolicate name "-CACHE-CLEAR") () (setq ,var-name nil))
-       ,@(when flush-function
-           `((defun ,flush-function ,arg-vars
-               (let ,bind-hashval
-                 ,(funcall probe-it
-                   `((declare (ignore ,@result-temps)))
-                   `(return (setf (svref ,cache
-                                         (ldb (byte ,hash-bits 0) ,hashval))
-                                  0)))))))
-       (declaim (inline ,fun-name))
-       ,fun)))
+               (sb-thread:barrier (:write))
+               (setf (svref ,cache (cond ((eql (svref ,cache idx1) 0) idx1)
+                                         ((eql (svref ,cache idx2) 0) idx2)
+                                         (t ,@(when *profile-hash-cache* ; count evictions
+                                                `((incf (aref ,statistics-name 2))))
+                                            idx1)))
+                     ,entry)))
+           (values ,@result-temps))))))
 
 ;;; some syntactic sugar for defining a function whose values are
 ;;; cached by !DEFINE-HASH-CACHE
@@ -680,10 +741,7 @@ NOTE: This interface is experimental and subject to change."
 ;;; Since we don't have caches that aren't in direct support of DEFUN-CACHED
 ;;; - did we ever? - this should be possible to change.
 ;;;
-(defmacro defun-cached ((name &rest options &key
-                              (memoizer (make-symbol "MEMOIZE")
-                                        memoizer-supplied-p)
-                              &allow-other-keys)
+(defmacro defun-cached ((name &rest options &key memoizer &allow-other-keys)
                         args &body body-decls-doc)
   (binding* (((forms decls doc) (parse-body body-decls-doc t))
              ((inputs aux-vars)
@@ -692,42 +750,30 @@ NOTE: This interface is experimental and subject to change."
                     (values (ldiff args aux) aux)
                     (values args nil))))
              (arg-names (mapcar #'car inputs)))
+    (assert (not aux-vars)) ; was only for CTYPE-OF-ARRAY
     `(progn
-        (!define-hash-cache ,name ,inputs ,aux-vars ,@options)
+        (!define-hash-cache ,name ,inputs ,@options)
         (defun ,name ,arg-names
           ,@decls
           ,@(if doc (list doc))
-          (macrolet ((,memoizer (&body body)
-                       ;; We don't need (DX-FLET ((,thunk () ,@body)) ...)
-                       ;; This lambda is a single-use local call within
-                       ;; the inline memoizing wrapper.
-                       `(,',(symbolicate "!" name "-MEMO-WRAPPER")
-                         (lambda () ,@body) ,@',arg-names)))
-             ,@(if memoizer-supplied-p
-                   forms
-                   `((,memoizer ,@forms))))))))
+          ,(if memoizer
+               `(macrolet ((,memoizer (&body body)
+                             `(with-cache ,',(list* name arg-names) ,@body)))
+                  ,@forms)
+               `(with-cache (,name ,@arg-names) ,@forms))))))
 
-;;; FIXME: maybe not the best place
-;;;
-;;; FIXME: think of a better name -- not only does this not have the
-;;; CAR recursion of EQUAL, it also doesn't have the special treatment
-;;; of pathnames, bit-vectors and strings.
-;;;
-;;; KLUDGE: This means that we will no longer cache specifiers of the
-;;; form '(INTEGER (0) 4).  This is probably not a disaster.
-;;;
-;;; A helper function for the type system, which is the main user of
-;;; these caches: we must be more conservative than EQUAL for some of
-;;; our equality tests, because MEMBER and friends refer to EQLity.
-;;; So:
-(defun equal-but-no-car-recursion (x y)
-  (do () (())
-    (cond ((eql x y) (return t))
-          ((and (consp x)
-                (consp y)
-                (eql (pop x) (pop y))))
-          (t
-           (return)))))
+(defun list-elts-eq (x y)
+  (loop (when (eq x y) (return t))
+        (when (or (atom x) (atom y)) (return nil))
+        (unless (eq (car x) (car y)) (return nil))
+        (setq x (cdr x)
+              y (cdr y))))
+(defun list-elements-eql (x y)
+  (loop (when (eq x y) (return t))
+        (when (or (atom x) (atom y)) (return nil))
+        (unless (eql (car x) (car y)) (return nil))
+        (setq x (cdr x)
+              y (cdr y))))
 
 ;;;; various operations on names
 
@@ -739,6 +785,10 @@ NOTE: This interface is experimental and subject to change."
 (declaim (inline legal-fun-name-p))
 (defun legal-fun-name-p (name)
   (values (valid-function-name-p name)))
+
+(declaim (inline legal-class-name-p))
+(defun legal-class-name-p (thing)
+  (symbolp thing))
 
 ;;; * extended-function-designator: an object that denotes a function and that is one of:
 ;;;   a function name (denoting the function it names in the global environment),
@@ -760,8 +810,7 @@ NOTE: This interface is experimental and subject to change."
 (deftype function-name () '(satisfies legal-fun-name-p))
 
 ;;; Signal an error unless NAME is a legal function name.
-(defun legal-fun-name-or-type-error (name)
-  #-sb-xc-host(declare (optimize allow-non-returning-tail-call))
+(define-error-wrapper legal-fun-name-or-type-error (name)
   (unless (legal-fun-name-p name)
     (error 'simple-type-error
            :datum name
@@ -823,7 +872,7 @@ NOTE: This interface is experimental and subject to change."
           (let* ((name (first spec))
                  (exp-temp (gensym "ONCE-ONLY")))
             `(let ((,exp-temp ,(second spec))
-                   (,name (sb-xc:gensym ,(symbol-name name))))
+                   (,name (gensym ,(symbol-name name))))
                `(let ((,,name ,,exp-temp))
                   ,,(frob (rest specs) body))))))))
 
@@ -849,11 +898,22 @@ NOTE: This interface is experimental and subject to change."
 ;;; with this should reduce the size of the system by enough to be
 ;;; worthwhile.)
 (defmacro aver (expr)
-  `(unless ,expr
-     (%failed-aver ',expr)))
+  ;; Don't hold on to symbols, helping shake-packages.
+  (labels ((replace-symbols (expr)
+             (typecase expr
+               (null expr)
+               (symbol
+                (symbol-name expr))
+               (cons
+                (cons (replace-symbols (car expr))
+                      (replace-symbols (cdr expr))))
+               (t
+                expr))))
+    `(unless ,expr
+       (%failed-aver ',(replace-symbols expr)))))
 
 (defun %failed-aver (expr)
-  (bug "~@<failed AVER: ~2I~_~S~:>" expr))
+  (bug "~@<failed AVER: ~2I~_~A~:>" expr))
 
 (defun bug (format-control &rest format-arguments)
   (error 'bug
@@ -876,10 +936,10 @@ NOTE: This interface is experimental and subject to change."
 ;;; The "more or less" bit is that the no-bound-at-all case is
 ;;; represented by NIL (not by * as in ANSI type specifiers); and in
 ;;; this case we return NIL.
-(declaim (ftype (sfunction (t) (or null real)) type-bound-number))
+(declaim (inline type-bound-number))
 (defun type-bound-number (x)
   (if (consp x)
-      (destructuring-bind (result) x result)
+      (car x)
       x))
 
 ;;;; utilities for two-VALUES predicates
@@ -1131,8 +1191,7 @@ NOTE: This interface is experimental and subject to change."
 ;;; Without a proclaimed type, the call is "untrusted" and so the compiler
 ;;; would generate a post-call check that the function did not return.
 (declaim (ftype (function (t t t t t) nil) deprecation-error))
-(defun deprecation-error (software version namespace name replacements)
-  #-sb-xc-host(declare (optimize allow-non-returning-tail-call))
+(define-error-wrapper deprecation-error (software version namespace name replacements)
   (error 'deprecation-error
          :namespace namespace
          :name name
@@ -1201,13 +1260,6 @@ NOTE: This interface is experimental and subject to change."
 ;;; - SOCKINT::WIN32-IOCTL                         since 1.2.10 (03/2015)    -> Late: 08/2015
 ;;; - SOCKINT::WIN32-SETSOCKOPT                    since 1.2.10 (03/2015)    -> Late: 08/2015
 ;;; - SOCKINT::WIN32-GETSOCKOPT                    since 1.2.10 (03/2015)    -> Late: 08/2015
-;;;
-;;; - SB-C::MERGE-TAIL-CALLS (policy)              since 1.0.53.74 (11/2011) -> Late: 11/2012
-;;;
-;;; LATE:
-;;; - SB-C::STACK-ALLOCATE-DYNAMIC-EXTENT (policy) since 1.0.19.7            -> Final: anytime
-;;; - SB-C::STACK-ALLOCATE-VECTOR (policy)         since 1.0.19.7            -> Final: anytime
-;;; - SB-C::STACK-ALLOCATE-VALUE-CELLS (policy)    since 1.0.19.7            -> Final: anytime
 
 (defun setup-function-in-final-deprecation
     (software version name replacement-spec)
@@ -1256,7 +1308,6 @@ NOTE: This interface is experimental and subject to change."
                                 ((or (listp id) ; must be a type-specifier
                                      (memq id '(special ignorable ignore
                                                 dynamic-extent
-                                                truly-dynamic-extent
                                                 sb-c::constant-value
                                                 sb-c::no-constraints))
                                      (info :type :kind id))
@@ -1312,7 +1363,7 @@ NOTE: This interface is experimental and subject to change."
 
 (defun call-with-sane-io-syntax (function)
   (declare (type function function))
-  #-sb-xc-host (declare (dynamic-extent function)) ; "unable"
+  (declare (dynamic-extent function))
   ;; force BOUNDP to be tested by declaring maximal safety
   ;; in case unsafe code really screwed things up.
   (declare (optimize (safety 3)))
@@ -1347,8 +1398,7 @@ NOTE: This interface is experimental and subject to change."
 '(defun show-hash-cache-statistics ()
   (flet ((cache-stats (symbol)
            (let* ((name (string symbol))
-                  (statistics (let ((*package* (sb-xc:symbol-package symbol)))
-                                (symbolicate symbol "STATISTICS")))
+                  (statistics (package-symbolicate (sb-int-package) symbol "-STATS"))
                   (prefix
                    (subseq name 0 (- (length name) (length "VECTOR**")))))
              (values (if (boundp statistics)
@@ -1376,6 +1426,16 @@ NOTE: This interface is experimental and subject to change."
                       (* 100 (/ (count-if-not #'fixnump cache)
                                 (length cache))))
                   short-name))))))
+
+;;; some commonly-occurring CONSTANTLY forms
+(macrolet ((def-constantly-fun (name constant-expr)
+             `(defun ,name (&rest arguments)
+                (declare (ignore arguments))
+                (declare (optimize (speed 3) (safety 0) (debug 0)))
+                ,constant-expr)))
+  (def-constantly-fun constantly-t t)
+  (def-constantly-fun constantly-nil nil)
+  (def-constantly-fun constantly-0 0))
 
 (in-package "SB-KERNEL")
 
@@ -1413,15 +1473,6 @@ NOTE: This interface is experimental and subject to change."
              (sorted (stable-sort wrapped comparator :key #'cdr)))
         (map-into sorted #'car sorted))))
 
-;;; Ensure basicness if possible, and simplicity always
-(defun possibly-base-stringize (s)
-  (declare (string s))
-  (cond #+(and sb-unicode (not sb-xc-host))
-        ((and (typep s '(array character (*))) (every #'base-char-p s))
-         (coerce s 'base-string))
-        (t
-         (coerce s 'simple-string))))
-
 ;;; Return T if X is an object that always evaluates to itself. Guard against:
 ;;;  (LET ((S 'XXX)) (SET S 9) (UNINTERN S) (IMPORT S 'KEYWORD) (SYMBOL-VALUE S)) => 9
 ;;; whereby :XXX satisfies KEWORDP and has value 9, or maybe even has no value
@@ -1439,5 +1490,20 @@ NOTE: This interface is experimental and subject to change."
               (eq (symbol-value x) x))))
     (cons nil)
     (t t)))
+
+(declaim (inline first-bit-set))
+(defun first-bit-set (x)
+  #+(and x86-64 (not sb-xc-host))
+  (truly-the (values (mod #.sb-vm:n-word-bits) &optional)
+             (%primitive sb-vm::unsigned-word-find-first-bit (the word x)))
+  #-(and x86-64 (not sb-xc-host))
+  (1- (integer-length (logand x (- x)))))
+
+(defun integer-float-p (float)
+  (and (floatp float)
+       (multiple-value-bind (significand exponent) (integer-decode-float float)
+         (or (plusp exponent)
+             (<= (- exponent) (first-bit-set significand))))))
+
 
 (defvar *top-level-form-p* nil)

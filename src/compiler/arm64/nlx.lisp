@@ -140,7 +140,7 @@
 
 (define-vop (nlx-entry)
   (:args (sp) ; Note: we can't list an sc-restriction, 'cause any load vops
-              ; would be inserted before the LRA.
+              ; would be inserted before the label.
          (start)
          (count))
   (:results (values :more t :from :load))
@@ -180,12 +180,24 @@
                     (store-stack-tn tn move-temp))))))))
     (load-stack-tn csp-tn sp)))
 
+(define-vop (nlx-entry-single)
+  (:args (sp)
+         (value))
+  (:results (res :from :load))
+  (:info label)
+  (:save-p :force-to-stack)
+  (:vop-var vop)
+  (:generator 30
+    (emit-label label)
+    (note-this-location vop :non-local-entry)
+    (inst mov res value)
+    (load-stack-tn csp-tn sp)))
+
 (define-vop (nlx-entry-multiple)
-  (:args (top :target result)
-         (src)
+  (:args (top :target result
+              :scs (any-reg))
+         (src :to :save)
          (count :target count-words))
-  ;; Again, no SC restrictions for the args, 'cause the loading would
-  ;; happen before the entry label.
   (:info label)
   (:temporary (:scs (any-reg)) dst)
   (:temporary (:scs (descriptor-reg)) temp)
@@ -194,12 +206,17 @@
             (num :scs (any-reg) :from (:argument 0)))
   (:save-p :force-to-stack)
   (:vop-var vop)
-  (:generator 30
+  (:before-load
     (emit-label label)
-    (note-this-location vop :non-local-entry)
+    (note-this-location vop :non-local-entry))
+  (:generator 30
 
     ;; Setup results, and test for the zero value case.
-    (load-stack-tn result top)
+    (if (eq (tn-kind result) :unused)
+        (setf result top)
+        (move result top))
+    (when (eq (tn-kind num) :unused)
+      (setf num tmp-tn))
     (inst mov num 0)
     ;; Shift and check for zero in one go
     (inst adds count-words zr-tn (lsl count (- word-shift n-fixnum-tag-bits)))
@@ -220,7 +237,8 @@
     ;; Reset the CSP.
     DONE
     (inst add csp-tn result num)
-    (inst lsr num num (- word-shift n-fixnum-tag-bits))))
+    (unless (eq (tn-kind num) :unused)
+      (inst lsr num num (- word-shift n-fixnum-tag-bits)))))
 
 ;;; This VOP is just to force the TNs used in the cleanup onto the stack.
 ;;;
@@ -256,7 +274,7 @@
   (:temporary (:sc descriptor-reg :offset r9-offset) saved-function)
   (:temporary (:sc unsigned-reg :offset r0-offset) block)
   (:temporary (:sc descriptor-reg :offset lexenv-offset) lexenv)
-  (:temporary (:scs (interior-reg)) lip)
+  (:temporary (:scs (non-descriptor-reg) :offset lr-offset) lr)
   (:temporary (:sc descriptor-reg :offset nargs-offset) nargs)
   (:vop-var vop)
   (:generator 22
@@ -285,14 +303,13 @@
       (storew temp block catch-block-entry-pc-slot)
 
       ;; Run any required UWPs.
-      (load-inline-constant tmp-tn '(:fixup unwind :assembly-routine) lip)
-      (inst br tmp-tn)
+      (invoke-asm-routine 'unwind tmp-tn :tail t)
 
       (emit-label ENTRY-LABEL)
       (inst mov nargs 0)
 
       (move lexenv saved-function)
 
-      (loadw saved-function lexenv closure-fun-slot fun-pointer-lowtag)
-      (lisp-jump saved-function lip))))
+      (loadw lr lexenv closure-fun-slot fun-pointer-lowtag)
+      (lisp-jump lr))))
 

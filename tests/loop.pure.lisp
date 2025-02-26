@@ -90,7 +90,7 @@
 (assert (= (loop for nil being the external-symbols of :cl count t) 978))
 (assert (= (loop for x being the external-symbols of :cl count x) 977))
 
-(let ((*package* (find-package :cl)))
+(let ((cl:*package* (find-package :cl)))
   (assert (= (loop for x being each external-symbol count t) 978)))
 
 (assert (eq (loop for a = (return t) return nil) t))
@@ -428,7 +428,7 @@
   (assert-no-signal
    (compile nil '(lambda ()
                    (declare (optimize speed))
-                   (loop repeat (+ 1 5) for baz = 'this then 'that
+                   (loop for baz = 'this then 'that repeat (+ 1 5)
                          do (print baz))))))
 
 (with-test (:name :loop-default-init-type)
@@ -479,3 +479,14 @@
                      (loop for x in l
                            collect x)))))
           '(values list &optional))))
+
+
+(with-test (:name :loop-in-reverse-by-cddr)
+  (checked-compile-and-assert
+   (:optimize nil)
+   `(lambda (l)
+      (loop for x in (reverse l) by #'cddr collect x))
+   (('(1)) '(1) :test #'equal)
+   (('(1 2)) '(2) :test #'equal)
+   (('(1 2 3)) '(3 1) :test #'equal)
+   (('(1 2 3 4)) '(4 2) :test #'equal)))

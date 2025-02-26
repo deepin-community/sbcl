@@ -1,0 +1,13 @@
+# Configuration file for Salsa CI/CD
+# cf. https://salsa.debian.org/salsa-ci-team/pipeline
+---
+include:
+  - https://salsa.debian.org/salsa-ci-team/pipeline/raw/master/salsa-ci.yml
+  - https://salsa.debian.org/salsa-ci-team/pipeline/raw/master/pipeline-jobs.yml
+
+variables:
+  SALSA_CI_ENABLE_PIPELINE_ON_TAGS: 1
+  # disable failing pipeline steps (blhc fails mostly because of test compilation)
+  SALSA_CI_DISABLE_BLHC: 1
+  SALSA_CI_DISABLE_REPROTEST: 1
+  SALSA_CI_DISABLE_CROSSBUILD_ARM64: 1

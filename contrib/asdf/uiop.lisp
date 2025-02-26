@@ -1833,7 +1833,7 @@ keywords explicitly."
 
   (defun os-unix-p ()
     "Is the underlying operating system some Unix variant?"
-    (or (featurep '(:or :unix :cygwin)) (os-macosx-p)))
+    (or (featurep '(:or :unix :cygwin :haiku)) (os-macosx-p)))
 
   (defun os-windows-p ()
     "Is the underlying operating system Microsoft Windows?"
@@ -1857,9 +1857,9 @@ except on ABCL where it might change between FASL compilation and runtime."
     (loop* :with o
            :for (feature . detect) :in '((:os-unix . os-unix-p) (:os-macosx . os-macosx-p)
                                          (:os-windows . os-windows-p)
-                                         (:genera . os-genera-p) (:os-oldmac . os-oldmac-p)
-                                         (:haiku . os-haiku-p))
-           :when (and (or (not o) (eq feature :os-macosx)) (funcall detect))
+                                         (:os-genera . os-genera-p) (:os-oldmac . os-oldmac-p)
+                                         (:os-haiku . os-haiku-p))
+           :when (and (or (not o) (eq feature :os-macosx) (eq feature :os-haiku)) (funcall detect))
            :do (setf o feature) (pushnew feature *features*)
            :else :do (setf *features* (remove feature *features*))
            :finally
@@ -4925,6 +4925,7 @@ This can help you produce more deterministic output for FASLs."))
     (defun sb-grovel-unknown-constant-condition-p (c)
       "Detect SB-GROVEL unknown-constant conditions on older versions of SBCL"
       (and (typep c 'sb-int:simple-style-warning)
+           (stringp (simple-condition-format-control c))
            (string-enclosed-p
             "Couldn't grovel for "
             (simple-condition-format-control c)

@@ -36,7 +36,7 @@
       ;; See ENCODE-ARRAY-RANK.
       (inst sub ndescr rank (fixnumize 1))
       (inst and ndescr ndescr (fixnumize array-rank-mask))
-      (inst orr ndescr type (lsl ndescr array-rank-byte-pos))
+      (inst orr ndescr type (lsl ndescr array-rank-position))
       (inst mov ndescr (lsr ndescr n-fixnum-tag-bits))
       ;; And store the header value.
       (storew ndescr header 0 other-pointer-lowtag))
@@ -58,8 +58,10 @@
   (:results (res :scs (unsigned-reg)))
   (:result-types positive-fixnum)
   (:generator 6
-    (inst ldrb res (@ x #+little-endian (- 2 other-pointer-lowtag)
-                        #+big-endian    (- 1 other-pointer-lowtag)))
+    ;; convert ARRAY-RANK-POSITION to byte index and compensate for endianness
+    ;; ASSUMPTION: n-widetag-bits = 8 and rank is adjacent to widetag
+    (inst ldrb res (@ x #+little-endian (- 1 other-pointer-lowtag)
+                        #+big-endian    (- 2 other-pointer-lowtag)))
     (inst add res res 1)
     (inst and res res array-rank-mask)))
 
@@ -208,7 +210,7 @@
                         (= (tn-value value) ,(1- (ash 1 bits))))
              (inst mov temp ,(1- (ash 1 bits)))
              (inst bic old old (lsl temp shift)))
-           ;; LOGIOR in the new value (shifted appropriatly).
+           ;; LOGIOR in the new value (shifted appropriately).
            (sc-case value
              (immediate
               (inst mov temp (logand (tn-value value) ,(1- (ash 1 bits)))))
@@ -367,3 +369,9 @@
   (unsigned-reg) unsigned-num %vector-raw-bits)
 (define-full-setter set-vector-raw-bits * vector-data-offset other-pointer-lowtag
   (unsigned-reg) unsigned-num %set-vector-raw-bits)
+
+;;; Weak vectors
+(define-full-reffer %weakvec-ref * vector-data-offset other-pointer-lowtag
+  (any-reg descriptor-reg) * %weakvec-ref)
+(define-full-setter %weakvec-set * vector-data-offset other-pointer-lowtag
+  (any-reg descriptor-reg) * %weakvec-set)

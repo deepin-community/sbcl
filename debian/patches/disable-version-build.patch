@@ -1,11 +1,20 @@
-Description: Never try to recreate version-lisp.expr from git
- Otherwise this could interfere with the version generation done from
- debian/rules .
-Forwarded: not-needed
+From: Debian Common Lisp Team <debian-common-lisp@lists.debian.org>
+Date: Sat, 7 Apr 2018 00:00:00 +0000
+Subject: Never try to recreate version-lisp.expr from git
+MIME-Version: 1.0
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+Otherwise this could interfere with the version generation done from
+debian/rules.
+
 Reviewed-by: Sébastien Villemot <sebastien@debian.org>
-Last-Update: 2018-04-07
 ---
-This patch header follows DEP-3: http://dep.debian.net/deps/dep3/
+ generate-version.sh | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/generate-version.sh b/generate-version.sh
+index 52e4d69..2a11194 100755
 --- a/generate-version.sh
 +++ b/generate-version.sh
 @@ -5,7 +5,7 @@ git_available_p() {

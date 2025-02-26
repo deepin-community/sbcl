@@ -39,17 +39,17 @@
   (:generator 0
      (emit-label the-label)))
 
-;;; These guys use a single instruction to record a coverage mark
-;;; and (for better or worse) delay insertion of instrumentation until
-;;; assembling, just prior to which we try to combine sequences of marking
-;;; instructions that have no control flow and which record the same
-;;; path as hit. "compresion" should be performed in IR2 instead
-;;; so that all the architectures can benefit from it.
-#+(or x86 x86-64)
-(define-vop (mark-covered)
-  (:info path)
+#+sb-safepoint
+(define-vop (sb-vm::insert-safepoint)
+  (:policy :fast-safe)
+  (:translate sb-kernel::gc-safepoint)
   (:generator 0
-    (sb-assem:inst* 'sb-assem:.coverage-mark path)))
+    (sb-vm::emit-safepoint)))
+
+#-x86-64 (define-vop (fixed-alloc-to-stack fixed-alloc))
+
+;;; x86-64 defines this vop for real
+#-x86-64 (define-vop (end-pseudo-atomic) (:generator 1))
 
 ;;; SPLAT is always a no-op for architectures other than x86-64
 ;;; because:

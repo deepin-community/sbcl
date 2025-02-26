@@ -70,11 +70,12 @@
     (process-all-interrupts))
   (check-deferrables-unblocked-or-lose 0))
 
-#-sb-thread (sb-ext:exit :code 104)
+#-sb-thread (invoke-restart 'run-tests::skip-file)
 
 ;;;; Now the real tests...
 
-(with-test (:name (with-mutex :timeout))
+(with-test (:name (with-mutex :timeout)
+            :broken-on :gc-stress)
   (let ((m (make-mutex)))
     (with-mutex (m)
       (assert (null (join-thread (make-thread
@@ -111,16 +112,17 @@
        `(with-test (:name ,name)
           (let* ((n 200000)
                  (x ,init)
-                 (run nil)
+                 (run (sb-thread:make-semaphore))
+                 (threadcount 10)
                  (threads
-                  (loop repeat 10
+                  (loop repeat threadcount
                         collect (make-thread
                                  (lambda ()
-                                   (loop until run do (thread-yield))
+                                   (sb-thread:wait-on-semaphore run)
                                    (loop repeat n do (,incf x)))))))
-            (setf run t)
+            (sb-thread:signal-semaphore run threadcount)
             (map nil #'join-thread threads)
-            (assert (= (,op x) (* 10 n)))))))
+            (assert (= (,op x) (* threadcount n)))))))
 
   (def (cas car) (cons 0 nil) incf-car car)
   (def (cas cdr) (cons nil 0) incf-cdr cdr)
@@ -251,7 +253,8 @@
                               (with-recursive-lock (m :wait-p nil)
                                 t))))))))
 
-(with-test (:name (with-recursive-lock :timeout))
+(with-test (:name (with-recursive-lock :timeout)
+                  :broken-on :gc-stress)
   (let ((m (make-mutex)))
     (with-mutex (m)
       (assert (null (join-thread (make-thread
@@ -276,7 +279,8 @@
     (with-mutex (l)
       (with-recursive-lock (l)))))
 
-(with-test (:name (condition-wait :basics-1))
+(with-test (:name (condition-wait :basics-1)
+                  :skipped-on :gc-stress)
   (let ((queue (make-waitqueue :name "queue"))
         (lock (make-mutex :name "lock"))
         (n 0))
@@ -285,6 +289,7 @@
                  (assert (eql (mutex-owner lock) *current-thread*))
                  (format t "~A got mutex~%" *current-thread*)
                  ;; now drop it and sleep
+                 ;; FIXME: condition-wait returning doesn't mean there was condition-notify
                  (condition-wait queue lock)
                  ;; after waking we should have the lock again
                  (assert (eql (mutex-owner lock) *current-thread*))
@@ -300,7 +305,8 @@
         (condition-notify queue))
       (sleep 1))))
 
-(with-test (:name (condition-wait :basics-2))
+(with-test (:name (condition-wait :basics-2)
+                  :skipped-on :gc-stress)
   (let ((queue (make-waitqueue :name "queue"))
         (lock (make-mutex :name "lock")))
     (labels ((ours-p (value)
@@ -310,6 +316,7 @@
                  (assert (ours-p (mutex-owner lock)))
                  (format t "~A got mutex~%" (mutex-owner lock))
                  ;; now drop it and sleep
+                 ;; FIXME: condition-wait returning doesn't mean there was condition-notify
                  (condition-wait queue lock)
                  ;; after waking we should have the lock again
                  (format t "woken, ~A got mutex~%" (mutex-owner lock))
@@ -346,7 +353,8 @@
         (wait-on-semaphore w)
         (assert (null (join-thread th)))))))
 
-(with-test (:name (grab-mutex :timeout :acquisition-success))
+(with-test (:name (grab-mutex :timeout :acquisition-success)
+            :skipped-on :gc-stress)
   (let ((m (make-mutex))
         (child))
     (with-mutex (m)
@@ -389,7 +397,8 @@
   `(handler-case (progn (progn ,@body) nil)
     (sb-ext:timeout () t)))
 
-(with-test (:name (semaphore :wait-forever))
+(with-test (:name (semaphore :wait-forever)
+            :skipped-on (:and :sb-safepoint :linux)) ; hangs
   (let ((sem (make-semaphore :count 0)))
     (assert (raises-timeout-p
               (sb-ext:with-timeout 0.1
@@ -670,18 +679,20 @@
       (let* ((i (sb-kernel:symbol-tls-index mysym))
              (j (+ i sb-vm:n-word-bytes)))
         (assert (eql (sap-ref-word (sb-thread::current-thread-sap) j)
-                     sb-vm:no-tls-value-marker-widetag))
+                     sb-vm:no-tls-value-marker))
         (setf (sap-ref-lispobj (sb-thread::current-thread-sap) i) fool1
               (sap-ref-lispobj (sb-thread::current-thread-sap) j) fool2)
         ;; assert that my pointer arithmetic worked as expected
         (assert (eq (symbol-value mysym) fool1))
         ;; assert that FOOL1 is found by the TLS scan and that FOOL2 is not.
         (let ((list (sb-thread::%thread-local-references)))
+          (assert (not (find sb-vm:no-tls-value-marker list
+                             :key #'sb-kernel:get-lisp-obj-address)))
           (assert (member fool1 list))
           (assert (not (member fool2 list))))
         ;; repair the TLS entry that was corrupted by the test
         (setf (sap-ref-word (sb-thread::current-thread-sap) j)
-              sb-vm:no-tls-value-marker-widetag)))))
+              sb-vm:no-tls-value-marker)))))
 
 
 #|  ;; a cll post from eric marsden
@@ -727,14 +738,8 @@
     (mapc #'join-thread threads)
     (assert (not deadline-handler-run-twice?))))
 
-(with-test (:name (:mutex :finalization))
-  (let ((a nil))
-    (dotimes (i 500000)
-      (setf a (make-mutex)))))
-
 ;; You have to shoehorn this arbitrary sexpr into a feature expression
 ;; to have the test summary show that a test was disabled.
-#+gencgc
 (unless (eql (extern-alien "verify_gens" int)
              (+ sb-vm:+highest-normal-generation+ 2))
   (pushnew :verify-gens *features*))

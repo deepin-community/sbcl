@@ -15,7 +15,7 @@
 #include <stdlib.h>
 #include <ctype.h>
 
-#include "sbcl.h"
+#include "genesis/sbcl.h"
 #ifdef LISP_FEATURE_WIN32
 #include "pthreads_win32.h"
 #else
@@ -29,15 +29,12 @@
 #include "os.h"
 #include "interrupt.h"
 #include "lispregs.h"
-#include "monitor.h"
 #include "validate.h"
 #include "arch.h"
 #include "search.h"
 #include "thread.h"
-#include "getallocptr.h"
 
-#include "genesis/simple-fun.h"
-#include "genesis/fdefn.h"
+#include "genesis/closure.h"
 #include "genesis/symbol.h"
 #include "genesis/static-symbols.h"
 
@@ -47,7 +44,7 @@ static void skip_ws(char **ptr)
         (*ptr)++;
 }
 
-static boolean string_to_long(char *token, uword_t *value)
+static bool string_to_long(char *token, uword_t *value)
 {
     int base, digit;
     uword_t num;
@@ -57,7 +54,7 @@ static boolean string_to_long(char *token, uword_t *value)
         return 0;
 
     if (token[0] == '0')
-        if (token[1] == 'x') {
+        if (token[1] == 'x' || token[1] == 'X') {
             base = 16;
             token += 2;
         }
@@ -106,7 +103,7 @@ static boolean string_to_long(char *token, uword_t *value)
     return 1;
 }
 
-static boolean lookup_variable(char *name, lispobj *result)
+static bool lookup_variable(char *name, lispobj *result)
 {
     struct var *var = lookup_by_name(name);
 
@@ -119,7 +116,7 @@ static boolean lookup_variable(char *name, lispobj *result)
 }
 
 
-boolean more_p(char **ptr)
+bool more_p(char **ptr)
 {
     skip_ws(ptr);
 
@@ -172,32 +169,32 @@ int parse_number(char **ptr, int *output)
     return 0;
 }
 
-int parse_addr(char **ptr, boolean safely, char **output)
+int parse_addr(char **ptr, bool safely, char **output, FILE* errstream)
 {
     char *token = parse_token(ptr);
     lispobj result;
 
     if (token == NULL) {
-        printf("expected an address\n");
+        fprintf(errstream, "expected an address\n");
         return 0;
     }
     if (token[0] == '$') {
         if (!lookup_variable(token+1, &result)) {
-            printf("unknown variable: ``%s''\n", token);
+            fprintf(errstream, "unknown variable: ``%s''\n", token);
             return 0;
         }
         result &= ~7; // LOWTAG_MASK maybe?
     } else {
         uword_t value;
         if (!string_to_long(token, &value)) {
-            printf("invalid number: ``%s''\n", token);
+            fprintf(errstream, "invalid number: ``%s''\n", token);
             return 0;
         }
         result = (value & ~3); // what is ~3 for - word alignment?
     }
 
     if (safely && !gc_managed_addr_p(result)) {
-        printf("invalid Lisp-level address: %p\n", (void *)result);
+        fprintf(errstream, "invalid Lisp-level address: %p\n", (void *)result);
         return 0;
     }
 
@@ -212,8 +209,8 @@ static lispobj lookup_symbol(char *name)
 #ifdef LISP_FEATURE_IMMOBILE_SPACE
       { FIXEDOBJ_SPACE_START, (uword_t)fixedobj_free_pointer },
 #endif
-#if defined(LISP_FEATURE_GENCGC)
-      { DYNAMIC_SPACE_START, (uword_t)get_alloc_pointer() }
+#ifdef LISP_FEATURE_GENERATIONAL
+      { DYNAMIC_SPACE_START, dynamic_space_highwatermark() }
 #else
       { (uword_t)current_dynamic_space, (uword_t)get_alloc_pointer() }
 #endif
@@ -264,7 +261,7 @@ static int parse_regnum(char *s)
 
 int parse_lispobj(char **ptr, lispobj *output)
 {
-    struct thread *thread=get_sb_vm_thread();
+    struct thread *thread = get_sb_vm_thread();
     char *token = parse_token(ptr);
     uword_t pointer;
     lispobj result;

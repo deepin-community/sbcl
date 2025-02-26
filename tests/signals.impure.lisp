@@ -14,7 +14,8 @@
 (use-package :test-util)
 
 (sb-ext:finalize (list 1) (lambda ()))
-(with-test (:name (:async-unwind :specials))
+(with-test (:name (:async-unwind :specials)
+                  :skipped-on (:and :sb-safepoint :linux)) ; hangs
   (let ((*x0* nil) (*x1* nil) (*x2* nil) (*x3* nil) (*x4* nil))
     (declare (special *x0* *x1* *x2* *x3* *x4*))
     (loop repeat 10 do
@@ -93,7 +94,8 @@
                 (sb-sys:interactive-interrupt ()
                   :condition)))))
 
-(with-test (:name :bug-640516)
+(with-test (:name :bug-640516
+                  :skipped-on :gc-stress)
   ;; On Darwin interrupting a SLEEP so that it took longer than
   ;; the requested amount caused it to hang.
   (assert

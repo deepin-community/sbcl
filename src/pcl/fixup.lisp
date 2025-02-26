@@ -57,6 +57,12 @@
                      (make-std-boundp-method-function 'slot-object slot-name)
                      "automatically-generated boundp method"
                      (make-fallback-boundp-method-function slot-name)
+                     fallback-reader-specializers))
+            (makunbound
+             (values '(object) reader-specializers 'global-makunbound-method
+                     (make-std-makunbound-method-function 'slot-object slot-name)
+                     "automatically-generated makunbound method"
+                     (make-fallback-makunbound-method-function slot-name)
                      fallback-reader-specializers)))
         (let ((gf (ensure-generic-function fun-name :lambda-list lambda-list)))
           (add-method gf (make-a-method method-class ()
@@ -71,6 +77,7 @@
   (fmakunbound gf-name)
   (ensure-accessor gf-name))
 
+(setq sb-kernel::*defstruct-hooks* '(ensure-defstruct-class))
 (compute-standard-slot-locations)
 (dolist (s '(condition function structure-object))
   (sb-kernel::do-subclassoids ((k v) (find-classoid s))
@@ -87,6 +94,14 @@
 ;;;
 (let ((class (find-class 'function)))
   (setf (slot-value class 'prototype) #'identity))
+
+;;; consistency check: all our standard SLOT-VALUE-USING-CLASS methods are available
+;;; and distinct from each other.
+(let (set)
+  (dolist (type '(reader writer boundp makunbound))
+    (dolist (fun '(standard-svuc-method structure-svuc-method condition-svuc-method))
+      (pushnew (funcall fun type) set)))
+  (assert (= (length set) 12)))
 
 (dolist (symbol '(add-method allocate-instance class-name compute-applicable-methods
                   ensure-generic-function make-instance method-qualifiers

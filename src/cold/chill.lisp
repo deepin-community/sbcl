@@ -21,17 +21,8 @@
 
 (setq *features* (union *features* sb-impl:+internal-features+))
 
-(defstruct package-data name doc shadow export reexport import-from use)
-(export 'package-data)
-(dolist (data (with-open-file (f (merge-pathnames "package-data-list.lisp-expr" *load-pathname*))
-                (read f)))
-  (labels ((flatten (tree)
-             (mapcan (lambda (x) (if (listp x) (flatten x) (list x)))
-                     tree)))
-    (let ((*package* (find-package (package-data-name data))))
-      (dolist (x (flatten (package-data-export data)))
-        (let ((symbol (intern x)))
-          (ignore-errors (export symbol)))))))
+(defun backend-asm-package-name ()
+  (package-name sb-assem::*backend-instruction-set-package*))
 
 (sb-ext:unlock-package "CL")
 (rename-package "COMMON-LISP" "COMMON-LISP"
@@ -42,12 +33,7 @@
     (when (sb-int:system-package-p (find-package name))
       (sb-ext:unlock-package package))))
 
-;;; Restore target floating-point number syntax
-(defun read-target-float (stream char)
-  (declare (ignore stream char))
-  (values)) ; ignore the $ as if it weren't there
-(compile 'read-target-float)
-(set-macro-character #\$ #'read-target-float t)
+(load (merge-pathnames "exports.lisp" *load-pathname*))
 
 (unless (fboundp 'sb-int:!cold-init-forms)
   (defmacro sb-int:!cold-init-forms (&rest forms) `(progn ,@forms)))

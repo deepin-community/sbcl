@@ -1,5 +1,6 @@
 (defpackage "SB-GMP-TESTS"
-  (:use "COMMON-LISP" "SB-GMP" "SB-RT"))
+  (:import-from #:test-util #:deftest)
+  (:use "COMMON-LISP" "SB-GMP"))
 
 (in-package "SB-GMP-TESTS")
 
@@ -201,6 +202,10 @@
 (deftest intexp-1
     (sb-gmp::gmp-intexp 1 (ash 1 127))
   1)
+
+(deftest intexp-2
+    (sb-gmp::gmp-intexp 113/355 -1)
+  355/113)
 
 (deftest remove-1
     (multiple-value-list (mpz-remove 28 2))

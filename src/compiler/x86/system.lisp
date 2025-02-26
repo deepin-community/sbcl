@@ -68,7 +68,7 @@
     (inst cmp
           (make-ea :dword
                    :disp (+ (id-bits-offset)
-                            (ash (- (wrapper-depthoid test) 2) 2)
+                            (ash (- (layout-depthoid test) 2) 2)
                             (- instance-pointer-lowtag))
                    :base x)
           (if (or (typep (layout-id test) '(and (signed-byte 8) (not (eql 0))))
@@ -120,8 +120,8 @@
     (load-type al-tn x (- other-pointer-lowtag))
     (storew eax x 0 other-pointer-lowtag)))
 
-(define-vop (test-header-bit)
-  (:translate test-header-bit)
+(define-vop (test-header-data-bit)
+  (:translate test-header-data-bit)
   (:policy :fast-safe)
   (:args (array :scs (descriptor-reg)))
   (:arg-types t (:constant t))
@@ -130,17 +130,13 @@
   (:generator 1
     ;; Assert that the mask is in header-data byte index 0
     ;; which is byte index 1 of the whole header word.
-    (aver (typep mask '(unsigned-byte 8)))
-    (inst test (make-ea :byte :disp (- 1 other-pointer-lowtag) :base array) mask)))
-
-(define-vop (pointer-hash)
-  (:translate pointer-hash)
-  (:args (ptr :scs (any-reg descriptor-reg) :target res))
-  (:results (res :scs (any-reg descriptor-reg)))
-  (:policy :fast-safe)
-  (:generator 1
-    (move res ptr)
-    (inst and res (lognot fixnum-tag-mask))))
+    (cond ((typep mask '(unsigned-byte 8))
+           (inst test (make-ea :byte :disp (- 1 other-pointer-lowtag) :base array) mask))
+          ((and (typep mask '(unsigned-byte 16)) (not (logtest mask #xFF)))
+           (inst test (make-ea :byte :disp (- 2 other-pointer-lowtag) :base array)
+                 (ash mask -8)))
+          (t
+           (bug "Unimplemented")))))
 
 ;;;; allocation
 
@@ -228,44 +224,8 @@
   (:results (result :scs (descriptor-reg)))
   (:generator 3
     (loadw result function closure-fun-slot fun-pointer-lowtag)
-    (inst lea result
-          (make-ea :byte :base result
-                   :disp (- fun-pointer-lowtag
-                            (* simple-fun-insts-offset n-word-bytes))))))
+    (inst sub result (- (* simple-fun-insts-offset n-word-bytes) fun-pointer-lowtag))))
 
-;;;; symbol frobbing
-
-(define-vop (symbol-info-vector)
-  (:policy :fast-safe)
-  (:translate symbol-info-vector)
-  (:args (x :scs (descriptor-reg)))
-  (:results (res :scs (descriptor-reg)))
-  (:temporary (:sc unsigned-reg :offset eax-offset) eax)
-  (:generator 1
-    (loadw res x symbol-info-slot other-pointer-lowtag)
-    ;; If RES has list-pointer-lowtag, take its CDR. If not, use it as-is.
-    ;; This CMOV safely reads from memory when it does not move, because if
-    ;; there is an info-vector in the slot, it has at least one element.
-    ;; This would compile to almost the same code without a VOP,
-    ;; but using a jmp around a mov instead.
-    (inst lea eax (make-ea :dword :base res :disp (- list-pointer-lowtag)))
-    (emit-optimized-test-inst eax lowtag-mask)
-    (inst cmov :e res
-          (object-slot-ea res cons-cdr-slot list-pointer-lowtag))))
-(define-vop (symbol-plist)
-  (:policy :fast-safe)
-  (:translate symbol-plist)
-  (:args (x :scs (descriptor-reg)))
-  (:results (res :scs (descriptor-reg)))
-  (:temporary (:sc unsigned-reg) temp)
-  (:generator 1
-    (loadw res x symbol-info-slot other-pointer-lowtag)
-    ;; Instruction pun: (CAR x) is the same as (VECTOR-LENGTH x)
-    ;; so if the info slot holds a vector, this gets a fixnum- it's not a plist.
-    (loadw res res cons-car-slot list-pointer-lowtag)
-    (inst mov temp nil-value)
-    (emit-optimized-test-inst res fixnum-tag-mask)
-    (inst cmov :e res temp)))
 
 ;;;; other miscellaneous VOPs
 
@@ -458,3 +418,10 @@ number of CPU cycles elapsed as secondary value. EXPERIMENTAL."
    (move b ebx)
    (move c ecx)
    (move d edx)))
+
+(define-vop (sb-c::mark-covered)
+ (:info index)
+ (:generator 1
+   ;; Can't convert index to a code-relative index until the boxed header length
+   ;; has been determined.
+   (inst store-coverage-mark index)))

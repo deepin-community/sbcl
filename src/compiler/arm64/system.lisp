@@ -57,6 +57,22 @@
     (inst ldrb result (@ object result))
     done))
 
+;;; Return an index suitable for **PRIMITIVE-OBJECT-LAYOUTS**, with
+;;; instance and funcallable-instance already handled.
+(define-vop (widetag-of-for-layout)
+  (:policy :fast-safe)
+  (:args (object :scs (descriptor-reg)))
+  (:arg-refs object-ref)
+  (:results (result :scs (unsigned-reg) :from :load))
+  (:result-types positive-fixnum)
+  (:generator 6
+    (inst and result object widetag-mask)
+    (inst and tmp-tn object lowtag-mask)
+    (inst cmp tmp-tn other-pointer-lowtag)
+    (inst b :ne done)
+    (inst ldrb result (@ object (- other-pointer-lowtag)))
+    done))
+
 (define-vop (layout-depthoid)
   (:translate layout-depthoid)
   (:policy :fast-safe)
@@ -73,37 +89,6 @@
                            (get-dsd-index layout sb-kernel::flags))
                         word-shift))
                 instance-pointer-lowtag))))))
-
-;;; This could be split into two vops to avoid wasting an allocation for 'temp'
-;;; when the immediate form is used.
-(define-vop ()
-  (:translate sb-c::%structure-is-a)
-  (:args (x :scs (descriptor-reg)))
-  (:arg-types * (:constant t))
-  (:policy :fast-safe)
-  (:conditional :eq)
-  (:info test-layout)
-  (:temporary (:sc unsigned-reg) this-id temp)
-  (:generator 4
-    (let ((test-id (layout-id test-layout))
-          (offset (+ (id-bits-offset)
-                     (ash (- (wrapper-depthoid test-layout) 2) 2)
-                     (- instance-pointer-lowtag))))
-      (declare (ignorable test-id))
-      (inst ldr (32-bit-reg this-id) (@ x offset))
-      ;; 8-bit IDs are permanently assigned, so no fixup ever needed for those.
-      (cond ((typep test-id '(and (signed-byte 8) (not (eql 0))))
-             (if (minusp test-id)
-                 (inst cmn (32-bit-reg this-id) (- test-id))
-                 (inst cmp (32-bit-reg this-id) test-id)))
-            (t
-             (destructuring-bind (size . label)
-                 ;; This uses the bogus definition of :dword, the one which
-                 ;; emits 4 bytes. _technically_ dword should be 8 bytes.
-                 (register-inline-constant :dword `(:layout-id ,test-layout))
-               (declare (ignore size))
-               (inst load-from-label (32-bit-reg temp) label))
-             (inst cmp (32-bit-reg this-id) (32-bit-reg temp)))))))
 
 (define-vop (%other-pointer-widetag)
   (:translate %other-pointer-widetag)
@@ -149,23 +134,23 @@
        (inst orr t1 t1 (logical-mask (ash (tn-value data) n-widetag-bits)))))
     (storew t1 x 0 other-pointer-lowtag)))
 
-(define-vop (pointer-hash)
-  (:translate pointer-hash)
-  (:args (ptr :scs (any-reg descriptor-reg)))
-  (:results (res :scs (any-reg descriptor-reg)))
+(define-vop ()
+  (:translate test-header-data-bit)
   (:policy :fast-safe)
+  (:args (array :scs (descriptor-reg)))
+  (:info mask)
+  (:arg-types t (:constant t))
+  (:conditional :ne)
   (:generator 1
-    (inst and res ptr (lognot fixnum-tag-mask))))
+    (let ((byte 1))
+      (when (> mask #xff)
+        (aver (zerop (ldb (byte 8 0) mask)))
+        (setf mask (ash mask -8)
+              byte 2))
+      (inst ldrb tmp-tn (@ array (- byte other-pointer-lowtag)))
+      (inst tst tmp-tn mask))))
 
 ;;;; Allocation
-
-(define-vop (dynamic-space-free-pointer)
-  (:results (int :scs (sap-reg)))
-  (:result-types system-area-pointer)
-  (:translate dynamic-space-free-pointer)
-  (:policy :fast-safe)
-  (:generator 1
-    (load-symbol-value int *allocation-pointer*)))
 
 (define-vop (binding-stack-pointer-sap)
   (:results (int :scs (sap-reg)))
@@ -223,39 +208,15 @@
     (inst add ndescr offset ndescr)
     (inst sub ndescr ndescr (- other-pointer-lowtag fun-pointer-lowtag))
     (inst add func code ndescr)))
-;;;
 
-(defun load-symbol-info-vector (result symbol temp)
-  (assemble ()
-    (loadw result symbol symbol-info-slot other-pointer-lowtag)
-    ;; If RESULT has list-pointer-lowtag, take its CDR. If not, use it as-is.
-    (inst and temp result lowtag-mask)
-    (inst cmp temp list-pointer-lowtag)
-    (inst b :ne NE)
-    (loadw result result cons-cdr-slot list-pointer-lowtag)
-    NE))
-
-(define-vop (symbol-info-vector)
+(define-vop (%closure-fun)
   (:policy :fast-safe)
-  (:translate symbol-info-vector)
-  (:args (x :scs (descriptor-reg)))
-  (:results (res :scs (descriptor-reg)))
-  (:temporary (:sc unsigned-reg) temp)
-  (:generator 1
-    (load-symbol-info-vector res x temp)))
-
-(define-vop (symbol-plist)
-  (:policy :fast-safe)
-  (:translate symbol-plist)
-  (:args (x :scs (descriptor-reg)))
-  (:results (res :scs (descriptor-reg)))
-  (:generator 1
-    (loadw res x symbol-info-slot other-pointer-lowtag)
-    ;; Instruction pun: (CAR x) is the same as (VECTOR-LENGTH x)
-    ;; so if the info slot holds a vector, this gets a fixnum- it's not a plist.
-    (loadw res res cons-car-slot list-pointer-lowtag)
-    (inst tst res fixnum-tag-mask)
-    (inst csel res null-tn res :eq)))
+  (:translate %closure-fun)
+  (:args (function :scs (descriptor-reg)))
+  (:results (result :scs (descriptor-reg)))
+  (:generator 3
+    (loadw result function closure-fun-slot fun-pointer-lowtag)
+    (inst add-sub result result (- fun-pointer-lowtag (* simple-fun-insts-offset n-word-bytes)))))
 
 ;;;; other miscellaneous VOPs
 
@@ -288,10 +249,12 @@
     (:result-types system-area-pointer)
     (:translate current-thread-offset-sap)
     (:info n)
-    (:arg-types (:constant (satisfies ldr-str-offset-encodable)))
+    (:arg-types (:constant (satisfies ldr-str-word-offset-encodable)))
     (:policy :fast-safe)
     (:generator 1
-                (inst ldr sap (@ thread-tn (ash n word-shift)))))
+      (if (= n thread-this-slot)
+          (move sap thread-tn)
+          (inst ldr sap (@ thread-tn (ash n word-shift))))))
 
   (define-vop (current-thread-offset-sap)
     (:results (sap :scs (sap-reg)))
@@ -301,7 +264,7 @@
     (:arg-types signed-num)
     (:policy :fast-safe)
     (:generator 2
-                (inst ldr sap (@ thread-tn (extend n :lsl word-shift))))))
+      (inst ldr sap (@ thread-tn (extend n :lsl word-shift))))))
 
 ;;; Barriers
 (define-vop (%compiler-barrier)
@@ -340,3 +303,27 @@
    ;; Can't compute code-tn-relative index until the boxed header length
    ;; is known. Some vops emit new boxed words via EMIT-CONSTANT.
    (inst store-coverage-mark index tmp vector)))
+
+(define-vop ()
+  (:translate sb-lockless:get-next)
+  (:policy :fast-safe)
+  (:args (node :scs (descriptor-reg)))
+  (:results (next-tagged :scs (descriptor-reg))
+            (next-bits :scs (descriptor-reg)))
+  (:generator 10
+    ;; Read the first user-data slot and convert to a tagged pointer,
+    ;; also returning the raw value as a secondary result
+    (pseudo-atomic (tmp-tn :sync nil)
+      (loadw next-bits node (+ instance-slots-offset instance-data-start)
+             instance-pointer-lowtag)
+      (inst orr next-tagged next-bits instance-pointer-lowtag))))
+
+
+(define-vop (switch-to-arena)
+  (:args (x :scs (descriptor-reg immediate)))
+  (:temporary (:sc unsigned-reg :offset nl0-offset :from (:argument 0)) arg0)
+  (:temporary (:sc unsigned-reg :offset nl1-offset) arg1)
+  (:vop-var vop)
+  (:generator 1
+    (inst mov arg0 (if (sc-is x immediate) (tn-value x) x))
+    (invoke-asm-routine 'switch-to-arena arg1)))

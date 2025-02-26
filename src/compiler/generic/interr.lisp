@@ -58,7 +58,7 @@
                           (remove-if (lambda (x) (member x '(nil t)))
                                      sb-vm:*specialized-array-element-type-properties*
                                      :key 'sb-vm:saetp-specifier))))
-                `(((integer 0 ,array-dimension-limit)
+                `(((mod ,(1+ array-dimension-limit))
                    object-not-array-dimension)
                   ;; Union of all unboxed array specializations,
                   ;; for type-checking the argument to VECTOR-SAP
@@ -73,16 +73,20 @@
         ;; Error number must be of type (unsigned-byte 8).
         (assert (<= (length list) 256))
         `(defconstant-eqx sb-c:+backend-internal-errors+
-               ,(map 'vector
-                     (lambda (x)
+             ,(map 'vector
+                   (lambda (x)
+                     (flet ((normalize-type (type)
+                              (if (stringp type)
+                                  type
+                                  (type-specifier (specifier-type type)))))
                        (if (symbolp x)
-                           (list* x (symbolicate "OBJECT-NOT-" x "-ERROR") 1)
-                           (list* (car x) (symbolicate (second x) "-ERROR")
+                           (list* (normalize-type x) (symbolicate "OBJECT-NOT-" x "-ERROR") 1)
+                           (list* (normalize-type (car x)) (symbolicate (second x) "-ERROR")
                                   (if (stringp (car x))
                                       (third x)
-                                      1))))
-                     list)
-               #'equalp))))
+                                      1)))))
+                   list)
+           #'equalp))))
  (compute-it
   ;; Keep the following two subsets of internal errors in this order:
   ;;
@@ -103,8 +107,9 @@
    ("An attempt was made to use an undefined SYMBOL-VALUE." unbound-symbol 1)
    ("attempt to RETURN-FROM a block that no longer exists" invalid-unwind 0)
    ("attempt to THROW to a non-existent tag" unseen-throw-tag 1)
-   ("division by zero" division-by-zero 2)
+   ("division by zero" division-by-zero 1)
    ("Object is of the wrong type." object-not-type 2)
+   ("check-type error" check-type 3)
    ("ECASE failure" ecase-failure 2)
    ("ETYPECASE failure" etypecase-failure 2)
    ("odd number of &KEY arguments" odd-key-args 0)
@@ -116,9 +121,21 @@
    ("An array with element-type NIL was accessed." nil-array-accessed 1)
    ("Object layout is invalid. (indicates obsolete instance)" layout-invalid 2)
    ("Thread local storage exhausted." tls-exhausted 0)
+   ("Stack allocated object overflows stack." stack-allocated-object-overflows-stack 1)
    ("Unreachable code reached" unreachable 0)
-   ("Failed aver" failed-aver 1))
-
+   ("Failed aver" failed-aver 1)
+   ("Multiplication overflow" mul-overflow 2)
+   ("Add overflow" add-sub-overflow 1)
+   #+x86-64
+   ("Sub overflow" sub-overflow 1)
+   ("Add overflow" signed-unsigned-add-overflow 1)
+   ("Add overflow" add-overflow2 2)
+   ("Sub overflow" sub-overflow2 2)
+   ("Mul overflow" mul-overflow2 2)
+   ("ASH overflow" ash-overflow2 2)
+   ("Negate overflow" negate-overflow 1)
+   ("FILL-POINTER error" fill-pointer 1)
+   ("MPRINT" mprint 1))
   ;; (II) All the type specifiers X for which there is a unique internal
   ;;      error code corresponding to a primitive object-not-X-error.
   function
@@ -188,7 +205,7 @@
   sb-c::vop
   sb-c::basic-combination
   sb-sys:fd-stream
-  wrapper
+  layout
   (sb-assem:segment object-not-assem-segment)
   sb-c::cblock
   sb-disassem:disassem-state
@@ -223,7 +240,18 @@
   sb-format::format-directive
   package
   form-tracking-stream
-  ansi-stream))
+  ansi-stream
+  ((unsigned-byte 16) object-not-unsigned-byte-16)
+  ((signed-byte 8) object-not-signed-byte-8)
+  ((signed-byte 16) object-not-signed-byte-16)
+  ((or index list) object-not-index-or-list)
+  condition
+  sb-pcl::fast-method-call
+  ((or symbol string) object-not-symbol-or-string)
+  ((or symbol string character) object-not-string-designator)
+  ((and unsigned-byte fixnum) object-not-unsigned-fixnum)
+  bit-index
+  ((vector t) object-not-vector-t)))
 
 (defun error-number-or-lose (name)
   (or (position name sb-c:+backend-internal-errors+

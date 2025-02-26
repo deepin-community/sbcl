@@ -231,10 +231,9 @@
   (:info foreign-symbol)
   (:results (res :scs (sap-reg)))
   (:result-types system-area-pointer)
-  (:temporary (:scs (non-descriptor-reg)) addr)
   (:generator 2
-    (inst li addr (make-fixup foreign-symbol :foreign-dataref))
-    (loadw res addr)))
+    (inst li res (make-fixup foreign-symbol :foreign-dataref))
+    (loadw res res)))
 
 (define-vop (call-out)
   (:args (function :scs (sap-reg) :target cfunc)
@@ -251,8 +250,8 @@
     (let ((cur-nfp (current-nfp-tn vop)))
       (when cur-nfp
         (store-stack-tn nfp-save cur-nfp))
-      ;; (linkage-table-entry-address 0) is "call-into-c" in mips-assem.S
-      (inst lw tramp null-tn (- (linkage-table-entry-address 0) nil-value))
+      ;; (alien-linkage-table-entry-address 0) is "call-into-c" in mips-assem.S
+      (inst lw tramp null-tn (- (alien-linkage-table-entry-address 0) nil-value))
       (inst nop)
       (inst jal tramp)
       (inst move cfunc function)
@@ -330,9 +329,9 @@
   "Cons up a piece of code which calls enter-alien-callback with INDEX
 and a pointer to the arguments."
   (flet ((make-gpr (n)
-           (make-random-tn :kind :normal :sc (sc-or-lose 'any-reg) :offset n))
+           (make-random-tn (sc-or-lose 'any-reg) n))
          (make-fpr (n)
-           (make-random-tn :kind :normal :sc (sc-or-lose 'double-reg) :offset n)))
+           (make-random-tn (sc-or-lose 'double-reg) n)))
     (let* ((segment (make-segment))
            (n-argument-words
              (mapcar (lambda (arg) (ceiling (alien-type-bits arg) n-word-bits))
@@ -362,8 +361,9 @@ and a pointer to the arguments."
                         (incf words-processed)
                         (incf offset n-word-bytes))
                       (when gprs
-                        (loop repeat words
+                        (loop
                           for gpr = (pop gprs)
+                          repeat words
                           when gpr do
                             (inst sw gpr nsp-tn offset)
                           do

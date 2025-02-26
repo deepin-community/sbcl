@@ -32,7 +32,7 @@
 (defun c-strings->string-list (c-strings)
   (declare (type (alien (* c-string)) c-strings))
   (let ((reversed-result nil))
-    (dotimes (i most-positive-fixnum (error "argh! can't happen"))
+    (dotimes (i most-positive-fixnum)
       (declare (type index i))
       (let ((c-string (deref c-strings i)))
         (if c-string
@@ -61,30 +61,34 @@
     ;; called directly is listed explicitly, because there are also others
     ;; that might want to be wrapped even if they don't need to be,
     ;; like sb_opendir and sb_closedir. Why are those wrapped in fact?
-    #+netbsd x
-    #-netbsd (if (member x '("sb_getrusage" ; syscall*
-                             "sb_gettimeofday" ;syscall*
-                             "sb_select" ; int-syscall
-                             "sb_getitimer" ; syscall*
-                             "sb_setitimer" ; syscall*
-                             "sb_clock_gettime" ; alien-funcall
-                             "sb_utimes") ; posix
-                         :test #'string=)
-                 (subseq x 3)
-                 x)))
+    #+(or netbsd (not 64-bit)) x
+    #-(or netbsd (not 64-bit))
+    (if (member x '("sb_getrusage"      ; syscall*
+                    "sb_gettimeofday"   ;syscall*
+                    "sb_clock_gettime"  ; alien-funcall
+                    "sb_select"         ; int-syscall
+                    "sb_getitimer"      ; syscall*
+                    "sb_setitimer"      ; syscall*
+                    "sb_utimes")        ; posix
+                :test #'string=)
+        (subseq x 3)
+        x)))
 
-(defmacro syscall ((name &rest arg-types) success-form &rest args)
+(defmacro syscall-type ((name return-type &rest arg-types) success-form &rest args)
   (when (eql 3 (mismatch "[_]" name))
     (setf name
           (concatenate 'string #+win32 "_" (subseq name 3))))
   `(locally
-    (declare (optimize (sb-c::float-accuracy 0)))
-    (let ((result (alien-funcall (extern-alien ,(libc-name-for name)
-                                               (function int ,@arg-types))
-                                ,@args)))
-      (if (minusp result)
-          (values nil (get-errno))
-          ,success-form))))
+       (declare (optimize (sb-c::float-accuracy 0)))
+     (let ((result (alien-funcall (extern-alien ,(libc-name-for name)
+                                                (function ,return-type ,@arg-types))
+                                  ,@args)))
+       (if (minusp result)
+           (values nil (get-errno))
+           ,success-form))))
+
+(defmacro syscall ((name &rest arg-types) success-form &rest args)
+  `(syscall-type (,name int ,@arg-types) ,success-form ,@args))
 
 ;;; This is like SYSCALL, but if it fails, signal an error instead of
 ;;; returning error codes. Should only be used for syscalls that will
@@ -101,6 +105,9 @@
 
 (defmacro int-syscall ((name &rest arg-types) &rest args)
   `(syscall (,(libc-name-for name) ,@arg-types) (values result 0) ,@args))
+
+(defmacro type-syscall ((name return-type &rest arg-types) &rest args)
+  `(syscall-type (,(libc-name-for name) ,return-type ,@arg-types) (values result 0) ,@args))
 
 (defmacro with-restarted-syscall ((&optional (value (gensym))
                                              (errno (gensym)))
@@ -182,7 +189,9 @@ corresponds to NAME, or NIL if there is none."
     (locally
         (declare (optimize (sb-c::float-accuracy 0)))
       (let ((result (alien-funcall (extern-alien "open" (function int c-string int &optional int))
-                                   path (logior flags) mode)))
+                                   path (logior flags
+                                                #+largefile o_largefile)
+                                   mode)))
         (if (minusp result)
             (values nil (get-errno))
             (values result 0))))))
@@ -318,9 +327,14 @@ corresponds to NAME, or NIL if there is none."
 
 (defun unix-read (fd buf len)
   (declare (type unix-fd fd)
-           (type (unsigned-byte 32) len))
-  (int-syscall (#-win32 "read" #+win32 "win32_unix_read"
-                int (* char) int) fd buf len))
+           (type index len))
+  (type-syscall (#-win32 "read" #+win32 "win32_unix_read"
+                 ssize-t
+                 int (* char) size-t)
+                fd buf
+                (min len
+                     #+(or darwin freebsd)
+                     (1- (expt 2 31)))))
 
 ;;; UNIX-WRITE accepts a file descriptor, a buffer, an offset, and the
 ;;; length to write. It attempts to write len bytes to the device
@@ -332,15 +346,17 @@ corresponds to NAME, or NIL if there is none."
   ;; full calls to SB-ALIEN-INTERNALS:DEPORT-ALLOC and DEPORT.
   (declare (optimize (debug 1)))
   (declare (type unix-fd fd)
-           (type (unsigned-byte 32) offset len))
+           (type index offset len))
   (flet ((%write (sap)
            (declare (system-area-pointer sap))
-           (int-syscall (#-win32 "write" #+win32 "win32_unix_write"
-                         int (* char) int)
-                        fd
-                        (with-alien ((ptr (* char) sap))
-                          (addr (deref ptr offset)))
-                        len)))
+           (type-syscall (#-win32 "write" #+win32 "win32_unix_write"
+                          ssize-t int (* char) size-t)
+                         fd
+                         (with-alien ((ptr (* char) sap))
+                           (addr (deref ptr offset)))
+                         (min len
+                              #+(or darwin freebsd)
+                              (1- (expt 2 31))))))
     (etypecase buf
       ((simple-array * (*))
        (with-pinned-objects (buf)
@@ -549,7 +565,7 @@ avoiding atexit(3) hooks, etc. Otherwise exit(2) is called."
 (defun unix-ioctl (fd cmd arg)
   (declare (type unix-fd fd)
            (type word cmd))
-  (void-syscall ("ioctl" int unsigned-long (* char)) fd cmd arg))
+  (void-syscall ("ioctl" int unsigned-long &optional (* char)) fd cmd arg))
 
 ;;;; sys/resource.h
 
@@ -631,15 +647,21 @@ avoiding atexit(3) hooks, etc. Otherwise exit(2) is called."
       (note-dangerous-wait "poll(2)"))
     (let ((events (ecase direction
                     (:input (logior pollin pollpri))
-                    (:output pollout))))
+                    (:output pollout)))
+          (deadline (if (minusp to-msec)
+                        to-msec
+                        (+ (* (get-universal-time) 1000) to-msec))))
       (with-alien ((fds (struct pollfd)))
         (with-restarted-syscall (count errno)
-          (progn
+          (let ((timeout (if (minusp to-msec)
+                             -1
+                             (max 0 (- deadline (* 1000 (get-universal-time)))))))
+            (declare (fixnum timeout))
             (setf (slot fds 'fd) fd
                   (slot fds 'events) events
                   (slot fds 'revents) 0)
             (int-syscall ("poll" (* (struct pollfd)) int int)
-                         (addr fds) 1 to-msec))
+                         (addr fds) 1 timeout))
           (if (zerop errno)
               (let ((revents (slot fds 'revents)))
                 (or (and (eql 1 count) (logtest events revents))
@@ -655,8 +677,6 @@ avoiding atexit(3) hooks, etc. Otherwise exit(2) is called."
                         (1- ,n)))))
      (declare (type (integer 0 #.fd-setsize) ,n))
      ,@body))
-
-;;;; FIXME: Why have both UNIX-SELECT and UNIX-FAST-SELECT?
 
 ;;; Perform the UNIX select(2) system call.
 (declaim (inline unix-fast-select))
@@ -683,69 +703,7 @@ avoiding atexit(3) hooks, etc. Otherwise exit(2) is called."
                (note-dangerous-wait "select(2)"))
              (select (int-sap 0)))))))
 
-;;; UNIX-SELECT accepts sets of file descriptors and waits for an event
-;;; to happen on one of them or to time out.
-(declaim (inline num-to-fd-set fd-set-to-num))
-(defun num-to-fd-set (fdset num)
-  (typecase num
-    (fixnum
-     (setf (deref (slot fdset 'fds-bits) 0) num)
-     (loop for index from 1 below (/ fd-setsize
-                                     sb-vm:n-machine-word-bits)
-           do (setf (deref (slot fdset 'fds-bits) index) 0)))
-    (t
-     (loop for index from 0 below (/ fd-setsize
-                                     sb-vm:n-machine-word-bits)
-           do (setf (deref (slot fdset 'fds-bits) index)
-                    (ldb (byte sb-vm:n-machine-word-bits
-                               (* index sb-vm:n-machine-word-bits))
-                         num))))))
-
-(defun fd-set-to-num (nfds fdset)
-  (if (<= nfds sb-vm:n-machine-word-bits)
-      (deref (slot fdset 'fds-bits) 0)
-      (loop for index below (/ fd-setsize
-                               sb-vm:n-machine-word-bits)
-            sum (ash (deref (slot fdset 'fds-bits) index)
-                     (* index sb-vm:n-machine-word-bits)))))
-
-;;; Examine the sets of descriptors passed as arguments to see whether
-;;; they are ready for reading and writing. See the UNIX Programmer's
-;;; Manual for more information.
-(defun unix-select (nfds rdfds wrfds xpfds to-secs &optional (to-usecs 0))
-  (declare (muffle-conditions compiler-note))
-  (declare (type integer nfds)
-           (type unsigned-byte rdfds wrfds xpfds)
-           (type (or (unsigned-byte 31) null) to-secs)
-           (type (unsigned-byte 31) to-usecs)
-           (optimize (speed 3) (safety 0)))
-  (with-fd-setsize (nfds)
-    (with-alien ((tv (struct timeval))
-                 (rdf (struct fd-set))
-                 (wrf (struct fd-set))
-                 (xpf (struct fd-set)))
-      (cond (to-secs
-             (setf (slot tv 'tv-sec) to-secs
-                   (slot tv 'tv-usec) to-usecs))
-            ((not *interrupts-enabled*)
-             (note-dangerous-wait "select(2)")))
-      (num-to-fd-set rdf rdfds)
-      (num-to-fd-set wrf wrfds)
-      (num-to-fd-set xpf xpfds)
-      (macrolet ((frob (lispvar alienvar)
-                   `(if (zerop ,lispvar)
-                        (int-sap 0)
-                        (alien-sap (addr ,alienvar)))))
-        (syscall ("sb_select" int (* (struct fd-set)) (* (struct fd-set))
-                           (* (struct fd-set)) (* (struct timeval)))
-                 (values result
-                         (fd-set-to-num nfds rdf)
-                         (fd-set-to-num nfds wrf)
-                         (fd-set-to-num nfds xpf))
-                 nfds (frob rdfds rdf) (frob wrfds wrf) (frob xpfds xpf)
-                 (if to-secs (alien-sap (addr tv)) (int-sap 0)))))))
-
-;;; Lisp-side implmentations of FD_FOO macros.
+;;; Lisp-side implementations of FD_FOO macros.
 (declaim (inline fd-set fd-clr fd-isset fd-zero))
 (defun fd-set (offset fd-set)
   (multiple-value-bind (word bit) (floor offset
@@ -775,29 +733,34 @@ avoiding atexit(3) hooks, etc. Otherwise exit(2) is called."
 
 #-os-provides-poll
 (defun unix-simple-poll (fd direction to-msec)
-  (multiple-value-bind (to-sec to-usec)
-      (if (minusp to-msec)
-          (values nil nil)
-          (multiple-value-bind (to-sec to-msec2) (truncate to-msec 1000)
-            (values to-sec (* to-msec2 1000))))
-    (with-restarted-syscall (count errno)
-      (with-alien ((fds (struct fd-set)))
-        (fd-zero fds)
-        (fd-set fd fds)
-        (multiple-value-bind (read-fds write-fds)
-            (ecase direction
-              (:input
-               (values (addr fds) nil))
-              (:output
-               (values nil (addr fds))))
-          (unix-fast-select (1+ fd)
-                                    read-fds write-fds nil
-                                    to-sec to-usec)))
-      (case count
-        ((1) t)
-        ((0) nil)
-        (otherwise
-         (error "Syscall select(2) failed on fd ~D: ~A" fd (strerror)))))))
+  (flet ((msec-to-sec-usec (msec)
+           (multiple-value-bind (sec msec2) (truncate msec 1000)
+             (values sec (* msec2 1000)))))
+    (let ((deadline (if (minusp to-msec)
+                        to-msec
+                        (+ (* (get-universal-time) 1000) to-msec))))
+      (with-restarted-syscall (count errno)
+        (with-alien ((fds (struct fd-set)))
+          (fd-zero fds)
+          (fd-set fd fds)
+          (multiple-value-bind (to-sec to-usec)
+              (if (minusp to-msec)
+                  (values nil nil)
+                  (msec-to-sec-usec (max 0 (- deadline (* 1000 (get-universal-time))))))
+            (multiple-value-bind (read-fds write-fds)
+                (ecase direction
+                  (:input
+                   (values (addr fds) nil))
+                  (:output
+                   (values nil (addr fds))))
+              (unix-fast-select (1+ fd)
+                                read-fds write-fds nil
+                                to-sec to-usec))))
+        (case count
+          ((1) t)
+          ((0) nil)
+          (otherwise
+           (error "Syscall select(2) failed on fd ~D: ~A" fd (strerror))))))))
 
 ;;;; sys/stat.h
 
@@ -932,8 +895,9 @@ avoiding atexit(3) hooks, etc. Otherwise exit(2) is called."
 
 (define-alien-routine get-timezone int
   (when time-t)
-  ;; KLUDGE: the runtime `boolean' is defined as `int', but the alien
-  ;; type is N-WORD-BITS wide.
+  ;; BOOLEAN is N-WORD-BITS normally. Reduce it to an unsigned int in size.
+  ;; But we can't just put UNSIGNED-INT here because the clients of this function
+  ;; want to receive a T or NIL, not a 1 or 0.
   (daylight-savings-p (boolean 32) :out))
 #-win32
 (defun nanosleep (secs nsecs)
@@ -953,15 +917,6 @@ avoiding atexit(3) hooks, etc. Otherwise exit(2) is called."
                  seconds)
   nil)
 
-;;;; sys/time.h
-
-;;; Structure crudely representing a timezone. KLUDGE: This is
-;;; obsolete and should never be used.
-(define-alien-type nil
-  (struct timezone
-    (tz-minuteswest int)                ; minutes west of Greenwich
-    (tz-dsttime int)))                  ; type of dst correction
-
 
 ;; Type of the second argument to `getitimer' and
 ;; the second and third arguments `setitimer'.
@@ -969,10 +924,6 @@ avoiding atexit(3) hooks, etc. Otherwise exit(2) is called."
   (struct itimerval
     (it-interval (struct timeval))      ; timer interval
     (it-value (struct timeval))))       ; current value
-
-(defconstant itimer-real 0)
-(defconstant itimer-virtual 1)
-(defconstant itimer-prof 2)
 
 #-win32
 (defun unix-getitimer (which)
@@ -1048,7 +999,9 @@ avoiding atexit(3) hooks, etc. Otherwise exit(2) is called."
 #-win32
 (progn
 
+  #-avoid-clock-gettime
   (declaim (inline clock-gettime))
+  #-avoid-clock-gettime
   (defun clock-gettime (clockid)
     (declare (type (signed-byte 32) clockid))
     (with-alien ((ts (struct timespec)))
@@ -1083,7 +1036,10 @@ the UNIX epoch (January 1st 1970.)"
           ;; By scaling down we end up with far less resolution than clock-realtime
           ;; offers, and COARSE is about twice as fast, so use that, but only for linux.
           ;; BSD has something similar.
-          (clock-gettime #+linux clock-monotonic-coarse #-linux clock-monotonic)
+          #-avoid-clock-gettime
+        (clock-gettime #+linux clock-monotonic-coarse #-linux clock-monotonic)
+        #+avoid-clock-gettime
+        (multiple-value-bind (c-sec c-usec) (get-time-of-day) (values c-sec (* c-usec 1000)))
 
         #+64-bit ;; I know that my math is valid for 64-bit.
         (declare (optimize (sb-c::type-check 0)))
@@ -1094,21 +1050,21 @@ the UNIX epoch (January 1st 1970.)"
                (+ (the fixnum (* delta-sec internal-time-units-per-second))
                   (truncate delta-nsec nanoseconds-per-internal-time-unit))))
 
-  ;; There are two optimizations here that actually matter on 32-bit systems:
-  ;;  (1) subtract the epoch from seconds and milliseconds separately,
-  ;;  (2) avoid consing a new bignum if the result is unchanged.
-  ;;
-  ;; Thanks to James Anderson for the optimization hint.
-  ;;
-  ;; Yes, it is possible to a computation to be GET-INTERNAL-REAL-TIME
-  ;; bound.
-  ;;
-  ;; --NS 2007-04-05
+        ;; There are two optimizations here that actually matter on 32-bit systems:
+        ;;  (1) subtract the epoch from seconds and milliseconds separately,
+        ;;  (2) avoid consing a new bignum if the result is unchanged.
+        ;;
+        ;; Thanks to James Anderson for the optimization hint.
+        ;;
+        ;; Yes, it is possible to a computation to be GET-INTERNAL-REAL-TIME
+        ;; bound.
+        ;;
+        ;; --NS 2007-04-05
         #-64-bit
         (symbol-macrolet ((observed-sec
-                           (sb-thread::thread-observed-internal-real-time-delta-sec thr))
+                            (sb-thread::thread-observed-internal-real-time-delta-sec thr))
                           (observed-msec
-                           (sb-thread::thread-observed-internal-real-time-delta-millisec thr))
+                            (sb-thread::thread-observed-internal-real-time-delta-millisec thr))
                           (time (sb-thread::thread-internal-real-time thr)))
           (let* ((delta-sec (- c-sec (slot base 'tv-sec)))
                  ;; I inadvertently had too many THE casts in here, so I'd prefer
@@ -1132,12 +1088,29 @@ the UNIX epoch (January 1st 1970.)"
                   current)))))))
 
   (declaim (inline system-internal-run-time))
-  #-sunos ; defined in sunos-os
+
+  ;; SunOS defines CLOCK_PROCESS_CPUTIME_ID but you get EINVAL if you try to use it,
+  ;; also use the same trick when clock_gettime should be avoided.
+  #-(or sunos avoid-clock-gettime)
   (defun system-internal-run-time ()
     (multiple-value-bind (sec nsec) (clock-gettime clock-process-cputime-id)
       (+ (* sec internal-time-units-per-second)
          (floor (+ nsec (floor nanoseconds-per-internal-time-unit 2))
-                nanoseconds-per-internal-time-unit)))))
+                nanoseconds-per-internal-time-unit))))
+  #+(or sunos avoid-clock-gettime)
+  (defun system-internal-run-time ()
+    (multiple-value-bind (utime-sec utime-usec stime-sec stime-usec)
+        (with-alien ((usage (struct sb-unix::rusage)))
+          (syscall* ("sb_getrusage" int (* (struct sb-unix::rusage)))
+                    (values (slot (slot usage 'sb-unix::ru-utime) 'sb-unix::tv-sec)
+                            (slot (slot usage 'sb-unix::ru-utime) 'sb-unix::tv-usec)
+                            (slot (slot usage 'sb-unix::ru-stime) 'sb-unix::tv-sec)
+                            (slot (slot usage 'sb-unix::ru-stime) 'sb-unix::tv-usec))
+                    rusage_self (addr usage)))
+      (+ (* (+ utime-sec stime-sec) internal-time-units-per-second)
+         (floor (+ utime-usec stime-usec
+                   (floor microseconds-per-internal-time-unit 2))
+                microseconds-per-internal-time-unit)))))
 
 ;;; FIXME, KLUDGE: GET-TIME-OF-DAY used to be UNIX-GETTIMEOFDAY, and had a
 ;;; primary return value indicating sucess, and also returned timezone

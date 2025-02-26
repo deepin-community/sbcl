@@ -265,6 +265,15 @@ EOF
 fail_on_condition_during_compile sb-ext:compiler-note $tmpfilename
 
 cat > $tmpfilename <<EOF
+    (declaim (optimize debug)
+             (muffle-conditions compiler-note))
+    (defun foo (x y)
+      (declare (optimize speed))
+      (+ x y))
+EOF
+fail_on_condition_during_compile sb-ext:compiler-note $tmpfilename
+
+cat > $tmpfilename <<EOF
     (declaim (muffle-conditions compiler-note))
     (defun foo (x y)
       (declare (unmuffle-conditions compiler-note))
@@ -294,6 +303,23 @@ cat > $tmpfilename <<EOF
       (declare (muffle-conditions warning))
       (defun foo () x))
     (defun bar () x)
+EOF
+expect_failed_compile $tmpfilename
+
+cat > $tmpfilename <<EOF
+    (declaim (optimize debug))
+    (locally
+      (declare (muffle-conditions warning))
+      (defun foo () x))
+    (defun bar () x)
+EOF
+expect_failed_compile $tmpfilename
+
+cat > $tmpfilename <<EOF
+    (defun foo ()
+      (locally (declare (muffle-conditions warning))
+        (+ x x))
+      x)
 EOF
 expect_failed_compile $tmpfilename
 
@@ -567,13 +593,36 @@ EOF
 expect_warned_compile $tmpfilename
 
 cat > $tmpfilename <<EOF
-(defun foo () 128)
-(let ((a (load-time-value (foo))))
+(let ((a (load-time-value (funcall (lambda () 128)))))
   (declare (fixnum a))
   (print a)
   (terpri))
 EOF
 expect_clean_cload $tmpfilename
+
+# Test compiler warning generation for unbound variables from type declaration...
+cat > $tmpfilename <<EOF
+(defun foo (bar)
+  (declare (type vector baz))
+  (length bar))
+EOF
+expect_failed_compile $tmpfilename
+
+# ... extent declaration ...
+cat > $tmpfilename <<EOF
+(defun foo (n)
+  (declare (type (mod 32) n))
+  (let ((vect (make-array n :element-type 'fixnum)))
+    (declare (dynamic-extent vec))
+    (1+ (length vect))))
+EOF
+expect_failed_compile $tmpfilename
+
+# ... and setq
+cat > $tmpfilename <<EOF
+(setq nonexistent t)
+EOF
+expect_failed_compile $tmpfilename
 
 # success
 exit $EXIT_TEST_WIN

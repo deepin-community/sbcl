@@ -1,0 +1,27 @@
+From: Sean Whitton <spwhitton@spwhitton.name>
+Date: Wed, 2 Aug 2023 14:30:59 +0100
+Subject: disable genheaders.test.sh under autopkgtest
+
+---
+ tests/genheaders.test.sh | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/tests/genheaders.test.sh b/tests/genheaders.test.sh
+index ccd3e18..16fb7a6 100755
+--- a/tests/genheaders.test.sh
++++ b/tests/genheaders.test.sh
+@@ -4,6 +4,14 @@ set -e
+ . ./subr.sh
+ create_test_subdirectory
+ 
++# Loading src/cold/shared.lisp requires local-target-features.lisp-expr but
++# that won't be present under autopkgtest, and adding the build-needed
++# autopkgtest restriction seems too heavyweight.
++if [ -n "${AUTOPKGTEST_TMP+x}" ]; then
++    echo "Skipping under autopkgtest"
++    exit $EXIT_TEST_WIN
++fi
++
+ run_sbcl <<EOF
+ ;; technically this is "skipped" if not fasteval, but we don't have "skipped"
+ ;; as a status code from shell tests.

@@ -111,8 +111,6 @@
   ((double-reg) (double-stack))
   (inst movsd  (ea-for-df-stack y) x))
 
-(eval-when (:compile-toplevel :execute)
-  (setf cl:*read-default-float-format* 'cl:single-float))
 
 ;;;; complex float move functions
 
@@ -179,6 +177,16 @@
      (inst movsd (ea-for-df-desc y) x)))
 (define-move-vop move-from-double :move
   (double-reg) (descriptor-reg))
+(define-vop (!copy-dfloat)
+  (:args (x :scs (descriptor-reg) :to :save))
+  (:results (copy :scs (descriptor-reg)))
+  (:temporary (:sc unsigned-reg) bits)
+  (:node-var node)
+  #+gs-seg (:temporary (:sc unsigned-reg :offset 15) thread-tn)
+  (:generator 3
+     (alloc-other double-float-widetag double-float-size copy node nil thread-tn)
+     (loadw bits x double-float-value-slot other-pointer-lowtag)
+     (storew bits copy double-float-value-slot other-pointer-lowtag)))
 
 ;;; Move from a descriptor to a float register.
 (define-vop (move-to-single-reg)
@@ -1073,45 +1081,56 @@
     complex-double-reg fp-complex-double-immediate complex-double-float
     movsd movapd cmppd movmskpd #b11))
 
-(macrolet ((define (op single-name double-name &rest flags)
-               `(progn
-                  (define-vop (,double-name double-float-compare)
-                    (:translate ,op)
-                    (:info)
-                    (:vop-var vop)
-                    (:conditional ,@flags)
-                    (:generator 3
-                      (note-float-location ',op vop x y)
-                      (sc-case y
-                        (double-stack
-                         (setf y (ea-for-df-stack y)))
-                        (descriptor-reg
-                         (setf y (ea-for-df-desc y)))
-                        (fp-double-immediate
-                         (setf y (register-inline-constant (tn-value y))))
-                        (t))
-                      (inst comisd x y)))
-                  (define-vop (,single-name single-float-compare)
-                    (:translate ,op)
-                    (:info)
-                    (:conditional ,@flags)
-                    (:generator 3
-                      (note-float-location ',op vop x y)
-                      (sc-case y
-                        (single-stack
-                         (setf y (ea-for-sf-stack y)))
-                        (fp-single-immediate
-                         (setf y (register-inline-constant (tn-value y))))
-                        (t))
-                      (inst comiss x y))))))
+(macrolet ((define (op single-name double-name flags &optional flip)
+             `(progn
+                (define-vop (,double-name double-float-compare)
+                  (:translate ,op)
+                  (:info)
+                  (:vop-var vop)
+                  (:conditional ,@flags)
+                  (:generator 3
+                    (note-float-location ',op vop x y)
+                    (sc-case y
+                      (double-stack
+                       (setf y (ea-for-df-stack y)))
+                      (descriptor-reg
+                       (setf y (ea-for-df-desc y)))
+                      (fp-double-immediate
+                       (setf y (register-inline-constant (tn-value y))))
+                      ,(if flip
+                           `(t
+                             (change-vop-flags vop '(,flip))
+                             (rotatef x y))
+                           `(t)))
+                    (inst comisd x y)))
+                (define-vop (,single-name single-float-compare)
+                  (:translate ,op)
+                  (:info)
+                  (:conditional ,@flags)
+                  (:generator 3
+                    (note-float-location ',op vop x y)
+                    (sc-case y
+                      (single-stack
+                       (setf y (ea-for-sf-stack y)))
+                      (fp-single-immediate
+                       (setf y (register-inline-constant (tn-value y))))
+                      ,(if flip
+                           `(t
+                             (change-vop-flags vop '(,flip))
+                             (rotatef x y))
+                           `(t)))
+
+                    (inst comiss x y))))))
   ;;   UNORDERED:    ZF,PF,CF <- 111;
   ;;   GREATER_THAN: ZF,PF,CF <- 000;
   ;;   LESS_THAN:    ZF,PF,CF <- 001;
   ;;   EQUAL:        ZF,PF,CF <- 100;
-  (define < <single-float <double-float not :p :nc)
-  (define > >single-float >double-float not :p :na)
-  (define <= <=single-float <=double-float not :p :a)
-  (define >= >=single-float >=double-float not :p :b))
+  ;;   Using the flags that get a negated meaning by the unordered bits
+  ;;   allows not checking for :P specifically.
+  (define < <single-float <double-float (not :p :nc) :a)
+  (define > >single-float >double-float (:a))
+  (define <= <=single-float <=double-float (not :p :a) :nb)
+  (define >= >=single-float >=double-float (:nb)))
 
 
 ;;;; conversion
@@ -1281,6 +1300,28 @@
   (:generator 1
     (inst movsd res (register-inline-constant :qword (logior (ash hi 32) lo)))))
 
+(define-vop (%make-double-float)
+  (:args (bits :scs (signed-reg)))
+  (:results (res :scs (double-reg)))
+  (:arg-types signed-num)
+  (:result-types double-float)
+  (:translate %make-double-float)
+  (:policy :fast-safe)
+  (:vop-var vop)
+  (:generator 4
+    (inst movq res bits)))
+
+(define-vop (%make-double-float-c)
+  (:results (res :scs (double-reg)))
+  (:arg-types (:constant (signed-byte 64)))
+  (:result-types double-float)
+  (:info bits)
+  (:translate make-double-float)
+  (:policy :fast-safe)
+  (:vop-var vop)
+  (:generator 1
+    (inst movsd res (register-inline-constant :qword bits))))
+
 (define-vop (single-float-bits)
   (:args (float :scs (single-reg descriptor-reg)
                 :load-if (not (sc-is float single-stack))))
@@ -1346,9 +1387,7 @@
        (double-stack
         (inst mov bits (ea (frame-byte-offset (tn-offset float)) rbp-tn)))
        (descriptor-reg
-        (inst mov bits (ea (- (ash double-float-value-slot word-shift)
-                              other-pointer-lowtag)
-                           float))))))
+        (loadw bits float double-float-value-slot other-pointer-lowtag)))))
 
 (define-vop (double-float-high-bits)
   (:args (float :scs (double-reg descriptor-reg)

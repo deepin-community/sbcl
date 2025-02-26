@@ -30,8 +30,6 @@
                   #+sb-safepoint *thruption-pending*
                   #+sb-safepoint *in-safepoint*
                   *free-interrupt-context-index*
-                  #-gencgc
-                  sb-vm::*allocation-pointer*
                   sb-vm::*binding-stack-pointer*
                   sb-pcl::*cache-miss-values-stack*
                   sb-pcl::*dfun-miss-gfs-on-stack*))
@@ -39,8 +37,7 @@
 ;;; This is a slot of 'struct thread' if multithreaded,
 ;;; and the symbol-global-value should never be used.
 ;;; (And in any case it is not really a special var)
-#+(and (or x86 x86-64) (not sb-thread))
-(defvar *pseudo-atomic-bits* 0)
+#+(and x86 (not sb-thread)) (defvar *pseudo-atomic-bits* 0)
 
 #+c-stack-is-control-stack
 (setf (info :variable :always-bound 'sb-c:*alien-stack-pointer*) :always-bound)
@@ -61,7 +58,16 @@
 (declaim (type cons sb-kernel::*gc-epoch*))
 (define-load-time-global sb-kernel::*gc-epoch* '(nil . nil))
 
-;;; Default evaluator mode (interpeter / compiler)
+;;; Stores the code coverage instrumentation results. The CAR is a
+;;; hashtable. The CDR is a list of weak pointers to code objects
+;;; having coverage marks embedded in the unboxed constants. Keys in
+;;; the hashtable are namestrings, the value is a list of (CONS PATH
+;;; VISITED).
+(define-load-time-global *code-coverage-info*
+    (list (make-hash-table :test 'equal :synchronized t)))
+(declaim (type (cons hash-table) *code-coverage-info*))
+
+;;; Default evaluator mode (interpreter / compiler)
 
 (declaim (type (member :compile #+(or sb-eval sb-fasteval) :interpret)
                *evaluator-mode*))

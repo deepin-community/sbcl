@@ -29,14 +29,13 @@
 ;;; Move an untagged SAP to a tagged representation.
 (define-vop (move-from-sap)
   (:args (sap :scs (sap-reg) :to :save))
-  (:temporary (:sc non-descriptor-reg) pa-flag)
-  (:temporary (:scs (interior-reg)) lip)
+  (:temporary (:scs (non-descriptor-reg) :offset lr-offset) lr)
   (:results (res :scs (descriptor-reg)))
   (:note "SAP to pointer coercion")
   (:generator 20
-    (with-fixed-allocation (res pa-flag sap-widetag sap-size :lip lip
+    (with-fixed-allocation (res lr sap-widetag sap-size
                             :store-type-code nil)
-      (storew-pair pa-flag 0 sap sap-pointer-slot tmp-tn))))
+      (storew-pair lr 0 sap sap-pointer-slot tmp-tn))))
 
 (define-move-vop move-from-sap :move
   (sap-reg) (descriptor-reg))
@@ -149,6 +148,46 @@
 (macrolet ((def-system-ref-and-set
                (ref-name set-name sc type size &key signed)
              `(progn
+                ,@(when (implements-cas-sap-ref ref-name)
+                    (multiple-value-bind (load store)
+                        (case size
+                          (:byte  (values 'ldaxrb 'stlxrb))
+                          (:short (values 'ldaxrh 'stlxrh))
+                          (t      (values 'ldaxr  'stlxr)))
+                      `((define-vop (,(symbolicate "CAS-" ref-name))
+                          (:translate (cas ,ref-name))
+                          (:policy :fast-safe)
+                          (:args (oldval :scs (,sc))
+                                 (newval :scs (,sc))
+                                 (sap :scs (sap-reg))
+                                 ;; This could accept an immediate 0 to avoid
+                                 ;; the initial ADD but I don't care to optimize it out.
+                                 (offset :scs (signed-reg)))
+                          (:arg-types ,type ,type system-area-pointer signed-num)
+                          (:temporary (:sc unsigned-reg) addr)
+                          (:results (result :scs (,sc) :from :load))
+                          (:result-types ,type)
+                          (:generator 5
+                           (inst add addr sap offset)
+                           LOOP
+                           (inst ,load ,(if (eq size :word) '(32-bit-reg result) 'result) addr)
+                           ;; There is no instruction to perform signed load-acquire-exclusive,
+                           ;; Therefore the loaded value has to get sign-extend in order for CMP not to fail
+                           ;; on negatives. Alternatively there is (I think) a way to make the CMP
+                           ;; do the right thing without this, but one way or another, the result
+                           ;; requires sign-extension.
+                          ,@(when (and signed (neq size :long))
+                              (let ((bits (case size (:byte 8) (:short 16) (t 32))))
+                                `((inst sbfm result result 0 ,(1- bits)))))
+                           (inst cmp ,(if (eq size :long) 'result '(32-bit-reg result))
+                                     ,(if (eq size :long) 'oldval '(32-bit-reg oldval)))
+                           (inst b :ne EXIT)
+                           (inst ,store (32-bit-reg tmp-tn)
+                                 ,(if (eq size :word) '(32-bit-reg newval) 'newval) addr)
+                           (inst cbnz (32-bit-reg tmp-tn) LOOP)
+                           EXIT ; cargo-culted from WORD-INDEX-CAS
+                           (inst clrex)
+                           (inst dmb))))))
                 (define-vop (,ref-name)
                   (:translate ,ref-name)
                   (:policy :fast-safe)
@@ -158,31 +197,65 @@
                   (:results (result :scs (,sc)))
                   (:result-types ,type)
                   (:generator 5
-                              (inst ,(case size
-                                       (:byte (if signed 'ldrsb 'ldrb))
-                                       (:short (if signed 'ldrsh 'ldrh))
-                                       (:word (if signed 'ldrsw 'ldr))
-                                       (t 'ldr))
-                                    ,(if (eq size :word)
-                                         '(32-bit-reg result)
-                                         'result)
-                                    (@ sap offset))))
+                    (inst ,(case size
+                             (:byte (if signed 'ldrsb 'ldrb))
+                             (:short (if signed 'ldrsh 'ldrh))
+                             (:word (if signed 'ldrsw 'ldr))
+                             (t 'ldr))
+                      ,(if (eq size :word)
+                           '(32-bit-reg result)
+                           'result)
+                      (@ sap offset))))
                 (define-vop (,set-name)
                   (:translate ,set-name)
                   (:policy :fast-safe)
-                  (:args (value :scs (,sc))
+                  (:args (value :scs (,sc zero))
                          (sap :scs (sap-reg))
                          (offset :scs (signed-reg)))
                   (:arg-types ,type system-area-pointer signed-num)
                   (:generator 5
-                              (inst ,(case size
-                                       (:byte 'strb)
-                                       (:short 'strh)
-                                       (t 'str))
-                                    ,(if (eq size :word)
-                                         '(32-bit-reg value)
-                                         'value)
-                                    (@ sap offset)))))))
+                    (inst ,(case size
+                             (:byte 'strb)
+                             (:short 'strh)
+                             (t 'str))
+                      ,(if (eq size :word)
+                           '(32-bit-reg value)
+                           'value)
+                      (@ sap offset))))
+                (define-vop (,(symbolicate ref-name "-C"))
+                  (:translate ,ref-name)
+                  (:policy :fast-safe)
+                  (:args (sap :scs (sap-reg)))
+                  (:info offset)
+                  (:arg-types system-area-pointer (:constant (satisfies ldr-str-offset-encodable)))
+                  (:RESULTS (result :scs (,sc)))
+                  (:result-types ,type)
+                  (:generator 4
+                    (inst ,(case size
+                             (:byte (if signed 'ldrsb 'ldrb))
+                             (:short (if signed 'ldrsh 'ldrh))
+                             (:word (if signed 'ldrsw 'ldr))
+                             (t 'ldr))
+                      ,(if (eq size :word)
+                           '(32-bit-reg result)
+                           'result)
+                      (@ sap offset))))
+                (define-vop (,(symbolicate set-name "-C"))
+                  (:translate ,set-name)
+                  (:policy :fast-safe)
+                  (:args (value :scs (,sc zero))
+                         (sap :scs (sap-reg)))
+                  (:info offset)
+                  (:arg-types ,type system-area-pointer (:constant (satisfies ldr-str-offset-encodable)))
+                  (:generator 4
+                    (inst ,(case size
+                             (:byte 'strb)
+                             (:short 'strh)
+                             (t 'str))
+                      ,(if (eq size :word)
+                           '(32-bit-reg value)
+                           'value)
+                      (@ sap offset)))))))
   (def-system-ref-and-set sap-ref-8 %set-sap-ref-8
     unsigned-reg positive-fixnum :byte :signed nil)
   (def-system-ref-and-set signed-sap-ref-8 %set-signed-sap-ref-8

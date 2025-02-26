@@ -98,7 +98,7 @@
   (assert (= 0.0d0 (scale-float 1.0d0 (1- most-negative-fixnum)))))
 
 (with-test (:name (:scale-float-overflow :bug-372)
-            :fails-on (or :arm64 (and :darwin :ppc)))
+            :fails-on :no-float-traps)
   (flet ((test (form)
            (assert-error (funcall (checked-compile `(lambda () ,form)
                                                    :allow-style-warnings t))
@@ -133,10 +133,11 @@
     (mapc #'test '(sin cos tan))))
 
 (with-test (:name (:addition-overflow :bug-372)
-            :fails-on (or :arm64
-                        (and :ppc :openbsd)
-                        (and :ppc :darwin)
-                        (and :x86 :netbsd)))
+            :fails-on (or (and :arm64 (not :darwin))
+                          :arm
+                          (and :ppc :openbsd)
+                          (and :ppc :darwin)
+                          (and :x86 :netbsd)))
   (assert-error
    (sb-sys:without-interrupts
      (sb-int:set-floating-point-modes :current-exceptions nil
@@ -154,10 +155,11 @@
 ;; the preceeding "pure" test files aren't as free of side effects as
 ;; we might like.
 (with-test (:name (:addition-overflow :bug-372 :take-2)
-            :fails-on (or :arm64
-                        (and :ppc :openbsd)
-                        (and :ppc :darwin)
-                        (and :x86 :netbsd)))
+            :fails-on (or (and :arm64 (not :darwin))
+                          :arm
+                          (and :ppc :openbsd)
+                          (and :ppc :darwin)
+                          (and :x86 :netbsd)))
   (assert-error
    (sb-sys:without-interrupts
      (sb-int:set-floating-point-modes :current-exceptions nil
@@ -235,6 +237,18 @@
       (test (not (> -1.0 nan)))
       (test (not (> nan 1.0))))))
 
+(with-test (:name (:nan :comparison :non-float)
+            :fails-on (or :sparc))
+  (sb-int:with-float-traps-masked (:invalid)
+    (let ((nan (/ 0.0 0.0))
+          (reals (list 0 1 -1 1/2 -1/2 (expt 2 300) (- (expt 2 300))))
+          (funs '(> < <= >= =)))
+      (loop for fun in funs
+            do
+            (loop for real in reals
+                  do (assert (not (funcall fun nan real)))
+                     (assert (not (funcall fun real nan))))))))
+
 (with-test (:name :log-int/double-accuracy)
   ;; we used to use single precision for intermediate results
   (assert (eql 2567.6046442221327d0
@@ -264,6 +278,54 @@
     (assert (eql 0.0d0 (funcall f 123.0d0 0.0d0)))
     (assert (eql 0.0d0 (funcall f 123.0 0.0d0)))))
 
+(with-test (:name (:log2 :non-negative-powers-of-two))
+  (let ((diffs
+          (loop for i from 0 to 128
+                for x = (log (expt 2 i) 2.0d0)
+                if (or (not (typep x 'double-float)) (/= x i)) collect (cons i x))))
+    (assert (null diffs))))
+
+(with-test (:name (:log2 :negative-powers-of-two))
+  (let ((diffs
+          (loop for i from -128 to -1
+                for x = (log (expt 2 i) 2.0d0)
+                if (or (not (typep x 'double-float)) (/= x i)) collect (cons i x))))
+    (assert (null diffs))))
+
+(with-test (:name (:log2 :powers-of-two-negative))
+  (let ((diffs
+          (loop for i from -128 to 128
+                for x = (log (- (expt 2 i)) 2.0d0)
+                if (or (not (typep x '(complex double-float)))
+                       (/= (realpart x) i))
+                collect (cons i x))))
+    (assert (null diffs))))
+
+(with-test (:name (:log :ratios-near-1))
+  ;; LOG of 1 +/- 1/2^100 is approximately +/-1/2^100, comfortably
+  ;; within single-float range.
+  (let ((nvals
+          (loop for i from -128 to 128
+                for x = (log (/ (+ i (expt 2 100)) (+ i (expt 2 100) 1)))
+                collect x))
+        (pvals
+          (loop for i from -128 to 128
+                for x = (log (/ (+ i (expt 2 100) 1) (+ i (expt 2 100))))
+                collect x)))
+    (assert (= (length (remove-duplicates nvals)) 1))
+    (assert (< (first nvals) 0))
+    (assert (= (length (remove-duplicates pvals)) 1))
+    (assert (> (first pvals) 0))))
+
+(with-test (:name (:log :same-base-different-precision))
+  (let ((twos (list 2 2.0f0 2.0d0 #c(2.0f0 0.0f0) #c(2.0d0 0.0d0))))
+    (let ((result (loop for number in twos
+                        append (loop for base in twos
+                                     for result = (log number base)
+                                     if (/= (realpart result) 1)
+                                     collect (list number base result)))))
+      (assert (null result)))))
+
 ;; Bug reported by Eric Marsden on July 15 2009. The compiler
 ;; used not to constant fold calls with arguments of type
 ;; (EQL foo).
@@ -277,11 +339,11 @@
 
 ;; Leakage from the host could result in wrong values for truncation.
 (with-test (:name :truncate)
-  (assert (plusp (sb-kernel:%unary-truncate/single-float (expt 2f0 33))))
-  (assert (plusp (sb-kernel:%unary-truncate/double-float (expt 2d0 33))))
+  (assert (plusp (sb-kernel:%unary-truncate (expt 2f0 33))))
+  (assert (plusp (sb-kernel:%unary-truncate (expt 2d0 33))))
   ;; That'd be one strange host, but just in case
-  (assert (plusp (sb-kernel:%unary-truncate/single-float (expt 2f0 65))))
-  (assert (plusp (sb-kernel:%unary-truncate/double-float (expt 2d0 65)))))
+  (assert (plusp (sb-kernel:%unary-truncate (expt 2f0 65))))
+  (assert (plusp (sb-kernel:%unary-truncate (expt 2d0 65)))))
 
 ;; On x86-64, we sometimes forgot to clear the higher order bits of the
 ;; destination register before using it with an instruction that doesn't
@@ -528,12 +590,12 @@
 
 (with-test (:name :conservative-floor-bounds)
   (assert
-   (equal (sb-kernel:%simple-fun-type
-           (checked-compile
-            `(lambda (x)
-               (declare (unsigned-byte x))
-               (values (truncate 1.0 x)))))
-          '(function (unsigned-byte) (values unsigned-byte &optional)))))
+   (subtypep (second (third (sb-kernel:%simple-fun-type
+                          (checked-compile
+                           `(lambda (x)
+                              (declare (unsigned-byte x))
+                              (values (truncate 1.0 x)))))))
+             'unsigned-byte)))
 
 (with-test (:name :single-float-sign-stubs)
   (checked-compile-and-assert
@@ -546,10 +608,13 @@
    ((-96088.234) -1.0)))
 
 (with-test (:name :inline-signum)
-  (assert (ctu:find-named-callees ; should be a full call
-           (compile nil '(lambda (x)
+  (assert (equal '(signum)
+                 (ctu:ir1-named-calls ; should be a full call
+                        '(lambda (x)
                            (signum (truly-the number x))))))
-  ;; should not be a full call
+  ;; FIXME: This test passed by accident on backends that didn't fully inline
+  ;; the call, because PLUSP (from the IR transform) is an asm routine.
+  #+x86-64
   (dolist (type '(integer
                   (or (integer 1 10) (integer 50 90))
                   rational
@@ -557,9 +622,9 @@
                   (or (single-float -10f0 0f0) (single-float 1f0 20f0))
                   double-float
                   (or (double-float -10d0 0d0) (double-float 1d0 20d0))))
-    (assert (null (ctu:find-named-callees
-                   (compile nil `(lambda (x)
-                                   (signum (truly-the ,type x))))))))
+    (assert (null (ctu:ir1-named-calls
+                                `(lambda (x)
+                                   (signum (truly-the ,type x)))))))
   ;; check signed zero
   (let ((f (compile nil '(lambda (x) (signum (the single-float x))))))
     (assert (eql (funcall f -0f0) -0f0))
@@ -584,6 +649,7 @@
     ((1d0 0d0) t)))
 
 (with-test (:name :ftruncate-inline
+            :fails-on :ppc64
             :skipped-on (not :64-bit))
   (checked-compile
    `(lambda (v d)
@@ -613,7 +679,9 @@
         ((1) (values `(or single-float ,long (complex single-float) (complex ,long)) t)
          :test #'car-type-equal))
       (checked-compile-and-assert () '(lambda (x y) (ctu:compiler-derived-type (atan x y)))
-        ((1 2) (values `(or ,long single-float (complex ,long) (complex single-float)) t) :test #'car-type-equal)))))
+        ((1 2) (values `(float ,(- pi) ,pi)
+                       t)
+         :test #'car-type-equal)))))
 
 (with-test (:name :comparison-transform-overflow)
   (checked-compile-and-assert
@@ -671,14 +739,10 @@
 
 ;;; For #+64-bit we could eradicate the legacy interface
 ;;; to MAKE-DOUBLE-FLOAT, and just take the bits.
-(defun mdf (x)
-  (let ((f (sb-sys:%primitive sb-vm::fixed-alloc
-                              'make-double-float 2 sb-vm:double-float-widetag
-                              sb-vm:other-pointer-lowtag nil)))
-    (setf (sb-sys:sap-ref-word (sb-sys:int-sap (sb-kernel:get-lisp-obj-address f))
-                               (- 8 sb-vm:other-pointer-lowtag))
-          (the sb-vm:word x))
-    f))
+(defun mdf (bits)
+  (let ((hi (ldb (byte 32 32) bits))
+        (lo (ldb (byte 32  0) bits)))
+    (sb-kernel:make-double-float (sb-disassem:sign-extend hi 32) lo)))
 (compile 'mdf)
 
 #+64-bit
@@ -736,11 +800,67 @@
   (checked-compile-and-assert
       ()
       `(lambda (x y)
-         (declare ((OR (INTEGER 0 0) (DOUBLE-FLOAT 0.0d0 0.0d0)) x)
-                  ((OR (RATIONAL -10 0) (DOUBLE-FLOAT -10.0d0 -0.0d0)) y))
+         (declare ((or (integer 0 0) (double-float 0.0d0 0.0d0)) x)
+                  ((or (rational -10 0) (double-float -10.0d0 -0.0d0)) y))
          (= x y))
   ((0 0) t)
   ((0 0d0) t)
   ((0 -0d0) t)
   ((0d0 -0d0) t)
   ((0 -1d0) nil)))
+
+(with-test (:name :unary-truncate-float-derive-type)
+  (assert
+   (subtypep (second (third (sb-kernel:%simple-fun-type
+                             (checked-compile
+                              `(lambda (f)
+                                 (declare ((double-float 10d0 30d0) f))
+                                 (values (truncate f)))))))
+             '(integer 10 30))))
+
+(with-test (:name :rational-not-bignum)
+  (assert (equal (type-of (eval '(rational -4.3973217e12)))
+                 (type-of -4397321682944))))
+
+(with-test (:name :single-to-double-comparsion)
+  (assert (= (count 'sb-kernel:%double-float
+                    (ctu:ir1-named-calls
+                     `(lambda (x)
+                        (declare (single-float x))
+                        (= x 1d0))
+                     nil))
+             0)))
+
+(with-test (:name :float-to-known-comparison)
+  (assert (= (count 'sb-int:single-float-p
+                    (ctu:ir1-named-calls
+                     `(lambda (x)
+                        (declare (float x)
+                                 (optimize speed))
+                        (= x 1d0))
+                     nil))
+             1))
+  (assert (= (count 'sb-int:single-float-p
+                    (ctu:ir1-named-calls
+                     `(lambda (x y)
+                        (declare (float x)
+                                 ((signed-byte 8) y)
+                                 (optimize speed))
+                        (= x y))
+                     nil))
+             1))
+  (assert (= (count 'sb-int:single-float-p
+                    (ctu:ir1-named-calls
+                     `(lambda (x)
+                        (declare (float x)
+                                 (optimize (speed 1)))
+                        (= x 1d0))
+                     nil))
+             0)))
+
+(with-test (:name :tan-single-float-type-derivation)
+  (checked-compile-and-assert
+      ()
+      `(lambda (x)
+         (tan (the (single-float -1.5707964 1.5707964) x)))
+    ((1.5707964) -2.2877332e7)))

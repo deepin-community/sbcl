@@ -9,13 +9,13 @@
 ;;;; absolutely no warranty. See the COPYING and CREDITS files for
 ;;;; more information.
 
-#-(and x86-64 sb-thread (not win32)) (sb-ext:exit :code 104) ;; not implemented elsewhere
+#-(and x86-64 sb-thread (not win32)) (invoke-restart 'run-tests::skip-file) ;; not implemented elsewhere
 
 (defstruct fruitbasket x y z)
 (with-test (:name :aprof-smoketest-struct
                   :skipped-on :darwin
             ;; reverse-engineering the allocation instructions fails but should not
-            :fails-on (not :immobile-space))
+            :fails-on (and (not :immobile-space) (not :mark-region-gc)))
   (let ((nbytes
          (sb-aprof:aprof-run
             (checked-compile
@@ -97,8 +97,7 @@ sb-vm::
   (declare (optimize sb-c::instrument-consing))
   (list* (load-time-value(gensym)) :if-exists x))
 
-(import '(sb-vm::thread-boxed-tlab-slot sb-vm::thread-unboxed-tlab-slot
-          sb-vm::rcx-tn sb-vm::rbp-tn sb-vm::r9-tn sb-vm::r10-tn sb-vm::rsi-tn
+(import '(sb-vm::rcx-tn sb-vm::rbp-tn sb-vm::r9-tn sb-vm::r10-tn sb-vm::rsi-tn
           sb-vm:cons-size sb-vm:n-word-bytes
           sb-vm::ea sb-vm:nil-value
           sb-vm:list-pointer-lowtag sb-vm:bignum-widetag))
@@ -110,7 +109,7 @@ sb-vm::
   (declare (optimize sb-c::instrument-consing))
   (values (make-this-struct) (make-that-struct)))
 (compile 'make-structs)
-(with-test (:name :aprof-instance :skipped-on (not :immobile-space))
+(with-test (:name :aprof-instance :skipped-on (not :compact-instance-header))
   (let (seen-this seen-that)
     (dolist (line (split-string
                    (with-output-to-string (s)

@@ -1,20 +1,28 @@
 #include "os.h"
-#include "gencgc-alloc-region.h"
 #include "thread.h"
-#include "genesis/thread.h"
+#include "interr.h"
 #include <signal.h>
+#include <string.h>
+#include <errno.h>
 
-int arch_os_thread_init(struct thread __attribute__((unused)) *thread) {
+int arch_os_thread_init(struct thread *thread) {
+    /* Signal handlers are run on the control stack, so if it is exhausted
+     * we had better use an alternate stack for whatever signal tells us
+     * we've exhausted it */
+    stack_t sigstack;
+    sigstack.ss_sp    = calc_altstack_base(thread);
+    sigstack.ss_flags = 0;
+    sigstack.ss_size  = calc_altstack_size(thread);
+    if (sigaltstack(&sigstack, 0) < 0) {
+        lose("Cannot sigaltstack: %s", strerror(errno));
+    }
     return 1;
 }
 
-int arch_os_thread_cleanup(struct thread __attribute__((unused)) *thread) {
+int arch_os_thread_cleanup(struct thread *thread) {
     return 1;
 }
 
-os_context_register_t *os_context_pc_addr(os_context_t *context) {
-    return (os_context_register_t *)&context->uc_mcontext.rip;
-}
 os_context_register_t *os_context_sp_addr(os_context_t *context) {
     return (os_context_register_t *)&context->uc_mcontext.rsp;
 }
@@ -47,14 +55,13 @@ os_restore_fp_control(os_context_t *context)
     // just guessing here
 
     /* reset exception flags and restore control flags on SSE2 FPU */
-    unsigned int temp = (context->uc_mcontext.fpu.mxcsr) & ~0x3F;
+    unsigned int temp = (context->uc_mcontext.fpu.fp_fxsave.mxcsr) & ~0x3F;
     asm ("ldmxcsr %0" : : "m" (temp));
     /* same for x87 FPU. */
-    asm ("fldcw %0" : : "m" (context->uc_mcontext.fpu.control));
+    asm ("fldcw %0" : : "m" (context->uc_mcontext.fpu.fp_fxsave.control));
 }
 
 void
-os_flush_icache(os_vm_address_t __attribute__((unused)) address,
-                os_vm_size_t __attribute__((unused)) length)
+os_flush_icache(os_vm_address_t address, os_vm_size_t length)
 {
 }

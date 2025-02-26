@@ -8,8 +8,6 @@
 
 typedef int os_context_register_t;
 
-#include "arch-os-generic.inc"
-
 void set_data_desc_size(data_desc_t* desc, unsigned long size);
 void set_data_desc_addr(data_desc_t* desc, void* addr);
 
@@ -19,7 +17,9 @@ void set_data_desc_addr(data_desc_t* desc, void* addr);
  */
 #if __DARWIN_UNIX03
 
-#define CONTEXT_ADDR_FROM_STEM(stem) &context->uc_mcontext->__ss.__##stem
+#define CONTEXT_ADDR_FROM_STEM(stem) (os_context_register_t*)&context->uc_mcontext->__ss.__##stem
+#define OS_CONTEXT_PC(context) context->uc_mcontext->__ss.__eip
+
 #define EIP __eip
 #define ESP __esp
 #define EBP __ebp
@@ -42,6 +42,8 @@ void set_data_desc_addr(data_desc_t* desc, void* addr);
 #else
 
 #define CONTEXT_ADDR_FROM_STEM(stem) &context->uc_mcontext->ss.stem
+#define OS_CONTEXT_PC(context) context->uc_mcontext->ss.eip
+
 #define EIP eip
 #define ESP esp
 #define EBP ebp

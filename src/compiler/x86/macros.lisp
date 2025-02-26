@@ -203,10 +203,8 @@
   (with-unique-names (label pa-bits-ea)
     `(let ((,label (gen-label))
            (,pa-bits-ea
-            #+sb-thread
-            (make-ea :dword :disp (* 4 thread-pseudo-atomic-bits-slot))
-            #-sb-thread
-            (make-ea-for-symbol-value *pseudo-atomic-bits* :dword)))
+            #+sb-thread (make-ea :dword :disp (* 4 thread-pseudo-atomic-bits-slot))
+            #-sb-thread (make-ea-for-symbol-value *pseudo-atomic-bits* :dword)))
        (unless ,elide-if
          (inst mov ,pa-bits-ea ebp-tn #+sb-thread :fs))
        ,@forms
@@ -417,9 +415,7 @@
        (cond ((and (sc-is x any-reg descriptor-reg)
                    (or (= offset eax-offset) (= offset ebx-offset)
                        (= offset ecx-offset) (= offset edx-offset)))
-              (inst test (make-random-tn :kind :normal
-                                         :sc (sc-or-lose 'byte-reg)
-                                         :offset offset)
+              (inst test (make-random-tn (sc-or-lose 'byte-reg) offset)
                     y))
              ((sc-is x control-stack)
               (inst test (make-ea :byte :base ebp-tn

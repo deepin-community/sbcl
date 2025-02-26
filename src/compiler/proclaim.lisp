@@ -33,8 +33,8 @@
     (let ((name (uncross name)))
       (setq *undefined-warnings*
             (delete-if (lambda (x)
-                         (and (equal (undefined-warning-name x) name)
-                              (eq (undefined-warning-kind x) kind)))
+                         (and (eq (undefined-warning-kind x) kind)
+                              (equal (undefined-warning-name x) name)))
                        *undefined-warnings*))))
   (values))
 
@@ -68,6 +68,35 @@
     (t
      (compiler-error "~@<Illegal function name: ~S.~@:>" name)))
   name)
+
+;;; Check that NAME is a valid class name, returning the name if OK,
+;;; and signalling an error if not.
+(declaim (inline sb-pcl::check-class-name))
+(defun sb-pcl::check-class-name (name &optional (allow-nil t))
+  ;; Apparently, FIND-CLASS and (SETF FIND-CLASS) accept any symbol,
+  ;; but DEFCLASS only accepts non-NIL symbols.
+  (if (or (not (legal-class-name-p name))
+          (and (null name) (not allow-nil)))
+      (error 'sb-kernel::illegal-class-name-error :name name)
+      name))
+
+;;; Check that NAME is a valid designator for the defining macro
+;;; MACRO. This is used mostly to give a consistent message for all
+;;; defining forms, except for DEFCLASS, which uses CHECK-CLASS-NAME.
+(defun check-designator (name macro &optional (predicate #'symbolp)
+                                              (what "symbol")
+                                              (arg-reference "NAME"))
+  ;; If we decide that the correct behavior is to actually macroexpand
+  ;; and then fail later, well, I suppose we could express all macros
+  ;; such that they perform their LEGAL-FUN-NAME-P/SYMBOLP check as
+  ;; part of the ordinary code, as in: (DEFPARAMETER "foo" 3) ->
+  ;; (%defparameter (the symbol '"foo") ...)  which seems at least
+  ;; slightly preferable to failing in the internal function that
+  ;; would store the globaldb info.
+  (unless (funcall predicate name)
+    (error (format nil "The ~A argument to ~A, ~~S, is not a ~A."
+                   arg-reference macro what)
+           name)))
 
 ;;; This is called to do something about SETF functions that overlap
 ;;; with SETF macros. Perhaps we should interact with the user to see
@@ -105,7 +134,7 @@
              (assert-symbol-home-package-unlocked name "proclaiming ~S as a function")))
 
       (let ((kind (info :function :kind name)))
-        ;; scrubbing old data I: possible collision with a macro
+        ;; scrubbing old data: possible collision with a macro
         ;; There's a silly little problem with fun names that are not ANSI-legal names,
         ;; e.g. (CAS mumble). We can't ask the host whether that is FBOUNDP,
         ;; because it would rightly complain. So, just assume that it is not FBOUNDP.
@@ -124,23 +153,14 @@
           (unless (pcl-methodfn-name-p name)
             (setf (info :function :kind name) :function))))))
 
-  ;; scrubbing old data II: dangling forward references
-  ;;
-  ;; (This could happen if someone executes PROCLAIM FTYPE at
-  ;; macroexpansion time, which is bad style, or at compile time, e.g.
-  ;; in EVAL-WHEN (:COMPILE) inside something like DEFSTRUCT, in which
-  ;; case it's reasonable style. Either way, NAME is no longer a free
-  ;; function.)
-  (when (boundp '*ir1-namespace*)       ; when compiling
-    (unless (block-compile *compilation*)
-      (remhash name (free-funs *ir1-namespace*))))
-
   (values))
 
 ;;; Make NAME no longer be a function name: clear everything back to
 ;;; the default.
 (defun undefine-fun-name (name)
   (when name
+    #-sb-xc-host
+    (sb-impl::remove-specialized-xep name)
     (macrolet ((frob (&rest types)
                  `(clear-info-values
                    name ',(mapcar (lambda (x)
@@ -225,6 +245,7 @@
           #-sb-xc-host
           (let ((type (compiler-specifier-type typespec)))
             (cond ((not type))
+                  ((contains-unknown-type-p type))
                   (ospec
                    (setf (car ospec) (type-union (car ospec) type)))
                   (t
@@ -284,22 +305,14 @@
   (when (and (eq kind 'always-bound) (eq info-value :always-bound)
              (not (boundp name))
              ;; Allow it to be unbound at compile-time.
-             (not *compile-time-eval*)
-             ;; Check if we are still bootstrapping.
-             (not (boundp '*queued-proclaims*)))
+             (not *compile-time-eval*))
     (error "Cannot proclaim an unbound symbol as ~A: ~S" kind name))
 
   (multiple-value-bind (allowed test)
       (ecase kind
         (special
-         ;; KLUDGE: There is probably a better place to do this.
-         (when (boundp '*ir1-namespace*)
-           (remhash name (free-vars *ir1-namespace*)))
          (values '(:special :unknown) #'eq))
         (global
-         ;; KLUDGE: Ditto.
-         (when (boundp '*ir1-namespace*)
-           (remhash name (free-vars *ir1-namespace*)))
          (values '(:global :unknown) #'eq))
         (always-bound (values '(:constant) #'neq)))
     (let ((old (info :variable :kind name)))
@@ -310,11 +323,8 @@
       (:symbol name "globally declaring ~A ~A" kind)
     (if (eq kind 'always-bound)
         (setf (info :variable :always-bound name) info-value)
-        (setf (info :variable :kind name) info-value))))
-
-(defun type-proclamation-mismatch-warn (name old new &optional description)
-  (warn 'type-proclamation-mismatch-warning
-        :name name :old old :new new :description description))
+        (setf (info :variable :kind name) info-value)))
+  #-sb-xc-host (sb-impl::unset-symbol-progv-optimize name))
 
 (defun proclaim-type (name type type-specifier where-from)
   (unless (symbolp name)
@@ -322,17 +332,29 @@
 
   (with-single-package-locked-error
       (:symbol name "globally declaring the TYPE of ~A")
-    (when (eq (info :variable :where-from name) :declared)
-      (let ((old-type (info :variable :type name)))
-        (when (type/= type old-type)
-          (type-proclamation-mismatch-warn
-           name (type-specifier old-type) type-specifier))))
+    (let (warned)
+     (when (eq (info :variable :where-from name) :declared)
+       (let ((old-type (info :variable :type name)))
+         (when (type/= type old-type)
+           (setf warned t)
+           (warn 'type-proclamation-mismatch-warning
+                 :name name
+                 :old (type-specifier old-type)
+                 :new type-specifier))))
+      (when (and (not warned)
+                 (boundp name))
+        #-sb-xc-host
+        (let ((value (symbol-value name)))
+          (when (multiple-value-bind (p really) (ctypep value type)
+                  (and really
+                       (not p)))
+            (warn 'type-proclamation-mismatch-warning
+                  :name name
+                  :old (type-of value)
+                  :value value
+                  :new type-specifier)))))
     (setf (info :variable :type name) type
           (info :variable :where-from name) where-from)))
-
-(defun ftype-proclamation-mismatch-warn (name old new &optional description)
-  (warn 'ftype-proclamation-mismatch-warning
-        :name name :old old :new new :description description))
 
 (defun proclaim-ftype (name type-oid type-specifier where-from)
   (declare (type (or ctype defstruct-description) type-oid))
@@ -343,23 +365,45 @@
     (error "Not a function type: ~/sb-impl:print-type/" type-oid))
   (with-single-package-locked-error
       (:symbol name "globally declaring the FTYPE of ~A")
-    (when (eq (info :function :where-from name) :declared)
-      (let ((old-type (global-ftype name))
-            (type (if (ctype-p type-oid)
-                      type-oid
-                      (specifier-type type-specifier))))
-        (cond
-          ((not (type/= type old-type))) ; not changed
-          ((not (info :function :info name)) ; not a known function
-           (ftype-proclamation-mismatch-warn
-            name (type-specifier old-type) type-specifier))
-          ((csubtypep type old-type)) ; tighten known function type
-          (t
-           (cerror "Continue"
-                   'ftype-proclamation-mismatch-error
+    (let ((from (info :function :where-from name)))
+     (case from
+       (:declared
+        (let ((old-type (global-ftype name))
+              (type (if (ctype-p type-oid)
+                        type-oid
+                        (specifier-type type-specifier))))
+          (cond
+            ((not (type/= type old-type)))    ; not changed
+            ((not (info :function :info name)) ; not a known function
+             (warn 'ftype-proclamation-mismatch-warning
                    :name name
                    :old (type-specifier old-type)
-                   :new type-specifier)))))
+                   :new type-specifier))
+            ((csubtypep type old-type)) ; tighten known function type
+            (t
+             (cerror "Continue"
+                     'ftype-proclamation-mismatch-error
+                     :name name
+                     :old (type-specifier old-type)
+                     :new type-specifier)))))
+       (:defined
+        (when (and #+sb-xc-host (not (sb-cold::make-host-2-parallelism)))
+          (let* ((old-type (global-ftype name))
+                 (type (if (ctype-p type-oid)
+                           type-oid
+                           (specifier-type type-specifier)))
+                 (old-return-type (if (fun-type-p old-type)
+                                      (fun-type-returns old-type)
+                                      *wild-type*))
+                 (return-type (if (fun-type-p type)
+                                  (fun-type-returns type)
+                                  *wild-type*)))
+            (cond
+              ((values-subtypep old-return-type return-type))
+              (t
+               (style-warn 'sb-kernel::ftype-proclamation-derived-mismatch-warning
+                           :name name :old (type-specifier old-type)
+                           :new type-specifier))))))))
     ;; Now references to this function shouldn't be warned about as
     ;; undefined, since even if we haven't seen a definition yet, we
     ;; know one is planned.
@@ -376,31 +420,14 @@
 (defun seal-class (classoid)
   (declare (type classoid classoid))
   (setf (classoid-state classoid) :sealed)
-  (sb-kernel::do-subclassoids ((subclassoid wrapper) classoid)
-    (declare (ignore wrapper))
+  (sb-kernel::do-subclassoids ((subclassoid layout) classoid)
+    (declare (ignore layout))
     (setf (classoid-state subclassoid) :sealed)))
 
 (defun process-freeze-type-declaration (type-specifier)
   (let ((class (specifier-type type-specifier)))
     (when (typep class 'classoid)
       (seal-class class))))
-
-(defun process-inline-declaration (name kind)
-  (declare (type (and inlinep (not null)) kind))
-  ;; since implicitly it is a function, also scrubs (FREE-FUNS *IR1-NAMESPACE*)
-  (proclaim-as-fun-name name)
-  (warn-if-inline-failed/proclaim name kind)
-  (setf (info :function :inlinep name) kind))
-
-(defun process-block-compile-declaration (entries kind)
-  (ecase kind
-    (start-block
-     (finish-block-compilation)
-     (let ((compilation *compilation*))
-       (setf (block-compile compilation) t)
-       (setf (entry-points compilation) entries)))
-    (end-block
-     (finish-block-compilation))))
 
 (defun check-deprecation-declaration (state since form)
   (unless (typep state 'deprecation-state)
@@ -476,6 +503,19 @@
 (defun %proclaim (raw-form location)
   (destructuring-bind (&whole form &optional kind &rest args)
       (canonized-decl-spec raw-form)
+    ;; It seems strange to test whether we are currently in
+    ;; compile-time mode this way, but the reason we don't just call
+    ;; %COMPILER-PROCLAIM in a :COMPILE-TOPLEVEL-only situation in the
+    ;; macro-expansion of DECLAIM is that unlike the DEFmumble macros,
+    ;; DECLAIM and PROCLAIM both exist, and it is unclear whether the
+    ;; intent of the ANSI specification is that
+    ;;   (EVAL-WHEN (:COMPILE-TOPLEVEL ...)
+    ;;     (LET ()
+    ;;       (PROCLAIM ...)))
+    ;; should have the exact same compile time effects as (DECLAIM ...).
+    ;; We make the assumption that yes, they should have the same semantics.
+    (when (boundp '*compilation*)
+      (%compiler-proclaim kind args))
     (labels ((store-location (name &key (key kind))
                (if location
                    (setf (getf (info :source-location :declaration name) key)
@@ -508,17 +548,14 @@
                                     (type #'proclaim-type)
                                     (ftype #'proclaim-ftype))
                             ctype type :declared)))
-             (push raw-form *queued-proclaims*)))
-        #-sb-fluid
+             #-sb-xc-host
+             (push raw-form *queued-proclaims*)
+             #+sb-xc-host
+             (error "Type system not yet initialized.")))
         (freeze-type
          (map-args #'process-freeze-type-declaration))
-        ((start-block end-block)
-         (when (and *compile-time-eval* (boundp '*compilation*))
-           (if (eq *block-compile-argument* :specified)
-               (process-block-compile-declaration args kind)
-               (compiler-notify "ignoring ~S declaration since ~
-                                :BLOCK-COMPILE is not :SPECIFIED"
-                                kind))))
+        ;; This only has compile-time effects.
+        ((start-block end-block))
         (optimize
          (multiple-value-bind (new-policy specified-qualities)
              (process-optimize-decl form *policy*)
@@ -542,8 +579,11 @@
         ((disable-package-locks enable-package-locks)
          (setq *disabled-package-locks*
                (process-package-lock-decl form *disabled-package-locks*)))
-        ((#-sb-fluid inline notinline #-sb-fluid maybe-inline)
-         (map-args #'process-inline-declaration kind))
+        ((inline notinline maybe-inline)
+         (dolist (name args)
+           (warn-if-inline-failed/proclaim name kind)
+           (setf (info :function :inlinep name)
+                 (the (and inlinep (not null)) kind))))
         (deprecated
          (destructuring-bind (state since &rest things) args
            (multiple-value-bind (state software version)

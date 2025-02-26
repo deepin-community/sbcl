@@ -15,13 +15,12 @@
 
 #include <stdio.h>
 
-#include "sbcl.h"
+#include "genesis/sbcl.h"
 #include "runtime.h"
 #include "globals.h"
 #include "interrupt.h"
 
 extern lispobj call_into_lisp(lispobj fun, lispobj *args, int nargs)
-
 #ifdef LISP_FEATURE_X86_64
     __attribute__((sysv_abi))
 #endif
@@ -43,7 +42,6 @@ funcall0(lispobj function)
 {
     lispobj *args = NULL;
 
-    FSHOW((stderr, "/entering funcall0(0x%lx)\n", (long)function));
     return call_into_lisp(function, args, 0);
 }
 lispobj

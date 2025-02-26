@@ -16,15 +16,42 @@
 (defvar *load-source-default-type* "lisp"
   "The source file types which LOAD looks for by default.")
 
+(defvar *load-verbose* nil
+  ;; Note that CMU CL's default for this was T, and ANSI says it's
+  ;; implementation-dependent. We choose NIL on the theory that it's
+  ;; a nicer default behavior for Unix programs.
+  "the default for the :VERBOSE argument to LOAD")
+
+(defvar *load-print* nil
+  "the default for the :PRINT argument to LOAD")
+
+#+ansi-compliant-load-truename
 (defvar *load-truename* nil
   "the TRUENAME of the file that LOAD is currently loading")
+#-ansi-compliant-load-truename
+(setf (documentation '*load-truename* 'variable)
+  "the TRUENAME of the file that LOAD is currently loading")
+
 (defvar *load-pathname* nil
   "the defaulted pathname that LOAD is currently loading")
+
+(declaim (type (or pathname null) *load-truename* *load-pathname*))
+
 
 ;;;; LOAD-AS-SOURCE
 
 ;;; something not EQ to anything we might legitimately READ
 (define-load-time-global *eof-object* (make-symbol "EOF-OBJECT"))
+
+(macrolet ((make-file-stream-source-info (s)
+             `(sb-c::make-source-info
+               :file-info (sb-c::make-file-info
+                           :%truename :defer
+                           ;; This T-L-P has been around since at least 2011.
+                           ;; It's unclear why an LPN isn't good enough.
+                           :pathname (translate-logical-pathname ,s)
+                           :external-format (stream-external-format ,s)
+                           :write-date (file-write-date ,s)))))
 
 ;;; Load a text stream.  (Note that load-as-fasl is in another file.)
 ;; We'd like, when entering the debugger as a result of an EVAL error,
@@ -74,7 +101,7 @@
          (locally (declare (optimize (sb-c::type-check 0)))
            (setf sb-c::*current-path* (make-unbound-marker)))
          (if pathname
-             (let* ((info (sb-c::make-file-stream-source-info stream))
+             (let* ((info (make-file-stream-source-info stream))
                     (sb-c::*source-info* info))
                (locally (declare (optimize (sb-c::type-check 0)))
                  (setf sb-c::*current-path* (make-unbound-marker)))
@@ -94,6 +121,7 @@
                      do (sb-c::with-source-paths
                           (eval-form form nil)))))))))
   t)
+) ; end MACROLET
 
 ;;;; LOAD itself
 
@@ -119,16 +147,22 @@
                             (error () nil)))
          ;; FIXME: this ANSI-specified nonsense should have been an accessor call
          ;; because eager binding might force dozens of syscalls to occur.
-         ;; And you wonder why I/O is slow.  What a joke. Making this a symbol-macro
-         ;; that calls a function would be technically incompatible, but we could
-         ;; make it an unbound symbol and trap the access, stuffing in a value
-         ;; just-in-time. But BOUNDP would also need to hacked to return T.
+         ;; The non-ansi-compliant code resolves *LOAD-TRUENAME* only if referenced.
+         #-ansi-compliant-load-truename (%load-truename (make-unbound-marker))
+         #+ansi-compliant-load-truename
          (*load-truename* (when *load-pathname*
                             (handler-case (truename stream)
                               (file-error () nil))))
          ;; Bindings used internally.
          (*load-depth* (1+ *load-depth*)))
     (funcall function stream arg)))
+
+(defun resolve-load-truename (symbol untruename)
+  (if (boundp symbol)
+      (symbol-value symbol)
+      (set symbol (when untruename
+                    (handler-case (truename untruename)
+                      (file-error () nil))))))
 
 ;;; Returns T if the stream is a binary input stream with a FASL header.
 (defun fasl-header-p (stream &key errorp)
@@ -171,10 +205,26 @@
                              :expected header))))
           (file-position stream p))))))
 
-(defun load (pathspec &key (verbose *load-verbose*) (print *load-print*)
-                           (if-does-not-exist t) (external-format :default))
-  "Load the file given by FILESPEC into the Lisp environment, returning
-   T on success."
+(defun load (filespec &key (verbose *load-verbose*) (print *load-print*)
+                           (if-does-not-exist :error) (external-format :default))
+  "Load the file given by FILESPEC into the Lisp environment, returning T on
+   success. The file type (a.k.a extension) is defaulted if missing. These
+   options are defined:
+
+   :IF-DOES-NOT-EXIST
+       If :ERROR (the default), signal an error if the file can't be located.
+       If NIL, simply return NIL (LOAD normally returns T.)
+
+   :VERBOSE
+       If true, print a line describing each file loaded.
+
+   :PRINT
+       If true, print information about loaded values.  When loading the
+       source, the result of evaluating each top-level form is printed.
+
+   :EXTERNAL-FORMAT
+       The external-format to use when opening the FILENAME. The default is
+       :DEFAULT which uses the SB-EXT:*DEFAULT-SOURCE-EXTERNAL-FORMAT*."
   (labels ((load-stream (stream faslp)
              (if (and (fd-stream-p stream)
                       (eq (sb-impl::fd-stream-fd-type stream) :directory))
@@ -186,11 +236,11 @@
                   #'load-stream-1 stream
                   faslp
                   ;; If you prefer *LOAD-PATHNAME* to reflect what the user specified prior
-                  ;; to merging, then CALL-WITH-LOAD-BINDINGS is passed PATHSPEC,
+                  ;; to merging, then CALL-WITH-LOAD-BINDINGS is passed FILESPEC,
                   ;; otherwise it is passed STREAM.
                   (cond ((and (not sb-c::*merge-pathnames*)
-                              (typep pathspec '(or string pathname)))
-                         pathspec)
+                              (typep filespec '(or string pathname)))
+                         filespec)
                         (t stream)))))
            (load-stream-1 (stream faslp)
              (let (;; Bindings required by ANSI.
@@ -207,27 +257,30 @@
                    (sb-c::*policy* sb-c::*policy*)
                    (sb-c::*handled-conditions* sb-c::*handled-conditions*))
                (if faslp
-                   (load-as-fasl stream verbose print)
+                   (load-as-fasl stream verbose (if print t nil))
                    ;; FIXME: if *EVALUATOR-MODE* is :INTERPRET,
                    ;; then this should have nothing whatsoever to do with
                    ;; compiler-error-resignaling. That's an artifact
                    ;; of using the compiler to perform interpretation.
                    (sb-c:with-compiler-error-resignalling
                        (load-as-source stream :verbose verbose :print print))))))
-    (declare (truly-dynamic-extent #'load-stream-1))
+    (declare (dynamic-extent #'load-stream-1))
 
     ;; Case 1: stream.
-    (when (streamp pathspec)
-      (return-from load (load-stream pathspec (fasl-header-p pathspec))))
+    (when (streamp filespec)
+      (return-from load (load-stream filespec (fasl-header-p filespec))))
 
-    (let ((pathname (pathname pathspec)))
+    (let ((pathname (pathname filespec))
+          (external-format (if (eq external-format :default)
+                               sb-ext:*default-source-external-format*
+                               external-format)))
       ;; Case 2: Open as binary, try to process as a fasl.
       (with-open-stream
-          (stream (or (open pathspec :element-type '(unsigned-byte 8)
+          (stream (or (open filespec :element-type '(unsigned-byte 8)
                                      :if-does-not-exist nil)
-                      (when (null (pathname-type pathspec))
+                      (when (null (pathname-type filespec))
                         (let ((defaulted-pathname
-                                (probe-load-defaults pathspec)))
+                                (probe-load-defaults filespec)))
                           (if defaulted-pathname
                               (progn (setq pathname defaulted-pathname)
                                      (open pathname
@@ -236,11 +289,28 @@
                                            :element-type '(unsigned-byte 8))))))
                       (if if-does-not-exist
                           (error 'simple-file-error
-                                 :pathname pathspec
+                                 :pathname filespec
                                  :format-control
                                  "~@<Couldn't load ~S: file does not exist.~@:>"
-                                 :format-arguments (list pathspec))
+                                 :format-arguments (list filespec))
                           (return-from load nil))))
+        ;; This is the understandable logic.
+        #-ansi-compliant-load-truename
+        (if (string-equal (pathname-type pathname) *fasl-file-type*)
+            (load-stream stream t)
+            (with-open-file (stream pathname :external-format external-format
+                                             :class 'form-tracking-stream)
+              (load-stream stream nil)))
+        ;; I have no idea what "don't allow empty .fasls" was supposed to mean.
+        ;; The more natural interpretation to me would be that if a file is empty,
+        ;; we don't treat the file as fasl, but instead treat it as source (and do nothing)
+        ;; regardless of the name. But the actual effect seems to be to force an error.
+        ;; So I would have commented that as "force an error on empty fasls", especially
+        ;; as there is ambiguity in "don't X and Y" - does it mean "don't X" and "don't Y"?
+        ;; Because surely that would be illogical - "don't assume empty files are source".
+        ;; Anyway, reasonable users should never test the edge cases of this,
+        ;; and so all it effectively achieves is slowing down the loading of files.
+        #+ansi-compliant-load-truename
         (let* ((real (probe-file stream))
                (should-be-fasl-p
                  (and real (string-equal (pathname-type real) *fasl-file-type*))))
@@ -266,42 +336,37 @@
 ;; expicitly ask us to load a file with a made-up name (e.g., the
 ;; defaulted filename might exceed filename length limits).
 (defun probe-load-defaults (pathname)
-  (destructuring-bind (defaulted-source-pathname
-                       defaulted-source-truename
-                       defaulted-fasl-pathname
-                       defaulted-fasl-truename)
-      (loop for type in (list *load-source-default-type*
-                              *fasl-file-type*)
-            as probe-pathname = (make-pathname :type type
-                                               :defaults pathname)
-            collect probe-pathname
-            collect (handler-case (probe-file probe-pathname)
-                      (file-error () nil)))
-    (cond ((and defaulted-fasl-truename
-                defaulted-source-truename
-                (> (file-write-date defaulted-source-truename)
-                   (file-write-date defaulted-fasl-truename)))
+  (multiple-value-bind (source-existsp defaulted-source-pathname
+                        fasl-existsp defaulted-fasl-pathname)
+      (flet ((probe (type &aux (candidate (make-pathname :type type
+                                                         :defaults pathname)))
+               (values (sb-impl::query-file-system candidate :existence nil)
+                       candidate)))
+        (multiple-value-call #'values
+          (probe *load-source-default-type*) (probe *fasl-file-type*)))
+    (cond ((and fasl-existsp
+                source-existsp
+                (> (file-write-date defaulted-source-pathname)
+                   (file-write-date defaulted-fasl-pathname)))
            (restart-case
                (error "The object file ~A is~@
                        older than the presumed source:~%  ~A."
-                      defaulted-fasl-truename
-                      defaulted-source-truename)
+                      defaulted-fasl-pathname
+                      defaulted-source-pathname)
              (source () :report "load source file"
                      defaulted-source-pathname)
              (object () :report "load object file"
                      defaulted-fasl-pathname)))
-          (defaulted-fasl-truename defaulted-fasl-pathname)
-          (defaulted-source-truename defaulted-source-pathname))))
+          (fasl-existsp defaulted-fasl-pathname)
+          (source-existsp defaulted-source-pathname))))
 
 ;;;; linkage fixups
 
-;;; Lisp assembler routines are named by Lisp symbols, not strings,
-;;; and so can be compared by EQ.
-(define-load-time-global *assembler-routines* nil)
-(declaim (code-component *assembler-routines*))
+(defun %asm-routine-table (code-obj)
+   (#+darwin-jit car #-darwin-jit identity (%code-debug-info code-obj)))
 
 (defun calc-asm-routine-bounds ()
-  (loop for v being each hash-value of (%code-debug-info *assembler-routines*)
+  (loop for v being each hash-value of (%asm-routine-table *assembler-routines*)
         minimize (car v) into min
         maximize (cadr v) into max
         ;; min/max are inclusive byte ranges, but return the answer
@@ -311,25 +376,36 @@
 ;;; how we learn about assembler routines at startup
 (defvar *!initial-assembler-routines*)
 
-(defun get-asm-routine (name &optional indirect &aux (code *assembler-routines*))
-  (awhen (the list (gethash (the symbol name) (%code-debug-info code)))
-    (sap-int (sap+ (code-instructions code)
-                   (if indirect
-                       ;; Return the address containing the routine address
-                       (ash (cddr it) sb-vm:word-shift)
-                       ;; Return the routine address itself
-                       (car it))))))
+(defun get-asm-routine (name &aux (code *assembler-routines*))
+  (awhen (the list (gethash (the symbol name) (%asm-routine-table code)))
+    (sap-int (sap+ (code-instructions code) (car it)))))
+
+(defun asm-routine-index-from-addr (addr)
+  (let* ((code *assembler-routines*)
+         (max (hash-table-count (%asm-routine-table code)))
+         (min 1)
+         (table (code-instructions code)))
+    (loop
+     (let* ((guess-index (floor (+ min max) 2))
+            (guess-val (sap-ref-word table (ash guess-index sb-vm:word-shift))))
+       (cond ((= guess-val addr) (return guess-index))
+             ((< guess-val addr) (setq min (1+ guess-index))) ; guess too small
+             (t (setq max (1- guess-index)))) ; guess too large
+       (if (< max min) (return nil))))))
 
 (defun !loader-cold-init ()
   (let* ((code *assembler-routines*)
          (size (%code-text-size code))
          (vector (the simple-vector *!initial-assembler-routines*))
          (count (length vector))
+         (offsets (make-array (1+ count) :element-type '(unsigned-byte 16)))
          (ht (make-hash-table))) ; keys are symbols
-    (rplaca (%code-debug-info code) ht)
+    (#+darwin-jit rplaca #-darwin-jit setf (%code-debug-info code) ht)
+    (setf sb-c::*asm-routine-offsets* offsets)
     (dotimes (i count)
       (destructuring-bind (name . offset) (svref vector i)
         (let ((next-offset (if (< (1+ i) count) (cdr (svref vector (1+ i))) size)))
+          (setf (aref offsets (1+ i)) offset)
           ;; Must be in ascending order, but one address can have more than one name.
           (aver (>= next-offset offset))
           ;; store inclusive bounds on PC offset range and the function index
@@ -342,9 +418,3 @@
     (abort-build ()
       :report "Abort building SBCL."
       (sb-ext:exit :code 1))))
-
-;;; Remember where cold artifacts went, and put the warm ones there too
-;;; because it looks nicer not to scatter them throughout the source tree.
-;;; *t-o-prefix* isn't known to the compiler, and we need it to be
-;;; initialized from a constant, so use read-time eval.
-(defvar *!target-obj-prefix* #.sb-cold::*target-obj-prefix*)

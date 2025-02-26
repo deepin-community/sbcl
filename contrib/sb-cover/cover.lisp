@@ -18,7 +18,14 @@
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (setf (sb-int:system-package-p *package*) t))
 
-(defmacro code-coverage-hashtable () `(car sb-c:*code-coverage-info*))
+(defmacro code-coverage-hashtable () `(car sb-int:*code-coverage-info*))
+
+(defun reset-code-coverage ()
+  (maphash (lambda (info cc)
+             (declare (ignore info))
+             (dolist (cc-entry cc)
+               (setf (cdr cc-entry) nil)))
+           (car sb-int:*code-coverage-info*)))
 
 ;;;; New coverage representation.
 ;;;; One byte per coverage mark is stored in the unboxed constants of the code.
@@ -77,13 +84,14 @@
 into the database when the FASL files (produced by compiling
 STORE-COVERAGE-DATA optimization policy set to 3) are loaded again into the
 image."
-  (sb-c:clear-code-coverage))
+  (clrhash (car sb-int:*code-coverage-info*))
+  (setf (cdr sb-int:*code-coverage-info*) nil))
 
 (macrolet
     ((do-instrumented-code ((var &optional result) &body body)
        ;; Scan list of weak-pointers to all coverage-instrumented code,
        ;; binding VAR to each object, and removing broken weak-pointers.
-       `(let ((predecessor sb-c:*code-coverage-info*))
+       `(let ((predecessor sb-int:*code-coverage-info*))
           (loop
            (let ((cell (cdr predecessor)))
              (unless cell (return ,result))
@@ -91,6 +99,12 @@ image."
                (if ,var
                    (progn ,@body (setq predecessor cell))
                    (rplacd predecessor (cdr cell))))))))
+     ;; Using different values here isn't great, but a 1 bit seemed
+     ;; the natural choice for "marked" which is fine for x86 which can
+     ;; store any immediate byte. But the architectures which can't
+     ;; have either a ZERO-TN or NULL-TN, and can store a byte from
+     ;; that register into the coverage mark. So they expect a 0
+     ;; in the low bit and therefore a 1 in the unmarked state.
      (empty-mark-word ()
        #+(or x86-64 x86) 0
        #-(or x86-64 x86) sb-ext:most-positive-word)
@@ -118,20 +132,24 @@ image."
 (defun reset-coverage (&optional object)
   "Reset all coverage data back to the `Not executed` state."
   (cond (object ; reset only this object
-         (multiple-value-bind (map code) (%find-coverage-map object)
+         (multiple-value-bind (map code)
+             (%find-coverage-map (the sb-kernel:code-component object))
            (when map
              #-arm64
              (sb-sys:with-pinned-objects (code)
-               (let ((sap (code-coverage-marks code)))
-                 (dotimes (i (ceiling (length map) sb-vm:n-word-bytes))
-                   (setf (sb-sys:sap-ref-word sap (ash i sb-vm:n-word-bytes))
-                         (empty-mark-word)))))
+               (sb-alien:alien-funcall
+                (sb-alien:extern-alien "memset"
+                                       (function sb-alien:void sb-sys:system-area-pointer
+                                                 sb-alien:int sb-alien:unsigned))
+                (code-coverage-marks code)
+                (logand (empty-mark-word) #xFF)
+                (length map)))
              #+arm64
              (fill (code-coverage-marks code) #xFF))))
         (t                              ; reset everything
          (do-instrumented-code (code)
            (reset-coverage code))
-         (sb-c:reset-code-coverage))))
+         (reset-code-coverage))))
 
 ;;; Transfer data from new-style coverage marks into old-style.
 ;;; Update only data for FILENAME if supplied, or all files if NIL.
@@ -141,14 +159,14 @@ image."
   (declare (ignorable filename))
   ;; NAMESTRING->PATH-TABLES maps a namestring to a hashtable which maps
   ;; source paths to the legacy coverage record for that path in that file,
-  ;;   e.g. (1 4 1) -> ((1 4 1) . SB-C::%CODE-COVERAGE-UNMARKED%)
+  ;;   e.g. (1 4 1) -> ((1 4 1) . NIL)
   (let ((namestring->path-tables (make-hash-table :test 'equal))
         (coverage-records (code-coverage-hashtable))
         (n-marks 0))
     (do-instrumented-code (code)
       (sb-int:binding* ((map (%find-coverage-map code) :exit-if-null)
                         (namestring
-                         (sb-int:debug-source-namestring
+                         (sb-c::debug-source-namestring
                           (sb-c::debug-info-source (sb-kernel:%code-debug-info code)))
                          :exit-if-null)
                         (legacy-coverage-marks
@@ -171,10 +189,7 @@ image."
               (when (byte-marked-p (sb-sys:sap-ref-8 sap i))
                 (incf n-marks)
                 ;; Set the legacy coverage mark for each path it touches
-                ;; One mark byte for x86[-64] corresponds to a union of source paths.
-                ;; For everybody else, one mark is one path.
-                (dolist (path #+(or x86 x86-64) (svref map i)
-                              #-(or x86 x86-64) (list (svref map i)))
+                (dolist (path (svref map i))
                   (let ((found (gethash path path-lookup-table)))
                     (if found
                         (rplacd found t)
@@ -186,9 +201,10 @@ image."
           (dotimes (i (length map))     ; for each recorded mark
             (when (byte-marked-p (aref marks i))
               (incf n-marks)
-              (let ((found (gethash (svref map i) path-lookup-table)))
-                (if found
-                    (rplacd found t))))))))
+              (dolist (path (svref map i))
+                (let ((found (gethash path path-lookup-table)))
+                  (if found
+                      (rplacd found t)))))))))
     (values coverage-records n-marks)))
 
 ) ; end MACROLET
@@ -586,7 +602,7 @@ table.summary tr.subheading td { text-align: left; font-weight: bold; padding-le
            unless (member (caar record) '(:then :else))
            collect (list mode
                          (car record)
-                         (if (sb-c:code-coverage-record-marked record)
+                         (if (cdr record)
                              1
                              2))))
     (:branch
@@ -596,7 +612,7 @@ table.summary tr.subheading td { text-align: left; font-weight: bold; padding-le
            (when (member (car path) '(:then :else))
              (setf (gethash (cdr path) hash)
                    (logior (gethash (cdr path) hash 0)
-                           (ash (if (sb-c:code-coverage-record-marked record)
+                           (ash (if (cdr record)
                                     1
                                     2)
                                 (if (eql (car path) :then)
@@ -664,9 +680,10 @@ The source locations are stored in SOURCE-MAP."
         (return-from return
           (sb-impl::read-list stream ignore)))
       (let* ((thelist (list nil))
+             (rt *readtable*)
              (listtail thelist))
-        (do ((firstchar (sb-impl::flush-whitespace stream)
-                        (sb-impl::flush-whitespace stream)))
+        (do ((firstchar (sb-impl::flush-whitespace stream rt)
+                        (sb-impl::flush-whitespace stream rt)))
             ((char= firstchar #\) ) (cdr thelist))
           (when (char= firstchar #\.)
             (let ((nextchar (read-char stream t)))
@@ -676,8 +693,8 @@ The source locations are stored in SOURCE-MAP."
                               (sb-int:simple-reader-error
                                stream
                                "Nothing appears before . in list.")))
-                           ((sb-impl::whitespace[2]p nextchar)
-                            (setq nextchar (sb-impl::flush-whitespace stream))))
+                           ((sb-impl::whitespace[2]p nextchar rt)
+                            (setq nextchar (sb-impl::flush-whitespace stream rt))))
                      (rplacd listtail
                              (sb-impl::read-after-dot
                               stream nextchar (if *read-suppress* 0 -1)))

@@ -68,7 +68,7 @@
            "background read attempted from control terminal." t)
  (:integer SIGTTOU "SIGTTOU"
            "background write attempted to control terminal." t)
- (:integer SIGIO "SIGIO"
+ #-haiku (:integer SIGIO "SIGIO"
            "I/O is possible on a descriptor (see fcntl(2))." t)
  (:integer SIGXCPU "SIGXCPU"
            "cpu time limit exceeded (see setrlimit(2))." t)
@@ -274,6 +274,7 @@
               #-(and linux largefile) "struct dirent"
               #-(or win32 android) (:ino-t ino "ino_t" "d_ino")
               #+android ((unsigned 64) ino "unsigned long long" "d_ino")
+              #-haiku
               (:c-string name "char *" "d_name"
                          ;; FIXME: sunos should really have :distrust-length
                          ;; t, but this is currently broken. -- Jim Wise 2010-08-31
@@ -307,7 +308,8 @@
              ("struct group"
               (c-string-pointer name "char *" "gr_name")
               (c-string-pointer passwd "char *" "gr_passwd")
-              (gid-t gid "gid_t" "gr_gid")))
+              (gid-t gid "gid_t" "gr_gid")
+              ((* c-string) mem "char **" "gr_mem")))
 
  (:structure alien-stat
              ("struct stat"
@@ -422,7 +424,8 @@
  ;; utime(), utimes()
  #-win32
  (:type suseconds-t ; OAOOM warning: similar kludge in tools-for-build
-        #+os-provides-suseconds-t "suseconds_t"
+        #+(and os-provides-suseconds-t 64-bit-time) "__suseconds64_t"
+        #+(and os-provides-suseconds-t (not 64-bit-time)) "suseconds_t"
         #-os-provides-suseconds-t "long")
 
  #-win32
@@ -434,7 +437,9 @@
  (:structure alien-timeval
              ("struct timeval"
               (time-t sec "time_t" "tv_sec")
-              (suseconds-t usec "suseconds_t" "tv_usec")))
+              (suseconds-t usec #+64-bit-time "__suseconds64_t"
+                                #-64-bit-time "suseconds_t"
+                                "tv_usec")))
 
  (:integer veof "VEOF" nil t)
  (:integer veol "VEOL" nil t)
