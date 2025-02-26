@@ -249,11 +249,6 @@
       (add-method generic-function new)
       new)))
 
-(define-condition find-method-length-mismatch
-    (reference-condition simple-error)
-  ()
-  (:default-initargs :references '((:ansi-cl :function find-method))))
-
 (defun real-get-method (generic-function qualifiers specializers
                         &optional (errorp t)
                                   always-check-specializers)
@@ -371,18 +366,6 @@
             (or restp
                 (and number-of-requireds (/= number-of-requireds requireds)))
             specialized-argument-positions)))
-
-(defun make-discriminating-function-arglist (number-required-arguments restp)
-  (nconc (let ((args nil))
-           (dotimes (i number-required-arguments)
-             (push (format-symbol *package* ;; ! is this right?
-                                  "Discriminating Function Arg ~D"
-                                  i)
-                   args))
-           (nreverse args))
-         (when restp
-               `(&rest ,(format-symbol *package*
-                                       "Discriminating Function &rest Arg")))))
 
 (defmethod generic-function-argument-precedence-order
     ((gf standard-generic-function))
@@ -397,6 +380,15 @@
 
 (defmethod gf-fast-method-function-p ((gf standard-generic-function))
   (gf-info-fast-mf-p (slot-value gf 'arg-info)))
+
+(defun add-to-weak-hashset (key set)
+  (hashset-insert-if-absent set key #'identity)) ; implicitly locks
+(defun remove-from-weak-hashset (key set)
+  (with-system-mutex ((hashset-mutex set))
+    (hashset-remove set key)))
+(defun weak-hashset-memberp (key set)
+  (with-system-mutex ((hashset-mutex set))
+    (hashset-find set key)))
 
 (defmethod initialize-instance :after ((gf standard-generic-function)
                                        &key (lambda-list nil lambda-list-p)
@@ -413,7 +405,7 @@
                       :argument-precedence-order argument-precedence-order)
         (set-arg-info gf))
     (let ((mc (generic-function-method-combination gf)))
-      (setf (gethash gf (method-combination-%generic-functions mc)) t))
+      (add-to-weak-hashset gf (method-combination-%generic-functions mc)))
     (when (arg-info-valid-p (slot-value gf 'arg-info))
       (update-dfun gf))))
 
@@ -421,15 +413,15 @@
     ((gf standard-generic-function) &rest args &key
      (lambda-list nil lambda-list-p) (argument-precedence-order nil apo-p))
   (let* ((old-mc (generic-function-method-combination gf))
-         (mc (getf args :method-combination old-mc)))
+         (mc (getf args :method-combination old-mc))
+         (keys (arg-info-keys (gf-arg-info gf))))
     (unless (eq mc old-mc)
-      (aver (gethash gf (method-combination-%generic-functions old-mc)))
-      (aver (not (gethash gf (method-combination-%generic-functions mc)))))
+      (aver (weak-hashset-memberp gf (method-combination-%generic-functions old-mc)))
+      (aver (not (weak-hashset-memberp gf (method-combination-%generic-functions mc)))))
     (prog1 (call-next-method)
       (unless (eq mc old-mc)
-        (remhash gf (method-combination-%generic-functions old-mc))
-        (setf (gethash gf (method-combination-%generic-functions mc)) t)
-        (flush-effective-method-cache gf))
+        (remove-from-weak-hashset gf (method-combination-%generic-functions old-mc))
+        (add-to-weak-hashset gf (method-combination-%generic-functions mc)))
       (sb-thread::with-recursive-system-lock ((gf-lock gf))
         (cond
           ((and lambda-list-p apo-p)
@@ -438,8 +430,11 @@
                          :argument-precedence-order argument-precedence-order))
           (lambda-list-p (set-arg-info gf :lambda-list lambda-list))
           (t (set-arg-info gf)))
-        (when (arg-info-valid-p (gf-arg-info gf))
-          (update-dfun gf))
+        (let ((arg-info (gf-arg-info gf)))
+          (unless (and (eq mc old-mc) (equal keys (arg-info-keys arg-info)))
+            (flush-effective-method-cache gf))
+          (when (arg-info-valid-p arg-info)
+            (update-dfun gf)))
         (map-dependents gf (lambda (dependent)
                              (apply #'update-dependent gf dependent args)))))))
 
@@ -504,9 +499,9 @@
 
 (defun compute-gf-ftype (name)
   (let ((gf (and (fboundp name) (fdefinition name)))
-        (methods-in-compilation-unit (and (boundp 'sb-c::*methods-in-compilation-unit*)
-                                          sb-c::*methods-in-compilation-unit*
-                                          (gethash name sb-c::*methods-in-compilation-unit*))))
+        (methods-in-compilation-unit (binding* ((cu sb-c::*compilation-unit* :exit-if-null)
+                                                (methods (sb-c::cu-methods cu) :exit-if-null))
+                                       (gethash name methods))))
     (cond ((generic-function-p gf)
            (let* ((ll (generic-function-lambda-list gf))
                   ;; If the GF has &REST without &KEY then we don't augment
@@ -532,7 +527,7 @@
            ;; don't, however this branch should never be reached because the
            ;; info only stores :GENERIC-FUNCTION when methods are loaded.
            ;; Maybe AVER that it does not happen?
-           (sb-impl::ftype-from-fdefn name)))))
+           (sb-c::ftype-from-definition name)))))
 
 (defun real-add-method (generic-function method &optional skip-dfun-update-p)
   (flet ((similar-lambda-lists-p (old-method new-lambda-list)
@@ -807,13 +802,6 @@
             (invoke-emf emf args))
           (call-no-applicable-method generic-function args)))))
 
-(defun list-eq (x y)
-  (loop (when (atom x) (return (eq x y)))
-        (when (atom y) (return nil))
-        (unless (eq (car x) (car y)) (return nil))
-        (setq x (cdr x)
-              y (cdr y))))
-
 (define-load-time-global *std-cam-methods* nil)
 
 (defun compute-applicable-methods-emf (generic-function)
@@ -822,7 +810,7 @@
              (cam-methods (compute-applicable-methods-using-types
                            cam (list `(eql ,generic-function) t))))
         (values (get-effective-method-function cam cam-methods)
-                (list-eq cam-methods
+                (list-elts-eq cam-methods
                          (or *std-cam-methods*
                              (setq *std-cam-methods*
                                    (compute-applicable-methods-using-types
@@ -884,9 +872,10 @@
                              ((or (eq class *the-class-standard-writer-method*)
                                   (eq class *the-class-global-writer-method*))
                               'writer)
-                             ((or (eq class *the-class-standard-boundp-method*)
-                                  (eq class *the-class-global-boundp-method*))
-                              'boundp)))))
+                             ((eq class *the-class-global-boundp-method*)
+                              'boundp)
+                             ((eq class *the-class-global-makunbound-method*)
+                              'makunbound)))))
             (when (and (gf-info-c-a-m-emf-std-p arg-info)
                        type
                        (dolist (method (cdr methods) t)
@@ -901,10 +890,10 @@
 ;;; Return two values.  First value is a function to be stored in
 ;;; effective slot definition SLOTD for reading it with
 ;;; SLOT-VALUE-USING-CLASS, setting it with (SETF
-;;; SLOT-VALUE-USING-CLASS) or testing it with
-;;; SLOT-BOUNDP-USING-CLASS.  GF is one of these generic functions,
-;;; TYPE is one of the symbols READER, WRITER, BOUNDP.  CLASS is
-;;; SLOTD's class.
+;;; SLOT-VALUE-USING-CLASS), testing it with SLOT-BOUNDP-USING-CLASS,
+;;; or making it unbound with SLOT-MAKUNBOUND-USING-CLASS.  GF is one
+;;; of these generic functions, TYPE is one of the symbols READER,
+;;; WRITER, BOUNDP, MAKUNBOUND.  CLASS is SLOTD's class.
 ;;;
 ;;; Second value is true if the function returned is one of the
 ;;; optimized standard functions for the purpose, which are used
@@ -912,9 +901,7 @@
 ;;;
 ;;; FIXME: Change all these wacky function names to something sane.
 (defun get-accessor-method-function (gf type class slotd)
-  (let* ((std-method (standard-svuc-method type))
-         (str-method (structure-svuc-method type))
-         (types1 `((eql ,class) (class-eq ,class) (eql ,slotd)))
+  (let* ((types1 `((eql ,class) (class-eq ,class) (eql ,slotd)))
          (types (if (eq type 'writer) `(t ,@types1) types1))
          (methods (compute-applicable-methods-using-types gf types))
          (std-p (null (cdr methods))))
@@ -925,15 +912,15 @@
                  (get-optimized-std-slot-value-using-class-method-function
                   class slotd type))
                 (method-alist
-                 `((,(car (or (member std-method methods :test #'eq)
-                              (member str-method methods :test #'eq)
-                              (bug "error in ~S"
-                                   'get-accessor-method-function)))
+                 `((,(or (find (standard-svuc-method type) methods :test #'eq)
+                         (find (structure-svuc-method type) methods :test #'eq)
+                         (find (condition-svuc-method type) methods :test #'eq)
+                         (bug "error in ~S" 'get-accessor-method-function))
                     ,optimized-std-fun)))
                 (wrappers
-                 (let ((wrappers (list (wrapper-of class)
+                 (let ((wrappers (list (layout-of class)
                                        (class-wrapper class)
-                                       (wrapper-of slotd))))
+                                       (layout-of slotd))))
                    (if (eq type 'writer)
                        (cons (class-wrapper *the-class-t*) wrappers)
                        wrappers)))
@@ -945,7 +932,7 @@
 ;;; used by OPTIMIZE-SLOT-VALUE-BY-CLASS-P (vector.lisp)
 (defun update-slot-value-gf-info (gf type)
   (unless *new-class*
-    (update-std-or-str-methods gf type))
+    (update-std-slot-methods gf type))
   (when (and (standard-svuc-method type) (structure-svuc-method type))
     (flet ((update-accessor-info (class)
              (when (class-finalized-p class)
@@ -958,50 +945,59 @@
 (define-load-time-global *standard-slot-value-using-class-method* nil)
 (define-load-time-global *standard-setf-slot-value-using-class-method* nil)
 (define-load-time-global *standard-slot-boundp-using-class-method* nil)
+(define-load-time-global *standard-slot-makunbound-using-class-method* nil)
 (define-load-time-global *condition-slot-value-using-class-method* nil)
 (define-load-time-global *condition-setf-slot-value-using-class-method* nil)
 (define-load-time-global *condition-slot-boundp-using-class-method* nil)
+(define-load-time-global *condition-slot-makunbound-using-class-method* nil)
 (define-load-time-global *structure-slot-value-using-class-method* nil)
 (define-load-time-global *structure-setf-slot-value-using-class-method* nil)
 (define-load-time-global *structure-slot-boundp-using-class-method* nil)
+(define-load-time-global *structure-slot-makunbound-using-class-method* nil)
 
 (defun standard-svuc-method (type)
   (case type
     (reader *standard-slot-value-using-class-method*)
     (writer *standard-setf-slot-value-using-class-method*)
-    (boundp *standard-slot-boundp-using-class-method*)))
+    (boundp *standard-slot-boundp-using-class-method*)
+    (makunbound *standard-slot-makunbound-using-class-method*)))
 
 (defun set-standard-svuc-method (type method)
   (case type
     (reader (setq *standard-slot-value-using-class-method* method))
     (writer (setq *standard-setf-slot-value-using-class-method* method))
-    (boundp (setq *standard-slot-boundp-using-class-method* method))))
+    (boundp (setq *standard-slot-boundp-using-class-method* method))
+    (makunbound (setq *standard-slot-makunbound-using-class-method* method))))
 
 (defun condition-svuc-method (type)
   (case type
     (reader *condition-slot-value-using-class-method*)
     (writer *condition-setf-slot-value-using-class-method*)
-    (boundp *condition-slot-boundp-using-class-method*)))
+    (boundp *condition-slot-boundp-using-class-method*)
+    (makunbound *condition-slot-makunbound-using-class-method*)))
 
 (defun set-condition-svuc-method (type method)
   (case type
     (reader (setq *condition-slot-value-using-class-method* method))
     (writer (setq *condition-setf-slot-value-using-class-method* method))
-    (boundp (setq *condition-slot-boundp-using-class-method* method))))
+    (boundp (setq *condition-slot-boundp-using-class-method* method))
+    (makunbound (setq *condition-slot-makunbound-using-class-method* method))))
 
 (defun structure-svuc-method (type)
   (case type
     (reader *structure-slot-value-using-class-method*)
     (writer *structure-setf-slot-value-using-class-method*)
-    (boundp *structure-slot-boundp-using-class-method*)))
+    (boundp *structure-slot-boundp-using-class-method*)
+    (makunbound *structure-slot-makunbound-using-class-method*)))
 
 (defun set-structure-svuc-method (type method)
   (case type
     (reader (setq *structure-slot-value-using-class-method* method))
     (writer (setq *structure-setf-slot-value-using-class-method* method))
-    (boundp (setq *structure-slot-boundp-using-class-method* method))))
+    (boundp (setq *structure-slot-boundp-using-class-method* method))
+    (makunbound (setq *structure-slot-makunbound-using-class-method* method))))
 
-(defun update-std-or-str-methods (gf type)
+(defun update-std-slot-methods (gf type)
   (dolist (method (generic-function-methods gf))
     (let ((specls (method-specializers method)))
       (when (and (or (not (eq type 'writer))
@@ -1011,16 +1007,19 @@
                     (eq (class-name (cadr specls)) 'standard-object)
                     (eq (class-name (caddr specls))
                         'standard-effective-slot-definition))
+               (aver (null (method-qualifiers method)))
                (set-standard-svuc-method type method))
               ((and (eq (class-name (car specls)) 'condition-class)
                     (eq (class-name (cadr specls)) 'condition)
                     (eq (class-name (caddr specls))
                         'condition-effective-slot-definition))
+               (aver (null (method-qualifiers method)))
                (set-condition-svuc-method type method))
               ((and (eq (class-name (car specls)) 'structure-class)
                     (eq (class-name (cadr specls)) 'structure-object)
                     (eq (class-name (caddr specls))
                         'structure-effective-slot-definition))
+               (aver (null (method-qualifiers method)))
                (set-structure-svuc-method type method)))))))
 
 (defun mec-all-classes-internal (spec precompute-p)
@@ -1104,13 +1103,13 @@
   (cond
     ((eq class *the-class-t*) t)
     ((eq class *the-class-standard-object*)
-     `(or (std-instance-p ,arg) (fsc-instance-p ,arg)))
+     `(pcl-instance-p ,arg))
     ((eq class *the-class-funcallable-standard-object*)
-     `(fsc-instance-p ,arg))
+     `(and (pcl-instance-p ,arg) (fsc-instance-p ,arg)))
     ;; This is going to be cached (in *fgens*),
     ;; and structure type tests do not check for invalid layout.
     ;; Cache the wrapper itself, which is going to be different after
-    ;; redifinition.
+    ;; redefinition.
     ((structure-class-p class)
      `(sb-c::%instance-typep ,arg ,(class-wrapper class)))
     (t
@@ -1118,9 +1117,6 @@
 
 (defmacro class-eq-test (arg class)
   `(eq (class-of ,arg) ',class))
-
-(defmacro eql-test (arg object)
-  `(eql ,arg ',object))
 
 (defun dnet-methods-p (form)
   (and (consp form)
@@ -1289,11 +1285,6 @@
                                            (do-if t) (do-if nil))))))))))
       (do-column precedence methods ()))))
 
-(defun compute-secondary-dispatch-function (generic-function net &optional
-                                            method-alist wrappers)
-  (funcall (the function (compute-secondary-dispatch-function1 generic-function net))
-           method-alist wrappers))
-
 (defvar *eq-case-table-limit* 15)
 (defvar *case-table-limit* 10)
 
@@ -1393,7 +1384,9 @@
 (defun methods-converter (form generic-function)
   (cond ((and (consp form) (eq (car form) 'methods))
          (cons '.methods.
-               (get-effective-method-function1 generic-function (cadr form))))
+               ;; force to heap since the method list is stored in the %CACHE slot
+               (get-effective-method-function1 generic-function
+                                               (ensure-heap-list (cadr form)))))
         ((and (consp form) (eq (car form) 'unordered-methods))
          (default-secondary-dispatch-function generic-function))))
 
@@ -1419,13 +1412,13 @@
              (:assoc
               alist)
              (:hash-table
-              (let ((table (make-hash-table :test (if (car mp) 'eq 'eql))))
+              (let ((table (sb-vm:without-arena
+                            (make-hash-table :test (if (car mp) 'eq 'eql)))))
                 (dolist (k+m alist)
                   (setf (gethash (car k+m) table) (cdr k+m)))
                 table)))))))
 
-(defun compute-secondary-dispatch-function1 (generic-function net
-                                             &optional function-p)
+(defun compute-secondary-dispatch-function1 (generic-function net &optional function-p)
   (cond
    ((and (eq (car net) 'methods) (not function-p))
     (get-effective-method-function1 generic-function (cadr net)))
@@ -1579,10 +1572,15 @@
   (declare (ignore class))
   (funcall (slot-info-boundp (slot-definition-info slotd)) object))
 
+(defun slot-makunbound-using-class-dfun (class object slotd)
+  (declare (ignore class))
+  (funcall (slot-info-makunbound (slot-definition-info slotd)) object))
+
 (defun special-case-for-compute-discriminating-function-p (gf)
   (or (eq gf #'slot-value-using-class)
       (eq gf #'(setf slot-value-using-class))
-      (eq gf #'slot-boundp-using-class)))
+      (eq gf #'slot-boundp-using-class)
+      (eq gf #'slot-makunbound-using-class)))
 
 ;;; this is the normal function for computing the discriminating
 ;;; function of a standard-generic-function
@@ -1595,13 +1593,12 @@
             ;; COMPUTE-DISCRIMINATING-FUNCTION, then (at least for the
             ;; special cases implemented as of 2006-05-09) any information
             ;; in the cache is misplaced.
-            (aver (null dfun-state)))
-          (typecase dfun-state
-            (null
-             (when (eq gf (load-time-value #'compute-applicable-methods t))
-               (update-all-c-a-m-gf-info gf))
-             (cond
-               ((eq gf (load-time-value #'slot-value-using-class t))
+        (aver (null dfun-state)))
+      (typecase dfun-state
+        (null
+         (when (eq gf (load-time-value #'compute-applicable-methods t))
+           (update-all-c-a-m-gf-info gf))
+         (cond ((eq gf (load-time-value #'slot-value-using-class t))
                 (update-slot-value-gf-info gf 'reader)
                 #'slot-value-using-class-dfun)
                ((eq gf (load-time-value #'(setf slot-value-using-class) t))
@@ -1610,6 +1607,9 @@
                ((eq gf (load-time-value #'slot-boundp-using-class t))
                 (update-slot-value-gf-info gf 'boundp)
                 #'slot-boundp-using-class-dfun)
+               ((eq gf (load-time-value #'slot-makunbound-using-class t))
+                (update-slot-value-gf-info gf 'makunbound)
+                #'slot-makunbound-using-class-dfun)
                ;; KLUDGE: PRINT-OBJECT is not a special-case in the sense
                ;; of having a desperately special discriminating function.
                ;; However, it is important that the machinery for printing
@@ -1649,8 +1649,8 @@
                 (make-final-dfun gf))
                (t
                 (make-initial-dfun gf))))
-            (function dfun-state)
-            (cons (car dfun-state))))))
+        (function dfun-state)
+        (cons (car dfun-state))))))
 
 ;;; in general we need to support SBCL's encapsulation for generic
 ;;; functions: the default implementation of encapsulation changes the
@@ -1683,7 +1683,7 @@
    gf (generic-function-encapsulations gf) (call-next-method)))
 
 (defmethod (setf class-name) (new-value class)
-  (let ((classoid (wrapper-classoid (class-wrapper class))))
+  (let ((classoid (layout-classoid (class-wrapper class))))
     (if (and new-value (symbolp new-value))
         (setf (classoid-name classoid) new-value)
         (setf (classoid-name classoid) nil)))

@@ -16,7 +16,7 @@
 (defconstant sb-assem:assem-scheduler-p nil)
 (defconstant sb-assem:+inst-alignment-bytes+ 1)
 
-(defconstant +backend-fasl-file-implementation+ :x86)
+(defconstant sb-fasl:+backend-fasl-file-implementation+ :x86)
 (defconstant-eqx +fixup-kinds+ #(:absolute :relative) #'equalp)
 
 ;;; KLUDGE: It would seem natural to set this by asking our C runtime
@@ -33,15 +33,12 @@
 ;;; The size in bytes of GENCGC cards, i.e. the granularity at which
 ;;; writes to old generations are logged.  With mprotect-based write
 ;;; barriers, this must be a multiple of the OS page size.
-(defconstant gencgc-card-bytes +backend-page-bytes+)
+(defconstant gencgc-page-bytes +backend-page-bytes+)
 ;;; The minimum size of new allocation regions.  While it doesn't
 ;;; currently make a lot of sense to have a card size lower than
 ;;; the alloc granularity, it will, once we are smarter about finding
 ;;; the start of objects.
 (defconstant gencgc-alloc-granularity 0)
-;;; The minimum size at which we release address ranges to the OS.
-;;; This must be a multiple of the OS page size.
-(defconstant gencgc-release-granularity +backend-page-bytes+)
 
 ;;; ### Note: we simultaneously use ``word'' to mean a 32 bit quantity
 ;;; and a 16 bit quantity depending on context. This is because Intel
@@ -163,7 +160,7 @@
 ;;; table: "In CMUCL: 0xB0000000->0xB1000000"
 
 (defmacro space-setup (arg &rest more)
-  `(!gencgc-space-setup ,arg #-win32 :read-only-space-size #-win32 0 ,@more))
+  `(gc-space-setup ,arg ,@more))
 
 #+win32     (space-setup #x22000000)
 #+linux     (space-setup #x01000000 :dynamic-space-start #x09000000)
@@ -174,9 +171,9 @@
 #+netbsd    (space-setup #x20000000 :dynamic-space-start #x60000000)
 #+darwin    (space-setup #x04000000 :dynamic-space-start #x10000000)
 
-;;; Size of one linkage-table entry in bytes.
-(defconstant linkage-table-entry-size 8)
-(defconstant linkage-table-growth-direction :up)
+;;; Size of one alien-linkage-table entry in bytes.
+(defconstant alien-linkage-table-entry-size 8)
+(defconstant alien-linkage-table-growth-direction :up)
 
 
 (defenum (:start 8)
@@ -230,24 +227,7 @@
      *fp-constant-ln2*)
   #'equalp)
 
-(defconstant-eqx +static-fdefns+
-  #(length
-    two-arg-+
-    two-arg--
-    two-arg-*
-    two-arg-/
-    two-arg-<
-    two-arg->
-    two-arg-=
-    eql
-    %negate
-    two-arg-and
-    two-arg-ior
-    two-arg-xor
-    two-arg-gcd
-    two-arg-lcm
-    %coerce-callable-to-fun)
-  #'equalp)
+(defconstant-eqx +static-fdefns+ `#(,@common-static-fdefns) #'equalp)
 
 #+win32
 (defconstant +win32-tib-arbitrary-field-offset+ #.(+ #xE10 (* 4 63)))

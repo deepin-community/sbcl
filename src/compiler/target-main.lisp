@@ -15,6 +15,83 @@
 
 ;;;; CL:COMPILE
 
+(defun ir1-toplevel-for-compile (form name)
+  (let* ((component (make-empty-component))
+         (*current-component* component)
+         (debug-name-tail (or name (name-lambdalike form)))
+         (source-name (or name '.anonymous.)))
+    (setf (component-name component) (debug-name 'initial-component debug-name-tail)
+          (component-kind component) :initial)
+    (let* ((fun (let ((*allow-instrumenting* t))
+                  (ir1-convert-lambdalike form
+                                          :source-name source-name)))
+           ;; Convert the XEP using the policy of the real function. Otherwise
+           ;; the wrong policy will be used for deciding whether to type-check
+           ;; the parameters of the real function (via CONVERT-CALL /
+           ;; PROPAGATE-TO-ARGS). -- JES, 2007-02-27
+           (*lexenv* (make-lexenv :policy (lexenv-policy (functional-lexenv fun))))
+           (xep (ir1-convert-lambda (make-xep-lambda-expression fun)
+                                    :source-name source-name
+                                    :debug-name (debug-name 'tl-xep debug-name-tail))))
+      (when name
+        (assert-new-definition xep fun))
+      (setf (functional-kind xep) (functional-kind-attributes external)
+            (functional-entry-fun xep) fun
+            (functional-entry-fun fun) xep
+            (component-reanalyze component) t
+            (functional-has-external-references-p xep) t)
+      (reoptimize-component component :maybe)
+      (locall-analyze-xep-entry-point fun)
+      ;; Any leftover REFs to FUN outside local calls get replaced with the
+      ;; XEP.
+      (substitute-leaf-if (lambda (ref)
+                            (let* ((lvar (ref-lvar ref))
+                                   (dest (when lvar (lvar-dest lvar)))
+                                   (kind (when (basic-combination-p dest)
+                                           (basic-combination-kind dest))))
+                              (neq :local kind)))
+                          xep
+                          fun)
+      xep)))
+
+;;; Compile LAMBDA-EXPRESSION and return the compiled FUNCTION value.
+;;;
+;;; If NAME is provided, then we try to use it as the name of the
+;;; function for debugging/diagnostic information.
+(defun %compile (form ephemeral name)
+  (when name
+    (legal-fun-name-or-type-error name))
+  (with-ir1-namespace
+    (let* ((*lexenv* (make-lexenv
+                      :policy *policy*
+                      :handled-conditions *handled-conditions*
+                      :disabled-package-locks *disabled-package-locks*))
+           (*compile-object* (make-core-object ephemeral))
+           (lambda (ir1-toplevel-for-compile form name)))
+
+      ;; FIXME: The compile-it code from here on is sort of a
+      ;; twisted version of the code in COMPILE-TOPLEVEL. It'd be
+      ;; better to find a way to share the code there; or
+      ;; alternatively, to use this code to replace the code there.
+      ;; (The second alternative might be pretty easy if we used
+      ;; the :LOCALL-ONLY option to IR1-FOR-LAMBDA. Then maybe the
+      ;; whole FUNCTIONAL-KIND=:TOPLEVEL case could go away..)
+
+      (locall-analyze-clambdas-until-done (list lambda))
+
+      (dolist (component (find-initial-dfo (list lambda)))
+        (compile-component component))
+
+      (let ((object *compile-object*))
+        (multiple-value-bind (res found-p)
+            (gethash (leaf-info lambda) (core-object-entry-table object))
+          (aver found-p)
+          (fix-core-source-info *source-info* object
+                                (and (policy (lambda-bind lambda)
+                                         (> store-source-form 0))
+                                     res))
+          res)))))
+
 ;;; Handle the following:
 ;;;  - CL:COMPILE when the argument is not already a compiled function.
 ;;;  - %SIMPLE-EVAL in "pretend we don't have an interpreter" mode
@@ -24,100 +101,137 @@
 ;;; If ERORRP is true signals an error immediately -- otherwise returns
 ;;; a function that will signal the error.
 (defun compile-in-lexenv (form *lexenv* name source-info tlf ephemeral errorp)
+  ;; This ridiculous check for a NIL-returning constant function cuts out hundreds of
+  ;; identical functions that result from all the turds that users seem to generate.
+  ;; It's not coming from CLOS per se because our DEFCLASS knows to use :INITFUNCTION
+  ;; as #'SB-INT:CONSTANTLY-NIL of its own volition when applicable. Likely it is user-
+  ;; written code that employs a similar paradigm with no recognition of common cases.
+  (when (and (typep form '(cons (eql lambda)))
+             (let ((cdr (cdr form)))
+               (and (typep cdr '(cons (eql nil)))
+                    (or (null (setq cdr (cdr cdr)))
+                        (equal cdr '(nil))
+                        (equal cdr '('nil))))))
+    ;; I sure hope that users don't expect COMPILE to necessarily return a
+    ;; unique blob of code. How could they?
+    (return-from compile-in-lexenv
+      (values (if (policy *lexenv* (= safety 0))
+                  (load-time-value #'constantly-nil t)
+                  (load-time-value #'sb-impl::0-arg-nil t))
+              nil nil)))
   (let ((source-paths (when source-info *source-paths*)))
     (with-compilation-values
       (with-compilation-unit ()
-        ;; FIXME: These bindings were copied from SUB-COMPILE-FILE with
-        ;; few changes. Once things are stable, the shared bindings
-        ;; probably be merged back together into some shared utility
-        ;; macro, or perhaps both merged into one of the existing utility
-        ;; macros SB-C::WITH-COMPILATION-VALUES or
-        ;; CL:WITH-COMPILATION-UNIT.
-        (with-source-paths
-          (prog* ((tlf (or tlf 0))
-                  ;; If we have a source-info from LOAD, we will
-                  ;; also have a source-paths already set up -- so drop
-                  ;; the ones from WITH-COMPILATION-VALUES.
-                  (*source-paths* (or source-paths *source-paths*))
-                  (*source-info* (or source-info
-                                  (make-lisp-source-info
-                                   form :parent *source-info*)))
-                  (*allow-instrumenting* nil)
-                  (*compilation*
-                   (make-compilation
-                    :msan-unpoison
-                    (and (member :msan *features*)
-                         (find-dynamic-foreign-symbol-address "__msan_unpoison"))
-                    :block-compile nil))
-                  (*current-path* nil)
-                  (*last-message-count* (list* 0 nil nil))
-                  (*last-error-context* nil)
-                  (*gensym-counter* 0)
-                  ;; KLUDGE: This rebinding of policy is necessary so that
-                  ;; forms such as LOCALLY at the REPL actually extend the
-                  ;; compilation policy correctly.  However, there is an
-                  ;; invariant that is potentially violated: future
-                  ;; refactoring must not allow this to be done in the file
-                  ;; compiler.  At the moment we're clearly alright, as we
-                  ;; call %COMPILE with a core-object, not a fasl-stream,
-                  ;; but caveat future maintainers. -- CSR, 2002-10-27
-                  (*policy* (lexenv-policy *lexenv*))
-                  ;; see above
-                  (*handled-conditions* (lexenv-handled-conditions *lexenv*))
-                  ;; ditto
-                  (*disabled-package-locks* (lexenv-disabled-package-locks *lexenv*))
-                  ;; FIXME: ANSI doesn't say anything about CL:COMPILE
-                  ;; interacting with these variables, so we shouldn't. As
-                  ;; of SBCL 0.6.7, COMPILE-FILE controls its verbosity by
-                  ;; binding these variables, so as a quick hack we do so
-                  ;; too. But a proper implementation would have verbosity
-                  ;; controlled by function arguments and lexical variables.
-                  (*compile-verbose* nil)
-                  (*compile-print* nil)
-                  ;; in some circumstances, we can trigger execution
-                  ;; of user code during optimization, which can
-                  ;; re-enter the compiler through explicit calls to
-                  ;; EVAL or COMPILE.  Those inner evaluations
-                  ;; shouldn't attempt to report any compiler problems
-                  ;; using the outer compiler error context.
-                  (*compiler-error-context* nil)
-                  (oops nil))
-             (handler-bind (((satisfies handle-condition-p) #'handle-condition-handler))
-               (unless source-paths
-                 (find-source-paths form tlf))
-               (let ((*compiler-error-bailout*
-                       (lambda (e)
-                         (setf oops e)
-                         ;; Unwind the compiler frames: users want the know where
-                         ;; the error came from, not how the compiler got there.
-                         (go :error))))
-                 (return
-                     (%compile form (make-core-object ephemeral)
-                               :name name
-                               :path `(original-source-start 0 ,tlf)))))
-           :error
-             ;; Either signal the error right away, or return a function that
-             ;; will signal the corresponding COMPILED-PROGRAM-ERROR. This is so
-             ;; that we retain our earlier behaviour when called with erronous
-             ;; lambdas via %SIMPLE-EVAL. We could legally do just either one
-             ;; always, but right now keeping the old behaviour seems like less
-             ;; painful option: compiler.pure.lisp is full of tests that make all
-             ;; sort of assumptions about when which things are signalled. FIXME,
-             ;; probably.
-             (if errorp
-                 (error oops)
-                 (let ((message (princ-to-string oops))
-                       (source (source-to-string form)))
-                   (return
-                     (lambda (&rest arguments)
-                       (declare (ignore arguments))
-                       (error 'compiled-program-error
-                              :message message
-                              :source source)))))))))))
+        (let ((*last-error-context* nil)
+              (*last-message-count* (list* 0 nil nil)))
+          (handler-bind ((compiler-error #'compiler-error-handler)
+                         (style-warning #'compiler-style-warning-handler)
+                         (warning #'compiler-warning-handler))
+            ;; FIXME: These bindings were copied from SUB-COMPILE-FILE with
+            ;; few changes. Once things are stable, the shared bindings
+            ;; probably be merged back together into some shared utility
+            ;; macro, or perhaps both merged into one of the existing utility
+            ;; macros SB-C::WITH-COMPILATION-VALUES or
+            ;; CL:WITH-COMPILATION-UNIT.
+            (with-source-paths
+              (prog* ((tlf (or tlf 0))
+                      ;; If we have a source-info from LOAD, we will
+                      ;; also have a source-paths already set up -- so drop
+                      ;; the ones from WITH-COMPILATION-VALUES.
+                      (*source-paths* (or source-paths *source-paths*))
+                      (*source-info* (or source-info
+                                      (make-lisp-source-info
+                                       form :parent *source-info*)))
+                      (*allow-instrumenting* nil)
+                      (*compilation*
+                       (make-compilation
+                        (and (member :msan *features*)
+                         (find-dynamic-foreign-symbol-address "__msan_unpoison"))))
+                      (*gensym-counter* 0)
+                      ;; KLUDGE: This rebinding of policy is necessary so that
+                      ;; forms such as LOCALLY at the REPL actually extend the
+                      ;; compilation policy correctly.  However, there is an
+                      ;; invariant that is potentially violated: future
+                      ;; refactoring must not allow this to be done in the file
+                      ;; compiler.  At the moment we're clearly alright, as we
+                      ;; call %COMPILE with a core-object, not a fasl-stream,
+                      ;; but caveat future maintainers. -- CSR, 2002-10-27
+                      (*policy* (lexenv-policy *lexenv*))
+                      ;; see above
+                      (*handled-conditions* (lexenv-handled-conditions *lexenv*))
+                      ;; ditto
+                      (*disabled-package-locks* (lexenv-disabled-package-locks *lexenv*))
+                      ;; FIXME: ANSI doesn't say anything about CL:COMPILE
+                      ;; interacting with these variables, so we shouldn't. As
+                      ;; of SBCL 0.6.7, COMPILE-FILE controls its verbosity by
+                      ;; binding these variables, so as a quick hack we do so
+                      ;; too. But a proper implementation would have verbosity
+                      ;; controlled by function arguments and lexical variables.
+                      (*compile-verbose* nil)
+                      (*compile-print* nil)
+                      ;; in some circumstances, we can trigger execution
+                      ;; of user code during optimization, which can
+                      ;; re-enter the compiler through explicit calls to
+                      ;; EVAL or COMPILE.  Those inner evaluations
+                      ;; shouldn't attempt to report any compiler problems
+                      ;; using the outer compiler error context.
+                      (*compiler-error-context* nil)
+                      (oops nil))
+                 (handler-bind (((satisfies handle-condition-p) 'handle-condition-handler))
+                   (unless source-paths
+                     (find-source-paths form tlf))
+                   (let ((*current-path* (or (get-source-path form)
+                                             (cons form (or (and (boundp '*current-path*)
+                                                                 *current-path*)
+                                                            `(original-source-start 0 ,tlf)))))
+                         (*compiler-error-bailout*
+                           (lambda (e)
+                             (setf oops e)
+                             ;; Unwind the compiler frames: users want the know where
+                             ;; the error came from, not how the compiler got there.
+                             (go :error))))
+                     (return
+                       (%compile form ephemeral name))))
+               :error
+                 ;; Either signal the error right away, or return a function that
+                 ;; will signal the corresponding COMPILED-PROGRAM-ERROR. This is so
+                 ;; that we retain our earlier behaviour when called with erronous
+                 ;; lambdas via %SIMPLE-EVAL. We could legally do just either one
+                 ;; always, but right now keeping the old behaviour seems like less
+                 ;; painful option: compiler.pure.lisp is full of tests that make all
+                 ;; sort of assumptions about when which things are signalled. FIXME,
+                 ;; probably.
+                 (if errorp
+                     (error oops)
+                     (let ((message (princ-to-string oops))
+                           (source (source-to-string form)))
+                       (return
+                         (lambda (&rest arguments)
+                           (declare (ignore arguments))
+                           (error 'compiled-program-error
+                                  :message message
+                                  :source source)))))))))))))
+
+;;; NOTE: COMPILE may be slightly nonconforming regarding generic functions,
+;;; but no more nonconforming than it was prior to the redefinition of
+;;; COMPILED-FUNCTION to exclude GENERIC-FUNCTION.
+;;; The concern stems from http://www.lispworks.com/documentation/HyperSpec/Issues/iss064_w.htm
+;;; which says "(4) Clarify that COMPILE must produce an object of type COMPILED-FUNCTION."
+;;;
+;;; In the case where DEFINITION is given, we're fine: the compiler can only return
+;;; a compiled function. But if only NAME is given, and it is fboundp to a generic-function,
+;;; we don't do anything at all - we don't touch the GF's dispatch function (which is a closure
+;;; over compiled code) and we don't touch the methods. But COMPILE doesn't return a function
+;;; in that case, so it's not wrong that COMPILED-FUNCTION-P is false of the result,
+;;; because the result is a symbol, not a function.
+
+;;; Also note that we lack good regression tests setting expectations around what's supposed
+;;; to happen when DEFINITION is supplied as a generic function. (Does it even make sense?)
 
 (defun compile (name &optional (definition (or (and (symbolp name)
                                                     (macro-function name))
-                                               (fdefinition name))))
+                                               (fdefinition name))
+                                           defp))
   "Produce a compiled function from DEFINITION. If DEFINITION is a
 lambda-expression, it is coerced to a function. If DEFINITION is an
 interpreted function, it is compiled. If DEFINITION is already a compiled
@@ -136,24 +250,40 @@ WARNING occur during the compilation, and NIL otherwise.
 Tertiary value is true if any conditions of type ERROR, or WARNING that are
 not STYLE-WARNINGs occur during compilation, and NIL otherwise.
 "
-  (multiple-value-bind (compiled-definition warnings-p failure-p)
-      ;; TODO: generic functions with any interpreted methods
-      ;; should compile the methods and reinstall them.
-      (if (compiled-function-p definition)
-          (values definition nil nil)
+  (binding*
+     (((start-sec start-nsec) (get-thread-virtual-time))
+      ((compiled-definition warnings-p failure-p)
+      (if (or (compiled-function-p definition)
+              (sb-pcl::generic-function-p definition))
+          ;; We're not invoking COMPILE. If NAME isn't NIL then we need to
+          ;; ensure that DEFINITION (if supplied) gets bound to NAME even if
+          ;; (COMPILED-FUNCTION-P #'NAME) => NIL afterwards.
+          ;; This is a minor bug if DEFINITION is a GENERIC-FUNCTION with
+          ;; at least one interpreted method.
+          (values (if (and name defp) definition (make-unbound-marker))
+                  nil nil)
           (multiple-value-bind (sexpr lexenv)
               (if (not (typep definition 'interpreted-function))
                   (values (the cons definition) (make-null-lexenv))
                   #+(or sb-eval sb-fasteval)
                   (prepare-for-compile definition))
-            (compile-in-lexenv sexpr lexenv name nil nil nil nil)))
+            (sb-vm:without-arena "compile"
+              (compile-in-lexenv sexpr lexenv name nil nil nil nil))))))
+    (accumulate-compiler-time '*compile-elapsed-time* start-sec start-nsec)
     (values (cond (name
-                   (if (and (symbolp name) (macro-function name))
-                       (setf (macro-function name) compiled-definition)
-                       (setf (fdefinition name) compiled-definition))
+                   ;; Do NOT assign anything into the symbol if we did not
+                   ;; actually invoke the compiler and DEFINITION was not given.
+                   ;; In that case it's not observable whether NAME get reassigned,
+                   ;; but since there is nonzero overhead to setting
+                   ;; an fdefinition, don't do it if it has no effect.
+                   (unless (unbound-marker-p compiled-definition)
+                     (if (and (symbolp name) (macro-function name))
+                         (setf (macro-function name) compiled-definition)
+                         (setf (fdefinition name) compiled-definition)))
                    name)
-                  (t
-                   compiled-definition))
+                  ;; Didn't run the compiler
+                  ((unbound-marker-p compiled-definition) definition)
+                  (t compiled-definition))
             warnings-p
             failure-p)))
 
@@ -201,16 +331,18 @@ not STYLE-WARNINGs occur during compilation, and NIL otherwise.
   ;; measurement unit. The standard allows counting in something other than
   ;; characters (namely bytes) for character streams, which is basically
   ;; irrelevant here, as we don't need random access to the file.
-  (compute-compile-file-position this-form nil))
+  (values (compute-compile-file-position this-form)))
 
 (defmacro compile-file-line (&whole this-form)
   "Return line# and column# of this macro invocation as multiple values."
-  (compute-compile-file-position this-form t))
+  (let ((start (form-source-bounds this-form)))
+    `(values ,(or (car start) 0) ,(or (cdr start) -1))))
 )
 
-(defun compute-compile-file-position (this-form as-line/col-p)
-  (let (file-info stream charpos)
+(defun compute-compile-file-position (this-form)
+  (let (file-info stream start-pos end-pos)
     (flet ((find-form-eq (form &optional fallback-path)
+             (when (and file-info (file-info-subforms file-info))
                (with-array-data ((vect (file-info-subforms file-info))
                                  (start) (end) :check-fill-pointer t)
                  (declare (ignore start))
@@ -218,46 +350,51 @@ not STYLE-WARNINGs occur during compilation, and NIL otherwise.
                      ((< i 0))
                    (declare (index-or-minus-1 i))
                    (when (eq form (svref vect i))
-                     (if charpos ; ambiguous
+                     (if start-pos ; ambiguous
                          (return
-                           (setq charpos
+                           (setf (values start-pos end-pos)
                                  (and fallback-path
                                       (compile-file-position-helper
                                        file-info fallback-path))))
-                         (setq charpos (svref vect (- i 2)))))))))
-      (let ((source-info *source-info*))
+                         (setq start-pos (svref vect (- i 2))
+                               end-pos (svref vect (1- i))))))))))
+      (let ((source-info *source-info*)
+            (source-path
+             (cond ((boundp '*current-path*) *current-path*)
+                   ((boundp '*source-paths*) (get-source-path this-form)))))
         (when (and source-info (boundp '*current-path*))
           (setq file-info (source-info-file-info source-info)
                 stream (source-info-stream source-info))
           (cond
-            ((not *current-path*)
+            ((not source-path)
              ;; probably a read-time eval
              (find-form-eq this-form))
-          ;; Hmm, would a &WHOLE argument would work better or worse in general?
             (t
-             (let* ((original-source-path (source-path-original-source *current-path*))
+             (let* ((original-source-path (source-path-original-source source-path))
                     (path (reverse original-source-path)))
                (when (file-info-subforms file-info)
                  (let ((form (elt (file-info-forms file-info) (car path))))
                    (dolist (p (cdr path))
+                     (unless (listp form)
+                       ;; probably comma
+                       (return))
                      (setq form (nth p form)))
                    (find-form-eq form (cdr path))))
-               (unless charpos
+               (unless (and start-pos end-pos)
                  (let ((parent (source-info-parent *source-info*)))
                  ;; probably in a local macro executing COMPILE-FILE-POSITION,
                  ;; not producing a sexpr containing an invocation of C-F-P.
                    (when parent
                      (setq file-info (source-info-file-info parent)
                            stream (source-info-stream parent))
-                     (find-form-eq this-form))))))))))
-    (if as-line/col-p
-        (if (and charpos (form-tracking-stream-p stream))
-            (let ((line/col (line/col-from-charpos stream charpos)))
-              `(values ,(car line/col) ,(cdr line/col)))
-            '(values 0 -1))
-        charpos)))
+                     (find-form-eq this-form (cdr path)))))))))))
+    (values start-pos end-pos stream)))
 
-;; Find FORM's character position in FILE-INFO by looking for PATH-TO-FIND.
+;; Given the form whose source path is PATH-TO-FIND, return the values
+;; corresponding to FILE-POSITION of that form's first and last characters.
+;; (Note that thse are sometimes approximate depending on whitespace)
+;; The form should be the currently-being-compiled toplevel form
+;; or subform thereof, and findable by EQness in the FILE-INFO's forms read.
 ;; This is done by imparting tree structure to the annotations
 ;; more-or-less paralleling construction of the original sexpr.
 ;; Unfortunately, though this was a nice idea, it is not terribly useful.
@@ -279,7 +416,7 @@ not STYLE-WARNINGs occur during compilation, and NIL otherwise.
 ;; answers. (Modulo any bugs due to near-total lack of testing)
 
 (defun compile-file-position-helper (file-info path-to-find)
-  (let (start-char)
+  (let (start-char end-char)
     (labels
         ((recurse (subpath upper-bound queue)
            (let ((index -1))
@@ -295,7 +432,8 @@ not STYLE-WARNINGs occur during compilation, and NIL otherwise.
                   ;; This does not eagerly declare victory, because we want
                   ;; to find the rightmost match. In "#1=(FOO)" there are two
                   ;; different annotations pointing to (FOO).
-                  (setq start-char (caar item)))
+                  (setq start-char (caar item)
+                        end-char (cdar item)))
                 (unless queue (return))
                 (let* ((next (car queue))
                        (next-end (cdar next)))
@@ -322,26 +460,21 @@ not STYLE-WARNINGs occur during compilation, and NIL otherwise.
                                           (aref v (+ i 2))))
                      #'< :key 'caar))))
         (recurse path-to-find (cdaar list) (cdr list))))
-    start-char))
+    (values start-char end-char)))
 
-;;;; Coverage helpers
+;;; Given FORM which must be the currently-being-compiled toplevel form or subform thereof,
+;;; return (VALUES START END) of that form where each coordinate is a cons (LINE . COLUMN).
+(defun form-source-bounds (form)
+  (multiple-value-bind (start-pos end-pos stream) (compute-compile-file-position form)
+    (if (and start-pos end-pos (form-tracking-stream-p stream))
+        (values (line/col-from-charpos stream start-pos)
+                (line/col-from-charpos stream end-pos))
+        (values nil nil))))
 
-(defun record-code-coverage (namestring cc)
-  (setf (gethash namestring (car *code-coverage-info*)) cc))
-
-(defun clear-code-coverage ()
-  (clrhash (car *code-coverage-info*))
-  (setf (cdr *code-coverage-info*) nil))
-
-(defun reset-code-coverage ()
-  (maphash (lambda (info cc)
-             (declare (ignore info))
-             (dolist (cc-entry cc)
-               (setf (cdr cc-entry) +code-coverage-unmarked+)))
-           (car *code-coverage-info*)))
-
-(defun code-coverage-record-marked (record)
-  (aver (consp record))
-  (ecase (cdr record)
-    ((#.+code-coverage-unmarked+) nil)
-    ((t) t)))
+(sb-ext:defglobal *background-tasks* nil)
+(defun default-compiler-worker (&aux compiled)
+  (loop
+    (let ((item (sb-ext:atomic-pop *background-tasks*)))
+      (unless item (return compiled))
+      (setq compiled t)
+      (funcall item))))

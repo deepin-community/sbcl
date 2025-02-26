@@ -29,21 +29,37 @@
 (progn
   (declaim (inline assign-vector-flags logior-header-bits reset-header-bits))
   (defun assign-vector-flags (vector flags)
-    (set-header-data vector (dpb flags (byte 8 0) (get-header-data vector)))
-    (values))
-  (defun logior-header-bits (vector bits)
-    (set-header-data vector (logior (get-header-data vector) bits))
-    vector)
-  (defun reset-header-bits (vector bits)
-    (set-header-data vector (logand (get-header-data vector) (lognot bits)))
-    (values)))
+    (set-header-data vector (dpb flags (byte 8 #.array-flags-data-position)
+                                 (get-header-data vector))))
+  (defun logior-header-bits (object bits)
+    (set-header-data object (logior (get-header-data object) bits)))
+  (defun reset-header-bits (object bits)
+    (set-header-data object (logand (get-header-data object) (lognot bits)))))
+
+(defmacro logior-array-flags (array flags)
+  `(logior-header-bits ,array (ash ,flags #.array-flags-data-position)))
+(defmacro reset-array-flags (array flags)
+  `(reset-header-bits ,array (ash ,flags #.array-flags-data-position)))
 
 (in-package "SB-IMPL")
 
+(sb-c::unless-vop-existsp (:named sb-vm::%set-funinstance-info)
 (declaim (inline (setf %funcallable-instance-info)))
-(defun (setf %funcallable-instance-info) (value instance index)
-  (%set-funcallable-instance-info instance index value)
-  value)
+;;; Funcallable instances are just like closures, but there's another slot or two
+;;; depending on whether the layout pointer is in a slot or in the header word.
+;;; In retrospect, backends may want to emit different code for funcallable-instance
+;;; so it may not have been wise to reduce to the closure setter.
+(defun (setf %funcallable-instance-info) (newval fin index)
+  (%closure-index-set fin (+ index (- sb-vm:funcallable-instance-info-offset
+                                      sb-vm:closure-info-offset))
+                      newval)
+  newval))
+;;; This is just to keep the DEFSTRUCT logic consistent with %INSTANCE-SET,
+;;; but the canonical setter is the function named (setf %funcallable-instance-info)
+(declaim (inline %set-funcallable-instance-info))
+(defun %set-funcallable-instance-info (fin index newval)
+  (funcall #'(setf %funcallable-instance-info) newval fin index)
+  (values))
 
 ;;; from early-setf.lisp
 
@@ -152,13 +168,9 @@
   bits)
 (defsetf symbol-value set)
 (defsetf symbol-global-value set-symbol-global-value)
-(defsetf symbol-plist %set-symbol-plist)
 (defsetf fill-pointer %set-fill-pointer)
 (defsetf subseq (sequence start &optional end) (v)
   `(progn (replace ,sequence ,v :start1 ,start :end1 ,end) ,v))
-
-;;; from fdefinition.lisp
-(defsetf fdefinition %set-fdefinition)
 
 ;;; from kernel.lisp
 #-darwin-jit
@@ -292,7 +304,7 @@ place with bits from the low-order end of the new value."
              (byte (if (cdr byte-args) (cons 'byte byte-args) (car byte-args)))
              ((place-tempvars place-tempvals stores setter getter)
               (get-setf-expansion place env))
-             (newval (sb-xc:gensym "NEW"))
+             (newval (gensym "NEW"))
              (new-int `(,store-fun
                         ,(if (eq load-fun 'logbitp) `(if ,newval 1 0) newval)
                         ,byte ,getter)))
@@ -347,3 +359,21 @@ with bits from the corresponding position in the new value."
 (defun 1-arg-t   (a) (declare (ignore a)) t)
 (defun 2-arg-nil (a b) (declare (ignore a b)) nil)
 (defun 3-arg-nil (a b c) (declare (ignore a b c)) nil)
+
+(in-package "SB-VM")
+
+(defun blt-copier-for-widetag (x)
+  (declare ((mod 256) x))
+  (aref (load-time-value
+         (map-into (make-array 32)
+                   (lambda (x) (and x
+                                    (symbol-function x)))
+                   '#.(let ((a (make-array 32 :initial-element nil)))
+                        (dovector (saetp *specialized-array-element-type-properties* a)
+                          (when (and (not (member (saetp-specifier saetp) '(t nil)))
+                                     (<= (saetp-n-bits saetp) n-word-bits))
+                            (setf (svref a (logand #x1F (ash (saetp-typecode saetp) -2)))
+                                  (intern (format nil "UB~D-BASH-COPY" (saetp-n-bits saetp))
+                                          "SB-KERNEL"))))))
+         t)
+        (logand #x1F (ash x -2))))

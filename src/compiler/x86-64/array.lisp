@@ -81,12 +81,12 @@
     ;; rank 1 is stored as 0, 2 is stored as 1, ...
     (inst lea :dword header (ea (fixnumize -1) rank))
     (inst and :dword header (fixnumize array-rank-mask))
-    (inst shl :dword header array-rank-byte-pos)
+    (inst shl :dword header array-rank-position)
     (inst or  :dword header type)
     (inst shr :dword header n-fixnum-tag-bits)
     (instrument-alloc nil bytes node temp thread-tn)
     (pseudo-atomic (:thread-tn thread-tn)
-     (allocation nil bytes 0 result node temp thread-tn)
+     (allocation type bytes 0 result node temp thread-tn)
      (storew header result 0 0)
      (inst or :byte result other-pointer-lowtag))))
 
@@ -99,6 +99,8 @@
   array-dimensions-offset other-pointer-lowtag
   (any-reg) positive-fixnum %set-array-dimension)
 
+(symbol-macrolet ((rank-disp
+                    (- (/ array-rank-position n-byte-bits) other-pointer-lowtag)))
 (define-vop ()
   (:translate %array-rank)
   (:policy :fast-safe)
@@ -106,7 +108,7 @@
   (:results (res :scs (unsigned-reg)))
   (:result-types positive-fixnum)
   (:generator 3
-    (inst movzx '(:byte :dword) res (ea (- 2 other-pointer-lowtag) x))
+    (inst movzx '(:byte :dword) res (ea rank-disp x))
     (inst inc :byte res)))
 
 (define-vop ()
@@ -117,30 +119,39 @@
   (:arg-types * (:constant t))
   (:conditional :e)
   (:generator 2
-    (inst cmp :byte (ea (- 2 other-pointer-lowtag) array)
-          (encode-array-rank rank))))
+    (inst cmp :byte (ea rank-disp array) (encode-array-rank rank)))))
 
-(define-vop (array-vectorp simple-type-predicate)
-  ;; SIMPLE-TYPE-PREDICATE says that it takes stack locations, but that's no good.
-  (:args (array :scs (any-reg descriptor-reg)))
-  (:translate vectorp)
-  (:conditional :z)
-  (:info)
-  (:guard (lambda (node)
-            (let ((arg (car (sb-c::combination-args node))))
-              (csubtypep (sb-c::lvar-type arg) (specifier-type 'array)))))
-  (:generator 1
-    (inst cmp :byte (ea (- 2 other-pointer-lowtag) array) (encode-array-rank 1))))
+(define-vop (simple-array-header-of-rank-p type-predicate)
+  (:translate sb-c::simple-array-header-of-rank-p)
+  (:info rank)
+  (:conditional :e)
+  (:arg-types * (:constant t))
+  (:generator 2
+    (let ((c (dpb (encode-array-rank rank) (byte 8 array-rank-position)
+                  simple-array-widetag)))
+      (cond ((other-pointer-tn-ref-p args t)
+             (inst cmp :word (ea (- other-pointer-lowtag) value) c))
+            (t
+             (%lea-for-lowtag-test temp value other-pointer-lowtag :qword)
+             (inst test :byte temp lowtag-mask)
+             (inst jmp :ne OUT)
+             (inst cmp :word (ea temp) c))))
+    OUT))
 
+
+(defun power-of-two-limit-p (x)
+  (and (fixnump x)
+       (= (logcount (1+ x)) 1)))
+
 ;;;; bounds checking routine
 (defun emit-bounds-check (vop %test-fixnum array index limit)
   (let*  ((use-length-p (null limit))
           (error
-           (if use-length-p
-               (generate-error-code vop 'sb-kernel::invalid-vector-index-error
-                                    array index)
-               (generate-error-code vop 'invalid-array-index-error array limit
-                                    index)))
+            (if use-length-p
+                (generate-error-code vop 'sb-kernel::invalid-vector-index-error
+                                     array index)
+                (generate-error-code vop 'invalid-array-index-error array limit
+                                     index)))
           (bound (if (and (tn-p limit) (sc-is limit immediate))
                      (let ((value (tn-value limit)))
                        (cond ((and %test-fixnum
@@ -158,34 +169,34 @@
                            (fixnumize value)
                            value))
                      index)))
-      (cond ((typep bound '(integer * -1))
-             ;; Power of two bound, can be checked for fixnumness at
-             ;; the same time as it always occupies a consecutive bit
-             ;; range, everything else, including the tag, has to be
-             ;; zero.
-             (inst test index (if (eql bound -1)
-                                  index ;; zero?
-                                  bound))
-             (inst jmp :ne error))
-            (t
-             (when (and %test-fixnum (not (integerp index)))
-               (%test-fixnum index nil error t))
-             (cond (use-length-p
-                    (let ((len (vector-len-ea array)))
-                      (cond ((integerp index)
-                             (inst cmp vector-len-op-size len index)
-                             (inst jmp :be error))
-                            (t
-                             (inst cmp vector-len-op-size index len)
-                             (inst jmp :nb error)))))
-                   ((integerp bound)
-                    (inst cmp index bound)
-                    (inst jmp :nb error))
-                   (t
-                    (if (eql index 0)
-                        (inst test bound bound)
-                        (inst cmp bound index))
-                    (inst jmp :be error)))))))
+    (cond ((typep bound '(integer * -1))
+           ;; Power of two bound, can be checked for fixnumness at
+           ;; the same time as it always occupies a consecutive bit
+           ;; range, everything else, including the tag, has to be
+           ;; zero.
+           (inst test index (if (eql bound -1)
+                                index ;; zero?
+                                bound))
+           (inst jmp :ne error))
+          (t
+           (when (and %test-fixnum (not (integerp index)))
+             (%test-fixnum index nil error t))
+           (cond (use-length-p
+                  (let ((len (vector-len-ea array)))
+                    (cond ((integerp index)
+                           (inst cmp vector-len-op-size len index)
+                           (inst jmp :be error))
+                          (t
+                           (inst cmp vector-len-op-size index len)
+                           (inst jmp :nb error)))))
+                 ((integerp bound)
+                  (inst cmp index bound)
+                  (inst jmp :nb error))
+                 (t
+                  (if (eql index 0)
+                      (inst test bound bound)
+                      (inst cmp bound index))
+                  (inst jmp :be error)))))))
 
 (define-vop (check-bound)
   (:translate %check-bound)
@@ -301,10 +312,11 @@
 ;;; variants which affect an entire lispword-sized value.
 ;;; Toplevel macro for ease of viewing the expansion.
 (defmacro define-full-setter+addend (name type offset lowtag scs el-type)
-  `(progn
+  (let ((scs (adjoin 'immediate scs)))
+   `(progn
      (define-vop (,name dvset)
        (:args (object :scs (descriptor-reg))
-              (index :scs (any-reg))
+              (index :scs (any-reg signed-reg unsigned-reg))
               (value :scs ,scs))
        (:info addend)
        (:arg-types ,type tagged-num
@@ -313,11 +325,16 @@
                                                      vector-data-offset))
                    ,el-type)
        (:temporary (:sc unsigned-reg) val-temp)
+       (:vop-var vop)
        (:generator 4
+         ;; XXX: Is this good - we unpoison first, and then store? It seems wrong.
          ,@(unless (eq type 'simple-vector) '((unpoison-element object index addend)))
-         (gen-cell-set (ea (- (* (+ ,offset addend) n-word-bytes) ,lowtag)
-                           object index (ash 1 (- word-shift n-fixnum-tag-bits)))
-                       value val-temp)))
+         (let ((ea (ea (- (* (+ ,offset addend) n-word-bytes) ,lowtag)
+                           object index (index-scale n-word-bytes index))))
+           ,@(when (eq type 'simple-vector)
+               '((emit-gengc-barrier object ea val-temp (vop-nth-arg 2 vop))))
+           (emit-store ea value val-temp
+                       ,(not (intersection '(signed-reg unsigned-reg) scs))))))
      (define-vop (,(symbolicate name "-C") dvset)
        (:args (object :scs (descriptor-reg))
               (value :scs ,scs))
@@ -330,11 +347,15 @@
                                                      vector-data-offset))
                    ,el-type)
        (:temporary (:sc unsigned-reg) val-temp)
+       (:vop-var vop)
        (:generator 3
+         ;; XXX: Is this good - we unpoison first, and then store? It seems wrong.
          ,@(unless (eq type 'simple-vector) '((unpoison-element object (+ index addend))))
-         (gen-cell-set (ea (- (* (+ ,offset index addend) n-word-bytes) ,lowtag)
-                           object)
-                       value val-temp)))))
+         (let ((ea (ea (- (* (+ ,offset index addend) n-word-bytes) ,lowtag) object)))
+           ,@(when (eq type 'simple-vector)
+               '((emit-gengc-barrier object ea val-temp (vop-nth-arg 1 vop))))
+           (emit-store ea value val-temp
+                       ,(not (intersection '(signed-reg unsigned-reg) scs)))))))))
 (defmacro def-full-data-vector-frobs (type element-type &rest scs)
   `(progn
      (define-full-reffer+addend ,(symbolicate "DATA-VECTOR-REF-WITH-OFFSET/" type)
@@ -344,7 +365,7 @@
        ,type vector-data-offset other-pointer-lowtag ,scs
        ,element-type)))
 (progn
-  (def-full-data-vector-frobs simple-vector * descriptor-reg any-reg immediate)
+  (def-full-data-vector-frobs simple-vector * descriptor-reg any-reg immediate constant)
   (def-full-data-vector-frobs simple-array-unsigned-byte-64 unsigned-num
     unsigned-reg)
   (def-full-data-vector-frobs simple-array-fixnum tagged-num any-reg)
@@ -385,14 +406,15 @@
                  (new (sb-c::emit-and-insert-vop
                        (sb-c::vop-node vop) (vop-block vop)
                        (template-or-lose 'svref-with-addend+if-eq)
-                       new-args nil vop (vop-codegen-info vop))))
+                       new-args nil vop (append (vop-codegen-info vop)
+                                                (vop-codegen-info next)))))
             (sb-c::delete-vop vop)
             (sb-c::delete-vop next)
             new))))))
 
 (define-vop (svref-with-addend+if-eq)
    (:args (object :scs (descriptor-reg))
-          (index :scs (any-reg))
+          (index :scs (any-reg signed-reg unsigned-reg))
           (comparand :scs (any-reg descriptor-reg immediate)))
    (:info addend)
    (:arg-types simple-vector tagged-num * (:constant integer))
@@ -401,7 +423,7 @@
     (inst cmp :qword
           (ea (- (* (+ vector-data-offset addend) n-word-bytes) other-pointer-lowtag)
               object index
-              (ash 1 (- word-shift n-fixnum-tag-bits)))
+              (index-scale n-word-bytes index))
           (encode-value-if-immediate comparand))))
 
 (define-vop (data-vector-ref-with-offset/constant-simple-vector)
@@ -430,15 +452,10 @@
      (- (* vector-data-offset n-word-bytes) other-pointer-lowtag)))
 
 (defun emit-sbit-op (inst bv index &optional word temp)
-  (cond ((integerp index)
-         (multiple-value-bind (dword-index bit) (floor index 32)
+  (cond ((sc-is index immediate)
+         (multiple-value-bind (dword-index bit) (floor (tn-value index) 32)
            (let ((disp (bit-base dword-index)))
-             (cond ((typep disp '(signed-byte 32))
-                    (inst* inst :dword (ea disp bv) bit))
-                   (t                   ; excessive index, really?
-                    (aver temp)
-                    (inst mov temp index)
-                    (inst* inst (ea (bit-base 0) bv) temp))))))
+             (inst* inst :dword (ea disp bv) bit))))
         (t
          ;; mem/reg BT[SR] are really slow.
          (inst mov word index)
@@ -453,57 +470,44 @@
   (:translate data-vector-set-with-offset)
   (:policy :fast-safe)
   ;; Arg order is (VECTOR INDEX ADDEND VALUE)
-  (:arg-types simple-bit-vector positive-fixnum (:constant (eql 0)) positive-fixnum)
+  (:arg-types simple-bit-vector tagged-num (:constant (eql 0)) positive-fixnum)
   (:args (bv :scs (descriptor-reg))
-         (index :scs (unsigned-reg))
+         (index :scs (signed-reg unsigned-reg
+                                 (immediate
+                                  (typep (bit-base (floor (tn-value tn) 32)) '(signed-byte 32)))))
          (value :scs (immediate any-reg signed-reg unsigned-reg control-stack
                                 signed-stack unsigned-stack)))
-  (:temporary (:sc unsigned-reg) word temp)
   (:info addend)
   (:ignore addend)
+  (:temporary (:sc unsigned-reg) word temp)
   (:generator 6
     (unpoison-element bv index)
-    (if (sc-is value immediate)
-        (ecase (tn-value value)
-          (1 (emit-sbit-op 'bts bv index word temp))
-          (0 (emit-sbit-op 'btr bv index word temp)))
-        (emit-sbit-op (lambda ()
-                        (assemble ()
-                          (inst test :byte value
-                                (if (sc-is value control-stack signed-stack unsigned-stack) #xff value))
-                          (inst jmp :z ZERO)
-                          (inst bts temp index)
-                          (inst jmp OUT)
-                          ZERO
-                          (inst btr temp index)
-                          OUT))
-                      bv index word temp))))
-
-(define-vop (data-vector-set-with-offset/simple-bit-vector/c-index)
-  (:translate data-vector-set-with-offset)
-  (:policy :fast-safe)
-  ;; Arg order is (VECTOR INDEX ADDEND VALUE)
-  (:arg-types simple-bit-vector (:constant fixnum) (:constant (eql 0)) positive-fixnum)
-  (:args (bv :scs (descriptor-reg))
-         (value :scs (immediate any-reg signed-reg unsigned-reg control-stack
-                                signed-stack unsigned-stack)))
-  (:info index addend)
-  (:ignore addend)
-  (:generator 5
-    (unpoison-element bv index)
-    (when (sc-is value immediate)
-      (ecase (tn-value value)
-        (1 (emit-sbit-op 'bts bv index))
-        (0 (emit-sbit-op 'btr bv index)))
-      (return-from data-vector-set-with-offset/simple-bit-vector/c-index))
-    (inst test :byte value
-          (if (sc-is value control-stack signed-stack unsigned-stack) #xff value))
-    (inst jmp :z ZERO)
-    (emit-sbit-op 'bts bv index)
-    (inst jmp OUT)
-    ZERO
-    (emit-sbit-op 'btr bv index)
-    OUT))
+    (cond ((sc-is value immediate)
+           (ecase (tn-value value)
+             (1 (emit-sbit-op 'bts bv index word temp))
+             (0 (emit-sbit-op 'btr bv index word temp))))
+          ((sc-is index immediate)
+           (assemble ()
+             (inst test :byte value
+                   (if (sc-is value control-stack signed-stack unsigned-stack) #xff value))
+             (inst jmp :z ZERO)
+             (emit-sbit-op 'bts bv index)
+             (inst jmp OUT)
+             ZERO
+             (emit-sbit-op 'btr bv index)
+             OUT))
+          (t
+           (emit-sbit-op (lambda ()
+                           (assemble ()
+                             (inst test :byte value
+                                   (if (sc-is value control-stack signed-stack unsigned-stack) #xff value))
+                             (inst jmp :z ZERO)
+                             (inst bts temp index)
+                             (inst jmp OUT)
+                             ZERO
+                             (inst btr temp index)
+                             OUT))
+                         bv index word temp)))))
 
 (define-vop (data-vector-ref-with-offset/simple-bit-vector-c dvref)
   (:args (object :scs (descriptor-reg)))
@@ -516,163 +520,195 @@
   (:results (result :scs (any-reg)))
   (:result-types positive-fixnum)
   (:generator 3
-              ;; using 32-bit operand size might elide the REX prefix on mov + shift
-              (multiple-value-bind (dword-index bit) (floor index 32)
-                (inst mov :dword result (ea (bit-base dword-index) object))
-                (let ((right-shift (- bit n-fixnum-tag-bits)))
-                  (cond ((plusp right-shift)
-                         (inst shr :dword result right-shift))
-                        ((minusp right-shift) ; = left shift
-                         (inst shl :dword result (- right-shift))))))
-              (inst and :dword result (fixnumize 1))))
+    ;; using 32-bit operand size might elide the REX prefix on mov + shift
+    (multiple-value-bind (dword-index bit) (floor index 32)
+      (inst mov :dword result (ea (bit-base dword-index) object))
+      (let ((right-shift (- bit n-fixnum-tag-bits)))
+        (cond ((plusp right-shift)
+               (inst shr :dword result right-shift))
+              ((minusp right-shift)     ; = left shift
+               (inst shl :dword result (- right-shift))))))
+    (inst and :dword result (fixnumize 1))))
 
 (define-vop (data-vector-ref-with-offset/simple-bit-vector dvref)
   (:args (object :scs (descriptor-reg))
-         (index :scs (unsigned-reg)))
+         (index :scs (signed-reg unsigned-reg)))
   (:info addend)
   (:ignore addend)
-  (:arg-types simple-bit-vector positive-fixnum (:constant (integer 0 0)))
-  (:temporary (:sc unsigned-reg) word temp)
+  (:arg-types simple-bit-vector tagged-num (:constant (integer 0 0)))
+  (:temporary (:sc unsigned-reg) temp)
   (:results (result :scs (any-reg)))
   (:result-types positive-fixnum)
   (:vop-var vop)
   (:generator 4
     ;; mem/reg BT is really slow.
-    (inst mov word index)
-    (inst shr word (integer-length (1- n-word-bits)))
-    (inst mov temp (ea (bit-base 0) object word n-word-bytes))
+    (inst mov temp index)
+    (inst shr temp (integer-length (1- n-word-bits)))
+    (inst mov temp (ea (bit-base 0) object temp n-word-bytes))
     (inst bt temp index)
     (inst sbb :dword result result)
     (inst and :dword result (fixnumize 1))))
+
+(define-vop (data-vector-ref-with-offset/simple-bit-vector-c-eq)
+  (:policy :fast-safe)
+  (:args (object :scs (descriptor-reg)))
+  (:arg-types simple-bit-vector
+              (:constant (integer 0 #x3ffffffff)) (:constant (integer 0 0)))
+  (:info index addend)
+  (:ignore addend)
+  (:conditional :eq)
+  (:generator 3
+    (multiple-value-bind (byte-index bit) (floor index 8)
+      (inst test :byte (ea (+ byte-index
+                              (- (* vector-data-offset n-word-bytes) other-pointer-lowtag))
+                           object)
+            (ash 1 bit)))))
+
+(define-vop (data-vector-ref-with-offset/simple-bit-vector-eq)
+  (:policy :fast-safe)
+  (:args (object :scs (descriptor-reg))
+         (index :scs (signed-reg unsigned-reg)))
+  (:info addend)
+  (:ignore addend)
+  (:arg-types simple-bit-vector tagged-num (:constant (integer 0 0)))
+  (:temporary (:sc unsigned-reg) word)
+  (:conditional :nc)
+  (:vop-var vop)
+  (:generator 4
+    ;; mem/reg BT is really slow.
+    (inst mov word index)
+    (inst shr word (integer-length (1- n-word-bits)))
+    (inst mov word (ea (bit-base 0) object word n-word-bytes))
+    (inst bt word index)))
 
 ;;;; vectors whose elements are 2 or 4 bits each
 (macrolet ((def-small-data-vector-frobs (type bits)
              (let* ((elements-per-word (floor n-word-bits bits))
                     (bit-shift (1- (integer-length elements-per-word))))
-    `(progn
-       (define-vop (,(symbolicate 'data-vector-ref-with-offset/ type) dvref)
-         (:args (object :scs (descriptor-reg))
-                (index :scs (unsigned-reg)))
-         (:info addend)
-         (:ignore addend)
-         (:arg-types ,type positive-fixnum (:constant (integer 0 0)))
-         (:results (result :scs (unsigned-reg) :from (:argument 0)))
-         (:result-types positive-fixnum)
-         (:temporary (:sc unsigned-reg :offset rcx-offset) ecx)
-         (:generator 20
-           (move ecx index)
-           (inst shr ecx ,bit-shift)
-           (inst mov result
-                 (ea (- (* vector-data-offset n-word-bytes) other-pointer-lowtag)
-                     object ecx n-word-bytes))
-           (move ecx index)
-           ;; We used to mask ECX for all values of BITS, but since
-           ;; Intel's documentation says that the chip will mask shift
-           ;; and rotate counts by 63 automatically, we can safely move
-           ;; the masking operation under the protection of this UNLESS
-           ;; in the bit-vector case.  --njf, 2006-07-14
-           ,@(unless (= bits 1)
-               `((inst and ecx ,(1- elements-per-word))
-                 (inst shl ecx ,(1- (integer-length bits)))))
-           (inst shr result :cl)
-           (inst and result ,(1- (ash 1 bits)))))
-       (define-vop (,(symbolicate 'data-vector-ref-with-offset/ type "-C") dvref)
-         (:args (object :scs (descriptor-reg)))
-         (:arg-types ,type (:constant low-index) (:constant (integer 0 0)))
-         (:info index addend)
-         (:ignore addend)
-         (:results (result :scs (unsigned-reg)))
-         (:result-types positive-fixnum)
-         (:generator 15
-           (multiple-value-bind (word extra) (floor index ,elements-per-word)
-             (loadw result object (+ word vector-data-offset)
-                    other-pointer-lowtag)
-             (unless (zerop extra)
-               (inst shr result (* extra ,bits)))
-             (unless (= extra ,(1- elements-per-word))
-               (inst and result ,(1- (ash 1 bits)))))))
-       (define-vop (,(symbolicate 'data-vector-set-with-offset/ type) dvset)
-         (:args (object :scs (descriptor-reg))
-                (index :scs (unsigned-reg) :target ecx)
-                (value :scs (unsigned-reg immediate)))
-         (:info addend)
-         (:ignore addend)
-         (:arg-types ,type positive-fixnum (:constant (integer 0 0))
-                     positive-fixnum)
-         (:temporary (:sc unsigned-reg) word-index)
-         (:temporary (:sc unsigned-reg) old)
-         (:temporary (:sc unsigned-reg :offset rcx-offset) ecx)
-         (:generator 25
-           (unpoison-element object index)
-           (move word-index index)
-           (inst shr word-index ,bit-shift)
-           (inst mov old
-                 (ea (- (* vector-data-offset n-word-bytes) other-pointer-lowtag)
-                     object word-index n-word-bytes))
-           (move ecx index)
-           ;; We used to mask ECX for all values of BITS, but since
-           ;; Intel's documentation says that the chip will mask shift
-           ;; and rotate counts by 63 automatically, we can safely move
-           ;; the masking operation under the protection of this UNLESS
-           ;; in the bit-vector case.  --njf, 2006-07-14
-           ,@(unless (= bits 1)
-               `((inst and ecx ,(1- elements-per-word))
-                 (inst shl ecx ,(1- (integer-length bits)))))
-           (inst ror old :cl)
-           (unless (and (sc-is value immediate)
-                        (= (tn-value value) ,(1- (ash 1 bits))))
-             (inst and old ,(lognot (1- (ash 1 bits)))))
-           (sc-case value
-             (immediate
-              (unless (zerop (tn-value value))
-                (inst or old (logand (tn-value value) ,(1- (ash 1 bits))))))
-             (unsigned-reg
-              (inst or old value)))
-           (inst rol old :cl)
-           (inst mov (ea (- (* vector-data-offset n-word-bytes) other-pointer-lowtag)
-                         object word-index n-word-bytes)
-                 old)))
-       (define-vop (,(symbolicate 'data-vector-set-with-offset/ type "-C") dvset)
-         (:args (object :scs (descriptor-reg))
-                (value :scs (unsigned-reg immediate)))
-         (:arg-types ,type (:constant low-index)
-                     (:constant (integer 0 0)) positive-fixnum)
-         (:temporary (:sc unsigned-reg) mask-tn)
-         (:info index addend)
-         (:ignore addend)
-         (:temporary (:sc unsigned-reg :to (:result 0)) old)
-         (:generator 20
-           (unpoison-element object index)
-           (multiple-value-bind (word extra) (floor index ,elements-per-word)
-             (inst mov old
-                   (ea (- (* (+ word vector-data-offset) n-word-bytes)
-                          other-pointer-lowtag)
-                       object))
-             (sc-case value
-               (immediate
-                (let* ((value (tn-value value))
-                       (mask ,(1- (ash 1 bits)))
-                       (shift (* extra ,bits)))
-                  (unless (= value mask)
-                    (inst mov mask-tn (ldb (byte 64 0)
-                                           (lognot (ash mask shift))))
-                    (inst and old mask-tn))
-                  (unless (zerop value)
-                    (inst mov mask-tn (ash value shift))
-                    (inst or old mask-tn))))
-               (unsigned-reg
-                (let ((shift (* extra ,bits)))
-                  (unless (zerop shift)
-                    (inst ror old shift))
-                  (inst mov mask-tn (lognot ,(1- (ash 1 bits))))
-                  (inst and old mask-tn)
-                  (inst or old value)
-                  (unless (zerop shift)
-                    (inst rol old shift)))))
-             (inst mov (ea (- (* (+ word vector-data-offset) n-word-bytes)
-                              other-pointer-lowtag)
-                           object)
-                   old))))))))
+               `(progn
+                  (define-vop (,(symbolicate 'data-vector-ref-with-offset/ type) dvref)
+                    (:args (object :scs (descriptor-reg))
+                           (index :scs (signed-reg unsigned-reg)))
+                    (:info addend)
+                    (:ignore addend)
+                    (:arg-types ,type tagged-num (:constant (integer 0 0)))
+                    (:results (result :scs (unsigned-reg) :from (:argument 0)))
+                    (:result-types positive-fixnum)
+                    (:temporary (:sc unsigned-reg :offset rcx-offset) ecx)
+                    (:generator 20
+                      (move ecx index)
+                      (inst shr ecx ,bit-shift)
+                      (inst mov result
+                        (ea (- (* vector-data-offset n-word-bytes) other-pointer-lowtag)
+                          object ecx n-word-bytes))
+                      (move ecx index)
+                      ;; We used to mask ECX for all values of BITS, but since
+                      ;; Intel's documentation says that the chip will mask shift
+                      ;; and rotate counts by 63 automatically, we can safely move
+                      ;; the masking operation under the protection of this UNLESS
+                      ;; in the bit-vector case.  --njf, 2006-07-14
+                      ,@(unless (= bits 1)
+                          `((inst and ecx ,(1- elements-per-word))
+                            (inst shl ecx ,(1- (integer-length bits)))))
+                      (inst shr result :cl)
+                      (inst and result ,(1- (ash 1 bits)))))
+                  (define-vop (,(symbolicate 'data-vector-ref-with-offset/ type "-C") dvref)
+                    (:args (object :scs (descriptor-reg)))
+                    (:arg-types ,type (:constant low-index) (:constant (integer 0 0)))
+                    (:info index addend)
+                    (:ignore addend)
+                    (:results (result :scs (unsigned-reg)))
+                    (:result-types positive-fixnum)
+                    (:generator 15
+                      (multiple-value-bind (word extra) (floor index ,elements-per-word)
+                        (loadw result object (+ word vector-data-offset)
+                            other-pointer-lowtag)
+                        (unless (zerop extra)
+                          (inst shr result (* extra ,bits)))
+                        (unless (= extra ,(1- elements-per-word))
+                          (inst and result ,(1- (ash 1 bits)))))))
+                  (define-vop (,(symbolicate 'data-vector-set-with-offset/ type) dvset)
+                    (:args (object :scs (descriptor-reg))
+                           (index :scs (signed-reg unsigned-reg) :target ecx)
+                           (value :scs (unsigned-reg immediate)))
+                    (:info addend)
+                    (:ignore addend)
+                    (:arg-types ,type tagged-num (:constant (integer 0 0))
+                                positive-fixnum)
+                    (:temporary (:sc unsigned-reg) word-index)
+                    (:temporary (:sc unsigned-reg) old)
+                    (:temporary (:sc unsigned-reg :offset rcx-offset) ecx)
+                    (:generator 25
+                      (unpoison-element object index)
+                      (move word-index index)
+                      (inst shr word-index ,bit-shift)
+                      (inst mov old
+                        (ea (- (* vector-data-offset n-word-bytes) other-pointer-lowtag)
+                          object word-index n-word-bytes))
+                      (move ecx index)
+                      ;; We used to mask ECX for all values of BITS, but since
+                      ;; Intel's documentation says that the chip will mask shift
+                      ;; and rotate counts by 63 automatically, we can safely move
+                      ;; the masking operation under the protection of this UNLESS
+                      ;; in the bit-vector case.  --njf, 2006-07-14
+                      ,@(unless (= bits 1)
+                          `((inst and ecx ,(1- elements-per-word))
+                            (inst shl ecx ,(1- (integer-length bits)))))
+                      (inst ror old :cl)
+                      (unless (and (sc-is value immediate)
+                                   (= (tn-value value) ,(1- (ash 1 bits))))
+                        (inst and old ,(lognot (1- (ash 1 bits)))))
+                      (sc-case value
+                        (immediate
+                         (unless (zerop (tn-value value))
+                           (inst or old (logand (tn-value value) ,(1- (ash 1 bits))))))
+                        (unsigned-reg
+                         (inst or old value)))
+                      (inst rol old :cl)
+                      (inst mov (ea (- (* vector-data-offset n-word-bytes) other-pointer-lowtag)
+                                  object word-index n-word-bytes)
+                        old)))
+                  (define-vop (,(symbolicate 'data-vector-set-with-offset/ type "-C") dvset)
+                    (:args (object :scs (descriptor-reg))
+                           (value :scs (unsigned-reg immediate)))
+                    (:arg-types ,type (:constant low-index)
+                                (:constant (integer 0 0)) positive-fixnum)
+                    (:temporary (:sc unsigned-reg) mask-tn)
+                    (:info index addend)
+                    (:ignore addend)
+                    (:temporary (:sc unsigned-reg :to (:result 0)) old)
+                    (:generator 20
+                      (unpoison-element object index)
+                      (multiple-value-bind (word extra) (floor index ,elements-per-word)
+                        (inst mov old
+                              (ea (- (* (+ word vector-data-offset) n-word-bytes)
+                                     other-pointer-lowtag)
+                                  object))
+                        (sc-case value
+                          (immediate
+                           (let* ((value (tn-value value))
+                                  (mask ,(1- (ash 1 bits)))
+                                  (shift (* extra ,bits)))
+                             (unless (= value mask)
+                               (inst mov mask-tn (ldb (byte 64 0)
+                                                      (lognot (ash mask shift))))
+                               (inst and old mask-tn))
+                             (unless (zerop value)
+                               (inst mov mask-tn (ash value shift))
+                               (inst or old mask-tn))))
+                          (unsigned-reg
+                           (let ((shift (* extra ,bits)))
+                             (unless (zerop shift)
+                               (inst ror old shift))
+                             (inst mov mask-tn (lognot ,(1- (ash 1 bits))))
+                             (inst and old mask-tn)
+                             (inst or old value)
+                             (unless (zerop shift)
+                               (inst rol old shift)))))
+                        (inst mov (ea (- (* (+ word vector-data-offset) n-word-bytes)
+                                         other-pointer-lowtag)
+                                      object)
+                              old))))))))
   (def-small-data-vector-frobs simple-array-unsigned-byte-2 2)
   (def-small-data-vector-frobs simple-array-unsigned-byte-4 4))
 ;;; And the float variants.
@@ -761,7 +797,7 @@
 
 (define-vop (data-vector-ref-with-offset/simple-array-double-float dvref)
   (:args (object :scs (descriptor-reg))
-         (index :scs (any-reg)))
+         (index :scs (any-reg signed-reg unsigned-reg)))
   (:info addend)
   (:arg-types simple-array-double-float tagged-num
               (:constant (constant-displacement other-pointer-lowtag
@@ -769,8 +805,7 @@
   (:results (value :scs (double-reg)))
   (:result-types double-float)
   (:generator 7
-   (inst movsd value (float-ref-ea object index addend 8
-                                            :scale (ash 1 (- word-shift n-fixnum-tag-bits))))))
+   (inst movsd value (float-ref-ea object index addend 8 :scale (index-scale 8 index)))))
 
 (define-vop (data-vector-ref-c/simple-array-double-float dvref)
   (:args (object :scs (descriptor-reg)))
@@ -785,7 +820,7 @@
 
 (define-vop (data-vector-set-with-offset/simple-array-double-float dvset)
   (:args (object :scs (descriptor-reg))
-         (index :scs (any-reg))
+         (index :scs (any-reg signed-reg unsigned-reg))
          (value :scs (double-reg)))
   (:info addend)
   (:arg-types simple-array-double-float tagged-num
@@ -794,9 +829,7 @@
               double-float)
   (:generator 20
    (unpoison-element object index addend)
-   (inst movsd (float-ref-ea object index addend 8
-                                      :scale (ash 1 (- word-shift n-fixnum-tag-bits)))
-         value)))
+   (inst movsd (float-ref-ea object index addend 8 :scale (index-scale 8 index)) value)))
 
 (define-vop (data-vector-set-with-offset/simple-array-double-float-c dvset)
   (:args (object :scs (descriptor-reg))
@@ -923,10 +956,10 @@
                                   operand-size
                                   `(,operand-size ,(if (eq mov-inst 'movzx) :dword :qword))))
              (n-bytes (the (member 1 2 4) (size-nbyte operand-size)))
-             ((index-sc scale)
+             ((index-scs scale)
               (if (>= n-bytes (ash 1 n-fixnum-tag-bits))
-                  (values 'any-reg (ash n-bytes (- n-fixnum-tag-bits)))
-                  (values 'signed-reg n-bytes)))
+                  (values '(any-reg signed-reg unsigned-reg) `(index-scale ,n-bytes index))
+                  (values '(signed-reg unsigned-reg) n-bytes)))
              (ea-expr `(ea (+ (* vector-data-offset n-word-bytes)
                               (* addend ,n-bytes)
                               (- other-pointer-lowtag))
@@ -938,7 +971,7 @@
     `(progn
          (define-vop (,(symbolicate "DATA-VECTOR-REF-WITH-OFFSET/" ptype) dvref)
            (:args (object :scs (descriptor-reg))
-                  (index :scs (,index-sc)))
+                  (index :scs ,index-scs))
            (:info addend)
            (:arg-types ,ptype tagged-num
                        (:constant (constant-displacement other-pointer-lowtag
@@ -955,11 +988,10 @@
            (:results (value :scs ,scs))
            (:result-types ,type)
            (:generator 4 (inst ,mov-inst ',opcode-modifier value ,ea-expr-const)))
-         ;; FIXME: these all need to accept immediate SC for the value
          (define-vop (,(symbolicate "DATA-VECTOR-SET-WITH-OFFSET/" ptype) dvset)
            (:args (object :scs (descriptor-reg) :to (:eval 0))
-                  (index :scs (,index-sc) :to (:eval 0))
-                  (value :scs ,scs))
+                  (index :scs ,index-scs :to (:eval 0))
+                  (value :scs (,@scs immediate)))
            (:info addend)
            (:arg-types ,ptype tagged-num
                        (:constant (constant-displacement other-pointer-lowtag
@@ -967,10 +999,10 @@
                        ,type)
            (:generator 5
             (unpoison-element object index addend)
-            (inst mov ,operand-size ,ea-expr value)))
+            (inst mov ,operand-size ,ea-expr (encode-value-if-immediate value nil))))
          (define-vop (,(symbolicate "DATA-VECTOR-SET-WITH-OFFSET/" ptype "-C") dvset)
            (:args (object :scs (descriptor-reg) :to (:eval 0))
-                  (value :scs ,scs))
+                  (value :scs (,@scs immediate)))
            (:info index addend)
            (:arg-types ,ptype (:constant low-index)
                        (:constant (constant-displacement other-pointer-lowtag
@@ -978,7 +1010,7 @@
                        ,type)
            (:generator 4
             (unpoison-element object (+ index addend))
-            (inst mov ,operand-size ,ea-expr-const value)))))))
+            (inst mov ,operand-size ,ea-expr-const (encode-value-if-immediate value nil))))))))
   (define-data-vector-frobs simple-array-unsigned-byte-7 movzx :byte
     positive-fixnum unsigned-reg signed-reg)
   (define-data-vector-frobs simple-array-unsigned-byte-8 movzx :byte
@@ -1010,6 +1042,12 @@
   (unsigned-reg) unsigned-num %vector-raw-bits)
 (define-full-setter set-vector-raw-bits * vector-data-offset other-pointer-lowtag
   (unsigned-reg) unsigned-num %set-vector-raw-bits)
+
+;;; Weak vectors
+(define-full-reffer %weakvec-ref * vector-data-offset other-pointer-lowtag
+  (any-reg descriptor-reg) * %weakvec-ref)
+(define-full-setter %weakvec-set * vector-data-offset other-pointer-lowtag
+  (any-reg descriptor-reg) * %weakvec-set)
 
 ;;;; ATOMIC-INCF for arrays
 

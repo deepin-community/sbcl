@@ -28,7 +28,8 @@
     (ecase type
       (reader (slot-info-reader info))
       (writer (slot-info-writer info))
-      (boundp (slot-info-boundp info)))))
+      (boundp (slot-info-boundp info))
+      (makunbound (slot-info-makunbound info)))))
 
 (defmethod (setf slot-accessor-function) (function
                                           (slotd effective-slot-definition)
@@ -37,12 +38,14 @@
     (ecase type
       (reader (setf (slot-info-reader info) function))
       (writer (setf (slot-info-writer info) function))
-      (boundp (setf (slot-info-boundp info) function)))))
+      (boundp (setf (slot-info-boundp info) function))
+      (makunbound (setf (slot-info-makunbound info) function)))))
 
 (defconstant +slotd-reader-function-std-p+ 1)
 (defconstant +slotd-writer-function-std-p+ 2)
 (defconstant +slotd-boundp-function-std-p+ 4)
-(defconstant +slotd-all-function-std-p+ 7)
+(defconstant +slotd-makunbound-function-std-p+ 8)
+(defconstant +slotd-all-function-std-p+ 15)
 
 (defmethod slot-accessor-std-p ((slotd effective-slot-definition) type)
   (let ((flags (slot-value slotd 'accessor-flags)))
@@ -52,7 +55,8 @@
         (logtest flags (ecase type
                         (reader +slotd-reader-function-std-p+)
                         (writer +slotd-writer-function-std-p+)
-                        (boundp +slotd-boundp-function-std-p+))))))
+                        (boundp +slotd-boundp-function-std-p+)
+                        (makunbound +slotd-makunbound-function-std-p+))))))
 
 (defmethod (setf slot-accessor-std-p) (value
                                        (slotd effective-slot-definition)
@@ -60,7 +64,8 @@
   (let ((mask (ecase type
                 (reader +slotd-reader-function-std-p+)
                 (writer +slotd-writer-function-std-p+)
-                (boundp +slotd-boundp-function-std-p+)))
+                (boundp +slotd-boundp-function-std-p+)
+                (makunbound +slotd-makunbound-function-std-p+)))
         (flags (slot-value slotd 'accessor-flags)))
     (declare (type fixnum mask flags))
     (setf (slot-value slotd 'accessor-flags)
@@ -72,11 +77,12 @@
   (let* ((name (slot-value slotd 'name)) ; flushable? (is it ever unbound?)
          (class (slot-value slotd '%class)))
     (declare (ignore name))
-    (dolist (type '(reader writer boundp))
+    (dolist (type '(reader writer boundp makunbound))
       (let* ((gf-name (ecase type
                               (reader 'slot-value-using-class)
                               (writer '(setf slot-value-using-class))
-                              (boundp 'slot-boundp-using-class)))
+                              (boundp 'slot-boundp-using-class)
+                              (makunbound 'slot-makunbound-using-class)))
              (gf (gdefinition gf-name)))
         ;; KLUDGE: this logic is cut'n'pasted from
         ;; GET-ACCESSOR-METHOD-FUNCTION, which (for STD-CLASSes) is
@@ -97,11 +103,12 @@
                   (apply fun args))))))))
 
 (defmethod finalize-internal-slot-functions ((slotd effective-slot-definition))
-  (dolist (type '(reader writer boundp))
+  (dolist (type '(reader writer boundp makunbound))
     (let* ((gf-name (ecase type
                       (reader 'slot-value-using-class)
                       (writer '(setf slot-value-using-class))
-                      (boundp 'slot-boundp-using-class)))
+                      (boundp 'slot-boundp-using-class)
+                      (makunbound 'slot-makunbound-using-class)))
            (gf (gdefinition gf-name)))
       (compute-slot-accessor-info slotd type gf))))
 
@@ -111,11 +118,11 @@
 ;;; SLOT-VALUE-USING-CLASS) or SLOT-BOUNDP-USING-CLASS for reading/
 ;;; writing/testing effective slot SLOTD.
 ;;;
-;;; TYPE is one of the symbols READER, WRITER or BOUNDP, depending on
-;;; GF.  Store the effective method in the effective slot definition
-;;; object itself; these GFs have special dispatch functions calling
-;;; effective methods directly retrieved from effective slot
-;;; definition objects, as an optimization.
+;;; TYPE is one of the symbols READER, WRITER, BOUNDP or MAKUNBOUND,
+;;; depending on GF.  Store the effective method in the effective slot
+;;; definition object itself; these GFs have special dispatch
+;;; functions calling effective methods directly retrieved from
+;;; effective slot definition objects, as an optimization.
 ;;;
 ;;; FIXME: Change the function name to COMPUTE-SVUC-SLOTD-FUNCTION,
 ;;; or some such.
@@ -137,7 +144,7 @@
 ;;;; various class accessors that are a little more complicated than can be
 ;;;; done with automatically generated reader methods
 
-(defmethod class-prototype :before (class)
+(defmethod class-prototype :before ((class pcl-class))
   (unless (class-finalized-p class)
     (error "~@<~S is not finalized.~:@>" class)))
 
@@ -149,7 +156,8 @@
                 (declare (notinline allocate-instance))
                 (with-slots (prototype) class
                   (or prototype
-                      (setf prototype (allocate-instance class)))))))
+                      (setf prototype (sb-vm:without-arena "class-prototype"
+                                        (allocate-instance class))))))))
   (def std-class)
   (def condition-class)
   (def structure-class))
@@ -175,12 +183,12 @@
   (with-slots (direct-subclasses) class
     (with-world-lock ()
       (pushnew subclass direct-subclasses :test #'eq)
-      (let ((wrapper (class-wrapper subclass)))
-        (when wrapper
-          (let ((classoid (wrapper-classoid wrapper)))
-            (dovector (super-wrapper (wrapper-inherits wrapper))
-              (sb-kernel::add-subclassoid (wrapper-classoid super-wrapper)
-                                          classoid wrapper))))))
+      (let ((layout (class-wrapper subclass)))
+        (when layout
+          (let ((classoid (layout-classoid layout)))
+            (dovector (super-layout (layout-inherits layout))
+              (sb-kernel::add-subclassoid (layout-classoid super-layout)
+                                          classoid layout))))))
     subclass))
 (defmethod remove-direct-subclass ((class class) (subclass class))
   (with-slots (direct-subclasses) class
@@ -188,9 +196,9 @@
       (setq direct-subclasses (remove subclass direct-subclasses))
       ;; Remove from classoid subclasses as well.
       (let ((classoid (class-classoid subclass)))
-        (dovector (super-wrapper (wrapper-inherits (classoid-wrapper classoid)))
+        (dovector (super-layout (layout-inherits (classoid-layout classoid)))
           (sb-kernel::remove-subclassoid classoid
-                                         (wrapper-classoid super-wrapper)))))
+                                         (layout-classoid super-layout)))))
     subclass))
 
 ;;; Maintaining the direct-methods and direct-generic-functions backpointers.
@@ -213,38 +221,65 @@
 ;;; function using the same lock.
 (define-load-time-global *specializer-lock* (sb-thread:make-mutex :name "Specializer lock"))
 
-(defmethod add-direct-method :around ((specializer specializer) method)
+(defmethod add-direct-method :around ((specializer specializer) (method method))
   ;; All the actions done under this lock are done in an order
   ;; that is safe to unwind at any point.
   (sb-thread::with-recursive-system-lock (*specializer-lock*)
     (call-next-method)))
 
-(defmethod remove-direct-method :around ((specializer specializer) method)
+(defmethod remove-direct-method :around ((specializer specializer) (method method))
   ;; All the actions done under this lock are done in an order
   ;; that is safe to unwind at any point.
   (sb-thread::with-recursive-system-lock (*specializer-lock*)
     (call-next-method)))
 
 (defmethod add-direct-method ((specializer specializer) (method method))
-  (let ((cell (specializer-method-holder specializer)))
+  ;; Method "list" storage is a simple-vector. A hashset would probably be best,
+  ;; or a list that upgrades to a hashset. But a vector is already an improvement
+  ;; over a list because it can be examined faster. Quite often GFs gain
+  ;; thousands of methods, especially PRINT-OBJECT, where the vector eliminates
+  ;; all the CDR pointers thus having a better memory access pattern.
+  (flet ((adjoin-to (collection)
+           (let ((collection (the simple-vector (or collection (vector 0 0 0 0))))
+                 (hole))
+             (declare (optimize (sb-c::insert-array-bounds-checks 0)))
+             (loop for i downfrom (1- (length collection)) to 0
+                   do (let ((elt (svref collection i)))
+                        (cond ((eq elt method) (return-from adjoin-to collection))
+                              ((eql elt 0) (setq hole i)))))
+             (when hole
+               (setf (svref collection hole) method)
+               (return-from adjoin-to collection))
+             (let* ((old-size (length collection))
+                    (new-size (ash (* old-size 3) -1)) ; scale up by 3/2
+                    (new (replace (make-array new-size) collection)))
+               (setf (aref new old-size) method)
+               new))))
+    (let ((cell (specializer-method-holder specializer)))
     ;; We need to first smash the CDR, because a parallel read may
     ;; be in progress, and because if an interrupt catches us we
     ;; need to have a consistent state.
-    (setf (cdr cell) ()
-          (car cell) (adjoin method (car cell) :test #'eq)))
-  method)
+      (setf (cdr cell) ()
+            (car cell) (adjoin-to (car cell)))))
+    method)
 
 (defmethod remove-direct-method ((specializer specializer) (method method))
-  (let ((cell (specializer-method-holder specializer)))
+  (flet ((remove-from (collection)
+           (when collection
+             (awhen (position method (the simple-vector collection) :test #'eq)
+               (setf (svref collection it) 0)))
+           collection))
+    (let ((cell (specializer-method-holder specializer)))
     ;; We need to first smash the CDR, because a parallel read may
     ;; be in progress, and because if an interrupt catches us we
     ;; need to have a consistent state.
-    (setf (cdr cell) ()
-          (car cell) (remove method (car cell))))
+      (setf (cdr cell) ()
+            (car cell) (remove-from (car cell)))))
   method)
 
 (defmethod specializer-direct-methods ((specializer specializer))
-  (car (specializer-method-holder specializer nil)))
+  (let ((collection (car (specializer-method-holder specializer nil))))
+    (coerce (remove 0 collection) 'list)))
 
 (defmethod specializer-direct-generic-functions ((specializer specializer))
   (let ((cell (specializer-method-holder specializer nil)))
@@ -254,13 +289,14 @@
     (or (cdr cell)
         (when (car cell)
           (setf (cdr cell)
-                (sb-thread:with-mutex (*specializer-lock*)
+                (with-system-mutex (*specializer-lock*)
                   (let (collect)
-                    (dolist (m (car cell) (nreverse collect))
+                    (dovector (m (or (car cell) #()) (nreverse collect))
                 ;; the old PCL code used COLLECTING-ONCE which used
                 ;; #'EQ to check for newness
-                      (pushnew (method-generic-function m) collect
-                               :test #'eq)))))))))
+                      (unless (eql m 0)
+                        (pushnew (method-generic-function m) collect
+                                 :test #'eq))))))))))
 
 (defmethod specializer-method-holder ((self specializer) &optional create)
   ;; CREATE can be ignored, because instances of SPECIALIZER
@@ -615,7 +651,7 @@
             finalized-p t
             (classoid-pcl-class classoid) class
             direct-supers direct-superclasses
-            wrapper (classoid-wrapper classoid)
+            wrapper (classoid-layout classoid)
             %class-precedence-list (compute-class-precedence-list class)
             cpl-available-p t
             (getf plist 'direct-default-initargs)
@@ -623,7 +659,7 @@
       (add-direct-subclasses class direct-superclasses)
       (let ((slots (compute-slots class)))
         (setf (slot-value class 'slots) slots)
-        (setf (wrapper-slot-table wrapper) (make-slot-table class slots)))))
+        (setf (layout-slot-table wrapper) (make-slot-table class slots)))))
   ;; Comment from Gerd's PCL, 2003-05-15:
   ;;
   ;; We don't ADD-SLOT-ACCESSORS here because we don't want to
@@ -669,10 +705,10 @@
             (set-condition-slot-value x v slot-name)))
     (setf (slot-info-boundp info)
           (lambda (x)
-            (multiple-value-bind (v c)
-                (ignore-errors (condition-slot-value x slot-name))
-              (declare (ignore v))
-              (null c))))
+            (condition-slot-boundp x slot-name)))
+    (setf (slot-info-makunbound info)
+          (lambda (x)
+            (condition-slot-makunbound x slot-name)))
     slotd))
 
 (defmethod compute-slots :around ((class condition-class))
@@ -688,8 +724,8 @@
     (error "Structure slots must have :INSTANCE allocation.")))
 
 (defun make-structure-class-defstruct-form (name direct-slots include)
-  (let* ((conc-name (format-symbol *package* "~S structure class " name))
-         (constructor (format-symbol *package* "~Aconstructor" conc-name))
+  (let* ((conc-name (pkg-format-symbol *package* "~S structure class " name))
+         (constructor (pkg-format-symbol *package* "~Aconstructor" conc-name))
          (included-name (class-name include))
          (included-slots
           (when include
@@ -767,8 +803,8 @@
        ;;  (LAMBDA () (SB-PCL::FAST-MAKE-INSTANCE #<STRUCTURE-CLASS THING>))
        ;; So maybe we can figure out how to bundle two lambdas together?
        (lambda ()
-         (let* ((dd (wrapper-dd (class-wrapper class)))
-                (f (%make-structure-instance-allocator dd nil)))
+         (let* ((dd (layout-dd (class-wrapper class)))
+                (f (%make-structure-instance-allocator dd nil nil)))
            (if (functionp f)
                (funcall (setf (slot-value class 'defstruct-constructor) f))
                (error "Can't allocate ~S" class)))))
@@ -804,7 +840,7 @@
                               (when defstruct-p
                                 (let* ((slot-name (getf pl :name))
                                        (accessor
-                                        (format-symbol *package*
+                                        (pkg-format-symbol *package*
                                                        "~S structure class ~A"
                                                        name slot-name)))
                                   (setq pl (list* :defstruct-accessor-symbol
@@ -843,10 +879,11 @@
     (let ((slots (compute-slots class)))
       (setf (slot-value class 'slots) slots)
       (let* ((lclass (find-classoid (slot-value class 'name)))
-             (layout (classoid-wrapper lclass)))
+             (layout (classoid-layout lclass)))
         (setf (classoid-pcl-class lclass) class)
         (setf (slot-value class 'wrapper) layout)
-        (setf (wrapper-slot-table layout) (make-slot-table class slots))))
+        (sb-kernel::install-struct-slot-mapper layout)
+        (setf (layout-slot-table layout) (make-slot-table class slots))))
     (setf (slot-value class 'finalized-p) t)
     (add-slot-accessors class direct-slots)))
 
@@ -923,19 +960,24 @@
                (error "~@<Specified class ~S as a superclass of ~
                        itself.~@:>"
                       class))
-             (without-package-locks
-               (with-world-lock ()
-                 (when (or finalizep (class-finalized-p class))
-                   (%update-cpl class (compute-class-precedence-list class))
-                   ;; This invocation of UPDATE-SLOTS, in practice, finalizes the
-                   ;; class
-                   (%update-slots class (compute-slots class))
-                   (update-gfs-of-class class)
-                   (setf (plist-value class 'default-initargs) (compute-default-initargs class))
-                   (update-ctors 'finalize-inheritance :class class))
-                 (let ((seen (list* class seen)))
-                   (dolist (sub (class-direct-subclasses class))
-                     (rec sub nil seen)))))))
+             (when (without-package-locks
+                     (with-world-lock ()
+                       (prog1
+                           (when (or finalizep (class-finalized-p class))
+                             (%update-cpl class (compute-class-precedence-list class))
+                             ;; This invocation of UPDATE-SLOTS, in practice, finalizes the
+                             ;; class
+                             (%update-slots class (compute-slots class))
+                             (update-gfs-of-class class)
+                             (setf (plist-value class 'default-initargs) (compute-default-initargs class))
+                             (update-ctors 'finalize-inheritance :class class)
+                             t)
+                         (let ((seen (list* class seen)))
+                           (dolist (sub (class-direct-subclasses class))
+                             (rec sub nil seen))))))
+               ;; Warning at run-time is not nice, can it be done at compile-time?
+               #+nil
+               (style-warn-about-duplicate-slots class))))
     (rec class finalizep)))
 
 (define-condition cpl-protocol-violation (reference-condition error)
@@ -995,7 +1037,11 @@
   (when cpl
     (let ((first (car cpl)))
       (dolist (c (cdr cpl))
-        (pushnew c (slot-value first 'can-precede-list) :test #'eq)))
+        ;; This is (PUSHNEW c (SLOT-VALUE FIRST 'can-precede-list) :TEST #'EQ)))
+        ;; but avoids consing in an arena. Perhaps the ADJOIN transform could sense
+        ;; whether to change %ADJOIN-EQ to SYS-TLAB-ADJOIN-EQ ?
+        (with-slots (can-precede-list) first
+          (setf can-precede-list (sys-tlab-adjoin-eq c can-precede-list)))))
     (update-class-can-precede-p (cdr cpl))))
 
 (defun class-can-precede-p (class1 class2)
@@ -1096,13 +1142,10 @@
       (%update-lisp-class-layout class nwrapper)
       (setf (slot-value class 'slots) eslotds
             (wrapper-slot-list nwrapper) eslotds
-            (wrapper-slot-table nwrapper) (make-slot-table class eslotds)
-            (wrapper-length nwrapper) nslots
+            (layout-slot-table nwrapper) (make-slot-table class eslotds)
+            (layout-length nwrapper) nslots
             (slot-value class 'wrapper) nwrapper)
-      (style-warn-about-duplicate-slots class)
-      (setf (slot-value class 'finalized-p) t)
-      (unless (eq owrapper nwrapper)
-        (maybe-update-standard-slot-locations class)))))
+      (setf (slot-value class 'finalized-p) t))))
 
 (defun update-gf-dfun (class gf)
   (let ((*new-class* class)
@@ -1312,6 +1355,8 @@
            (slot-definition-internal-reader-function slotd)
            :internal-writer-function
            (slot-definition-internal-writer-function slotd)
+           :always-bound-p
+           (slot-definition-always-bound-p slotd)
            (call-next-method))))
 
 ;;; NOTE: For bootstrapping considerations, these can't use MAKE-INSTANCE
@@ -1351,34 +1396,16 @@
                              :method-class-function #'writer-method-class
                              'source source-location)))
 
-(defmethod add-boundp-method ((class slot-class) generic-function slot-name slot-documentation source-location)
-  (add-method generic-function
-              (make-a-method (constantly (find-class 'standard-boundp-method))
-                             class
-                             ()
-                             (list (or (class-name class) 'object))
-                             (list class)
-                             (make-boundp-method-function class slot-name)
-                             (or slot-documentation "automatically generated boundp method")
-                             :slot-name slot-name
-                             'source source-location)))
-
 (defmethod remove-reader-method ((class slot-class) generic-function)
   (let ((method
-         (and (= (length (arg-info-metatypes (gf-arg-info generic-function))) 1)
-              (get-method generic-function () (list class) nil))))
+          (and (= (length (arg-info-metatypes (gf-arg-info generic-function))) 1)
+               (get-method generic-function () (list class) nil))))
     (when method (remove-method generic-function method))))
 
 (defmethod remove-writer-method ((class slot-class) generic-function)
   (let ((method
          (and (= (length (arg-info-metatypes (gf-arg-info generic-function))) 2)
               (get-method generic-function () (list *the-class-t* class) nil))))
-    (when method (remove-method generic-function method))))
-
-(defmethod remove-boundp-method ((class slot-class) generic-function)
-  (let ((method
-         (and (= (length (arg-info-metatypes (gf-arg-info generic-function))) 1)
-              (get-method generic-function () (list class) nil))))
     (when method (remove-method generic-function method))))
 
 ;;; MAKE-READER-METHOD-FUNCTION and MAKE-WRITER-METHOD-FUNCTION
@@ -1400,9 +1427,6 @@
 
 (defmethod make-writer-method-function ((class slot-class) slot-name)
   (make-std-writer-method-function class slot-name))
-
-(defmethod make-boundp-method-function ((class slot-class) slot-name)
-  (make-std-boundp-method-function class slot-name))
 
 (defmethod compatible-meta-class-change-p (class proto-new-class)
   (eq (class-of class) (class-of proto-new-class)))
@@ -1415,21 +1439,21 @@
            (eq (class-of class) *the-class-standard-class*))))
 
 ;;; What this does depends on which of the four possible values of
-;;; WRAPPER-INVALID the PCL wrapper has; the simplest case is when it
+;;; LAYOUT-INVALID the PCL wrapper has; the simplest case is when it
 ;;; is (:FLUSH <wrapper>) or (:OBSOLETE <wrapper>), when there is
 ;;; nothing to do, as the new wrapper has already been created.  If
-;;; WRAPPER-INVALID returns NIL, then we invalidate it (setting it to
+;;; LAYOUT-INVALID returns NIL, then we invalidate it (setting it to
 ;;; (:FLUSH <wrapper>); UPDATE-SLOTS later gets to choose whether or
 ;;; not to "upgrade" this to (:OBSOLETE <wrapper>).
 ;;;
-;;; This leaves the case where WRAPPER-INVALID returns T, which happens
+;;; This leaves the case where LAYOUT-INVALID returns T, which happens
 ;;; when REGISTER-LAYOUT has invalidated a superclass of CLASS (which
 ;;; invalidated all the subclasses in SB-KERNEL land).  Again, here we
 ;;; must flush the caches and allow UPDATE-SLOTS to decide whether to
 ;;; obsolete the wrapper.
 ;;;
 ;;; FIXME: either here or in INVALID-WRAPPER-P looks like a good place
-;;; for (AVER (NOT (EQ (WRAPPER-INVALID OWRAPPER)
+;;; for (AVER (NOT (EQ (LAYOUT-INVALID OWRAPPER)
 ;;;                    :UNINITIALIZED)))
 ;;;
 ;;; Thanks to Gerd Moellmann for the explanation.  -- CSR, 2002-10-29
@@ -1446,19 +1470,19 @@
                 ;; a violation of locality or what might be considered
                 ;; good style.  There has to be a better way!  -- CSR,
                 ;; 2002-10-29
-                (eq (wrapper-invalid owrapper) t))
-        (let ((nwrapper (make-wrapper (wrapper-length owrapper)
+                (eq (layout-invalid owrapper) t))
+        (let ((nwrapper (make-wrapper (layout-length owrapper)
                                       class)))
           (setf (wrapper-slot-list nwrapper) (wrapper-slot-list owrapper))
-          (setf (wrapper-slot-table nwrapper) (wrapper-slot-table owrapper))
+          (setf (layout-slot-table nwrapper) (layout-slot-table owrapper))
           (%update-lisp-class-layout class nwrapper)
           (setf (slot-value class 'wrapper) nwrapper)
           ;; Use :OBSOLETE instead of :FLUSH if any superclass has
           ;; been obsoleted.
           (if (find-if (lambda (x)
                          (and (consp x) (eq :obsolete (car x))))
-                       (wrapper-inherits owrapper)
-                       :key #'wrapper-invalid)
+                       (layout-inherits owrapper)
+                       :key #'layout-invalid)
               (%invalidate-wrapper owrapper :obsolete nwrapper)
               (%invalidate-wrapper owrapper :flush nwrapper))))))
   nil)
@@ -1469,14 +1493,14 @@
 (defmethod make-instances-obsolete ((class std-class))
   (with-world-lock ()
     (let* ((owrapper (class-wrapper class))
-           (nwrapper (make-wrapper (wrapper-length owrapper)
+           (nwrapper (make-wrapper (layout-length owrapper)
                                    class)))
       (unless (class-finalized-p class)
         (if (class-has-a-forward-referenced-superclass-p class)
             (return-from make-instances-obsolete class)
             (%update-cpl class (compute-class-precedence-list class))))
       (setf (wrapper-slot-list nwrapper) (wrapper-slot-list owrapper))
-      (setf (wrapper-slot-table nwrapper) (wrapper-slot-table owrapper))
+      (setf (layout-slot-table nwrapper) (layout-slot-table owrapper))
       (%update-lisp-class-layout class nwrapper)
       (setf (slot-value class 'wrapper) nwrapper)
       (%invalidate-wrapper owrapper :obsolete nwrapper)
@@ -1563,11 +1587,11 @@
 
 (macrolet ((replace-wrapper-and-slots (thing layout slot-vector)
              `(if (functionp ,thing)
-                  (setf (%fun-wrapper ,thing) ,layout
+                  (setf (%fun-layout ,thing) ,layout
                         (fsc-instance-slots ,thing) ,slot-vector)
                   ;; TODO: use a double-wide CAS here if CPU supports it
                   (progn
-                    (setf (%instance-wrapper ,thing) ,layout)
+                    (setf (%instance-layout ,thing) ,layout)
                     (%instance-set ,thing sb-vm:instance-data-start ,slot-vector)))))
 
 (defun %obsolete-instance-trap (owrapper nwrapper instance)
@@ -1576,7 +1600,7 @@
      (binding* ((class (wrapper-class nwrapper))
                 (oslots (get-slots instance))
                 (nwrapper (class-wrapper class))
-                (nslots (make-array (wrapper-length nwrapper)
+                (nslots (make-array (layout-length nwrapper)
                                     :initial-element +slot-unbound+))
                 (added ())
                 (discarded ())
@@ -1619,9 +1643,7 @@
                            ((fixnump location)
                             (clos-slots-ref oslots location))
                            ((not location)
-                            (let ((location (slot-info-location (cdr cell))))
-                              (aver (integerp location))
-                              (clos-slots-ref oslots (slot-info-location (cdr cell)))))
+                            (clos-slots-ref oslots (slot-info-location (cdr cell))))
                            (t (bug "non-FIXNUM non-NULL location in cell: ~S" cell)))))
              (unless (unbound-marker-p value)
                (let ((new (assq name layout)))
@@ -1655,8 +1677,19 @@
            (push (car cell) added)))
 
        (replace-wrapper-and-slots instance nwrapper nslots)
-       (update-instance-for-redefined-class
-        instance added discarded plist)
+       ;; The obsolete instance protocol does not specify what happens if
+       ;; an error is signaled in U-I-F-R-C and there is a nonlocal exit
+       ;; outside; it may result in a half-updated instance whose
+       ;; structure is updated but whose added slots are not initialized.
+       ;; (See CLHS 3.7.2.)
+       ;; The approach taken here is to abort the update process, as defined
+       ;; in CLHS 4.3.6, altogether, and restore the instance to its obsolete
+       ;; state; this way the programmer can try to fix the U-I-F-R-C code
+       ;; which signaled an error and try to access the instance again
+       ;; in order to try and update it again.
+       (sb-sys:nlx-protect (update-instance-for-redefined-class
+                            instance added discarded plist)
+         (replace-wrapper-and-slots instance owrapper oslots))
 
        nwrapper))
     (*in-obsolete-instance-trap* #.(find-layout 'structure-object))
@@ -1666,9 +1699,9 @@
 
 (defun %change-class (copy instance new-class initargs)
   (binding* ((new-wrapper (class-wrapper (ensure-class-finalized new-class)))
-             (new-slots (make-array (wrapper-length new-wrapper)
+             (new-slots (make-array (layout-length new-wrapper)
                                     :initial-element +slot-unbound+))
-             (old-wrapper (wrapper-of instance))
+             (old-wrapper (layout-of instance))
              (old-class (wrapper-class old-wrapper))
              (old-slots (get-slots instance))
              (safe (safe-p new-class))
@@ -1714,7 +1747,20 @@
     ;; Users need to synchronize their own access when changing class.
     (replace-wrapper-and-slots copy old-wrapper old-slots)
     (replace-wrapper-and-slots instance new-wrapper new-slots)
-    (apply #'update-instance-for-different-class copy instance initargs)
+
+    ;; The CLHS does not specify what happens if an error is signaled in
+    ;; U-I-F-D-C and there is a nonlocal exit outside; it may result in a
+    ;; half-updated instance whose class is updated but whose added slots
+    ;; are not initialized. (See CLHS 3.7.2.)
+    ;; The approach taken here is to abort the change-class process, as
+    ;; defined in CLHS 4.3.6, altogether, and restore the instance to its
+    ;; previous state; this way the programmer can try to fix the U-I-F-D-C
+    ;; code which signaled an error and try to CHANGE-CLASS the instance
+    ;; again.
+    (sb-sys:nlx-protect (apply #'update-instance-for-different-class
+                               copy instance initargs)
+      (replace-wrapper-and-slots instance old-wrapper old-slots))
+
     instance))
 ) ; end MACROLET
 

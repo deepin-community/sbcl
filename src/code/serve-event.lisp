@@ -192,7 +192,6 @@
 
 ;;;; SERVE-ALL-EVENTS, SERVE-EVENT, and friends
 
-#-sb-devel
 (declaim (start-block wait-until-fd-usable serve-event serve-all-events compute-pollfds))
 
 ;;; When a *periodic-polling-function* is defined the server will not
@@ -301,7 +300,7 @@ happens. Server returns T if something happened and NIL otherwise. Timeout
            (decode-internal-time
             (seconds-to-internal-time *periodic-polling-period*))
          (if to-sec
-             (loop repeat (/ (+ to-sec (/ to-usec $1e6))
+             (loop repeat (/ (+ to-sec (/ to-usec 1e6))
                              *periodic-polling-period*)
                    thereis (sub-sub-serve-event p-sec p-usec)
                    do (funcall *periodic-polling-function*))
@@ -322,7 +321,7 @@ happens. Server returns T if something happened and NIL otherwise. Timeout
     (let ((count 0))
       (declare (type index count))
 
-      ;; Initialize the fd-sets for UNIX-SELECT and return the active
+      ;; Initialize the fd-sets for UNIX-FAST-SELECT and return the active
       ;; descriptor count.
       (map-descriptor-handlers
        (lambda (handler)

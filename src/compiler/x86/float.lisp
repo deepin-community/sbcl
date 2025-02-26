@@ -108,9 +108,7 @@
 (defun copy-fp-reg-to-fr0 (reg)
   (aver (not (zerop (tn-offset reg))))
   (inst fstp fr0-tn)
-  (inst fld (make-random-tn :kind :normal
-                            :sc (sc-or-lose 'double-reg)
-                            :offset (1- (tn-offset reg)))))
+  (inst fld (make-random-tn (sc-or-lose 'double-reg) (1- (tn-offset reg)))))
 ;;; Using Fxch then Fst to restore the original reg contents.
 #+nil
 (defun copy-fp-reg-to-fr0 (reg)
@@ -182,31 +180,28 @@
 ;;; stored in a more precise form on chip. Anyhow, might as well use
 ;;; the feature. It can be turned off by hacking the
 ;;; "immediate-constant-sc" in vm.lisp.
-(eval-when (:compile-toplevel :execute)
-  (setf *read-default-float-format*
-        #+long-float 'cl:long-float #-long-float 'cl:double-float))
 (define-move-fun (load-fp-constant 2) (vop x y)
   ((fp-constant) (single-reg double-reg #+long-float long-reg))
   (let ((value (tn-value x)))
     (with-empty-tn@fp-top(y)
-      (cond ((or (eql value $0f0) (eql value $0d0) #+long-float (eql value $0l0))
+      (cond ((zerop value)
              (inst fldz))
-            ((sb-xc:= value $1e0)
+            ((sb-xc:= value 1l0)
              (inst fld1))
             #+long-float
-            ((= value (coerce pi *read-default-float-format*))
+            ((= value pi)
              (inst fldpi))
             #+long-float
-            ((= value (log 10e0 2e0))
+            ((= value (log 10l0 2l0))
              (inst fldl2t))
             #+long-float
-            ((= value (log 2.718281828459045235360287471352662e0 2e0))
+            ((= value (log 2.718281828459045235360287471352662L0 2l0))
              (inst fldl2e))
             #+long-float
-            ((= value (log 2e0 10e0))
+            ((= value (log 2l0 10l0))
              (inst fldlg2))
             #+long-float
-            ((= value (log 2e0 2.718281828459045235360287471352662e0))
+            ((= value (log 2l0 2.718281828459045235360287471352662L0))
              (inst fldln2))
             (t (warn "ignoring bogus i387 constant ~A" value))))))
 
@@ -220,33 +215,25 @@
          (inst fld value))
         (double-reg
          (inst fldd value))))))
-(eval-when (:compile-toplevel :execute)
-  (setf *read-default-float-format* 'cl:single-float))
 
 ;;;; complex float move functions
 
 (defun complex-single-reg-real-tn (x)
-  (make-random-tn :kind :normal :sc (sc-or-lose 'single-reg)
-                  :offset (tn-offset x)))
+  (make-random-tn (sc-or-lose 'single-reg) (tn-offset x)))
 (defun complex-single-reg-imag-tn (x)
-  (make-random-tn :kind :normal :sc (sc-or-lose 'single-reg)
-                  :offset (1+ (tn-offset x))))
+  (make-random-tn (sc-or-lose 'single-reg) (1+ (tn-offset x))))
 
 (defun complex-double-reg-real-tn (x)
-  (make-random-tn :kind :normal :sc (sc-or-lose 'double-reg)
-                  :offset (tn-offset x)))
+  (make-random-tn (sc-or-lose 'double-reg) (tn-offset x)))
 (defun complex-double-reg-imag-tn (x)
-  (make-random-tn :kind :normal :sc (sc-or-lose 'double-reg)
-                  :offset (1+ (tn-offset x))))
+  (make-random-tn (sc-or-lose 'double-reg) (1+ (tn-offset x))))
 
 #+long-float
 (defun complex-long-reg-real-tn (x)
-  (make-random-tn :kind :normal :sc (sc-or-lose 'long-reg)
-                  :offset (tn-offset x)))
+  (make-random-tn (sc-or-lose 'long-reg) (tn-offset x)))
 #+long-float
 (defun complex-long-reg-imag-tn (x)
-  (make-random-tn :kind :normal :sc (sc-or-lose 'long-reg)
-                  :offset (1+ (tn-offset x))))
+  (make-random-tn (sc-or-lose 'long-reg) (1+ (tn-offset x))))
 
 ;;; X is source, Y is destination.
 (define-move-fun (load-complex-single 2) (vop x y)
@@ -449,10 +436,10 @@
   (:results (y :scs (descriptor-reg)))
   (:generator 2
      (ecase (sb-c::constant-value (sb-c::tn-leaf x))
-       ($0f0 (load-symbol-value y *fp-constant-0f0*))
-       ($1f0 (load-symbol-value y *fp-constant-1f0*))
-       ($0d0 (load-symbol-value y *fp-constant-0d0*))
-       ($1d0 (load-symbol-value y *fp-constant-1d0*))
+       (0f0 (load-symbol-value y *fp-constant-0f0*))
+       (1f0 (load-symbol-value y *fp-constant-1f0*))
+       (0d0 (load-symbol-value y *fp-constant-0d0*))
+       (1d0 (load-symbol-value y *fp-constant-1d0*))
        #+long-float
        (0l0 (load-symbol-value y *fp-constant-0l0*))
        #+long-float
@@ -1524,12 +1511,12 @@
 (define-vop (=0/single-float float-test)
   (:translate =)
   (:args (x :scs (single-reg)))
-  (:arg-types single-float (:constant (single-float $0f0 $0f0)))
+  (:arg-types single-float (:constant (single-float 0f0 0f0)))
   (:variant #x40))
 (define-vop (=0/double-float float-test)
   (:translate =)
   (:args (x :scs (double-reg)))
-  (:arg-types double-float (:constant (double-float $0d0 $0d0)))
+  (:arg-types double-float (:constant (double-float 0d0 0d0)))
   (:variant #x40))
 #+long-float
 (define-vop (=0/long-float float-test)
@@ -1541,12 +1528,12 @@
 (define-vop (<0/single-float float-test)
   (:translate <)
   (:args (x :scs (single-reg)))
-  (:arg-types single-float (:constant (single-float $0f0 $0f0)))
+  (:arg-types single-float (:constant (single-float 0f0 0f0)))
   (:variant #x01))
 (define-vop (<0/double-float float-test)
   (:translate <)
   (:args (x :scs (double-reg)))
-  (:arg-types double-float (:constant (double-float $0d0 $0d0)))
+  (:arg-types double-float (:constant (double-float 0d0 0d0)))
   (:variant #x01))
 #+long-float
 (define-vop (<0/long-float float-test)
@@ -1558,12 +1545,12 @@
 (define-vop (>0/single-float float-test)
   (:translate >)
   (:args (x :scs (single-reg)))
-  (:arg-types single-float (:constant (single-float $0f0 $0f0)))
+  (:arg-types single-float (:constant (single-float 0f0 0f0)))
   (:variant #x00))
 (define-vop (>0/double-float float-test)
   (:translate >)
   (:args (x :scs (double-reg)))
-  (:arg-types double-float (:constant (double-float $0d0 $0d0)))
+  (:arg-types double-float (:constant (double-float 0d0 0d0)))
   (:variant #x00))
 #+long-float
 (define-vop (>0/long-float float-test)
@@ -2160,9 +2147,7 @@
        (t
         (inst fstp fr0)
         (inst fstp fr0)
-        (inst fldd (make-random-tn :kind :normal
-                                   :sc (sc-or-lose 'double-reg)
-                                   :offset (- (tn-offset x) 2)))))
+        (inst fldd (make-random-tn (sc-or-lose 'double-reg) (- (tn-offset x) 2)))))
     (inst fptan)
     ;; Result is in fr1
     (case (tn-offset y)
@@ -2256,9 +2241,7 @@
        (t
         (inst fstp fr0)
         (inst fstp fr0)
-        (inst fldd (make-random-tn :kind :normal
-                                   :sc (sc-or-lose 'double-reg)
-                                   :offset (- (tn-offset x) 2)))))
+        (inst fldd (make-random-tn (sc-or-lose 'double-reg) (- (tn-offset x) 2)))))
     (inst fptan)
     (let ((REDUCE (gen-label))
           (REDUCE-LOOP (gen-label)))
@@ -2439,9 +2422,7 @@
              (inst fstp fr0)
              (inst fstp fr0)
              (inst fldln2)
-             (inst fldd (make-random-tn :kind :normal
-                                        :sc (sc-or-lose 'double-reg)
-                                        :offset (1- (tn-offset x))))))
+             (inst fldd (make-random-tn (sc-or-lose 'double-reg) (1- (tn-offset x))))))
          (inst fyl2x))
         ((double-stack descriptor-reg)
          (inst fstp fr0)
@@ -2490,14 +2471,61 @@
              (inst fstp fr0)
              (inst fstp fr0)
              (inst fldlg2)
-             (inst fldd (make-random-tn :kind :normal
-                                        :sc (sc-or-lose 'double-reg)
-                                        :offset (1- (tn-offset x))))))
+             (inst fldd (make-random-tn (sc-or-lose 'double-reg) (1- (tn-offset x))))))
          (inst fyl2x))
         ((double-stack descriptor-reg)
          (inst fstp fr0)
          (inst fstp fr0)
          (inst fldlg2)
+         (if (sc-is x double-stack)
+             (inst fldd (ea-for-df-stack x))
+             (inst fldd (ea-for-df-desc x)))
+         (inst fyl2x)))
+     (inst fld fr0)
+     (case (tn-offset y)
+       ((0 1))
+       (t (inst fstd y)))))
+
+(define-vop (flog2)
+  (:translate %log2)
+  (:args (x :scs (double-reg double-stack descriptor-reg) :target fr0))
+  (:temporary (:sc double-reg :offset fr0-offset
+                   :from :argument :to :result) fr0)
+  (:temporary (:sc double-reg :offset fr1-offset
+                   :from :argument :to :result) fr1)
+  (:results (y :scs (double-reg)))
+  (:arg-types double-float)
+  (:result-types double-float)
+  (:policy :fast-safe)
+  (:note "inline log2 function")
+  (:vop-var vop)
+  (:save-p :compute-only)
+  (:generator 5
+     (note-this-location vop :internal-error)
+     (sc-case x
+        (double-reg
+         (case (tn-offset x)
+            (0
+             ;; x is in fr0
+             (inst fstp fr1)
+             (inst fld1)
+             (inst fxch fr1))
+            (1
+             ;; x is in fr1
+             (inst fstp fr0)
+             (inst fld1)
+             (inst fxch fr1))
+            (t
+             ;; x is in a FP reg, not fr0 or fr1
+             (inst fstp fr0)
+             (inst fstp fr0)
+             (inst fld1)
+             (inst fldd (make-random-tn (sc-or-lose 'double-reg) (1- (tn-offset x))))))
+         (inst fyl2x))
+        ((double-stack descriptor-reg)
+         (inst fstp fr0)
+         (inst fstp fr0)
+         (inst fld1)
          (if (sc-is x double-stack)
              (inst fldd (ea-for-df-stack x))
              (inst fldd (ea-for-df-desc x)))
@@ -2590,9 +2618,7 @@
        (inst fstp fr0)
        (sc-case y
           (double-reg
-           (inst fldd (make-random-tn :kind :normal
-                                      :sc (sc-or-lose 'double-reg)
-                                      :offset (- (tn-offset y) 2))))
+           (inst fldd (make-random-tn (sc-or-lose 'double-reg) (- (tn-offset y) 2))))
           (double-stack
            (inst fldd (ea-for-df-stack y)))
           (descriptor-reg
@@ -2600,9 +2626,7 @@
        ;; Load x to fr0
        (sc-case x
           (double-reg
-           (inst fldd (make-random-tn :kind :normal
-                                      :sc (sc-or-lose 'double-reg)
-                                      :offset (1- (tn-offset x)))))
+           (inst fldd (make-random-tn (sc-or-lose 'double-reg) (1- (tn-offset x)))))
           (double-stack
            (inst fldd (ea-for-df-stack x)))
           (descriptor-reg
@@ -2670,9 +2694,7 @@
               (inst fild temp))
              (signed-stack
               (inst fild y)))
-           (inst fld (make-random-tn :kind :normal
-                                     :sc (sc-or-lose 'double-reg)
-                                     :offset (1- (tn-offset x)))))))
+           (inst fld (make-random-tn (sc-or-lose 'double-reg) (1- (tn-offset x)))))))
        ((double-stack descriptor-reg)
         (inst fstp fr0)
         (inst fstp fr0)
@@ -2770,9 +2792,7 @@
        (inst fstp fr0)
        (sc-case y
           (double-reg
-           (inst fldd (make-random-tn :kind :normal
-                                      :sc (sc-or-lose 'double-reg)
-                                      :offset (- (tn-offset y) 2))))
+           (inst fldd (make-random-tn (sc-or-lose 'double-reg) (- (tn-offset y) 2))))
           (double-stack
            (inst fldd (ea-for-df-stack y)))
           (descriptor-reg
@@ -2780,9 +2800,7 @@
        ;; Load x to fr0
        (sc-case x
           (double-reg
-           (inst fldd (make-random-tn :kind :normal
-                                      :sc (sc-or-lose 'double-reg)
-                                      :offset (1- (tn-offset x)))))
+           (inst fldd (make-random-tn (sc-or-lose 'double-reg) (1- (tn-offset x)))))
           (double-stack
            (inst fldd (ea-for-df-stack x)))
           (descriptor-reg
@@ -2811,9 +2829,7 @@
      ;; x is in a FP reg, not fr0, fr1.
      (inst fstp fr0)
      (inst fstp fr0)
-     (inst fldd (make-random-tn :kind :normal
-                                :sc (sc-or-lose 'double-reg)
-                                :offset (- (tn-offset x) 2)))
+     (inst fldd (make-random-tn (sc-or-lose 'double-reg) (- (tn-offset x) 2)))
      ;; Check the range
      (inst push #x3e947ae1)     ; Constant 0.29
      (inst fabs)
@@ -2825,9 +2841,7 @@
      (inst jmp :z WITHIN-RANGE)
      ;; Out of range for fyl2xp1.
      (inst fld1)
-     (inst faddd (make-random-tn :kind :normal
-                                 :sc (sc-or-lose 'double-reg)
-                                 :offset (- (tn-offset x) 1)))
+     (inst faddd (make-random-tn (sc-or-lose 'double-reg) (- (tn-offset x) 1)))
      (inst fldln2)
      (inst fxch fr1)
      (inst fyl2x)
@@ -2835,9 +2849,7 @@
 
      WITHIN-RANGE
      (inst fldln2)
-     (inst fldd (make-random-tn :kind :normal
-                                :sc (sc-or-lose 'double-reg)
-                                :offset (- (tn-offset x) 1)))
+     (inst fldd (make-random-tn (sc-or-lose 'double-reg) (- (tn-offset x) 1)))
      (inst fyl2xp1)
      DONE
      (inst fld fr0)
@@ -2882,9 +2894,7 @@
              (inst fstp fr0)
              (inst fstp fr0)
              (inst fldln2)
-             (inst fldd (make-random-tn :kind :normal
-                                        :sc (sc-or-lose 'double-reg)
-                                        :offset (1- (tn-offset x)))))))
+             (inst fldd (make-random-tn (sc-or-lose 'double-reg) (1- (tn-offset x)))))))
         ((double-stack descriptor-reg)
          (inst fstp fr0)
          (inst fstp fr0)
@@ -2927,9 +2937,7 @@
              ;; x is in a FP reg, not fr0 or fr1
              (inst fstp fr0)
              (inst fstp fr0)
-             (inst fldd (make-random-tn :kind :normal
-                                        :sc (sc-or-lose 'double-reg)
-                                        :offset (- (tn-offset x) 2))))))
+             (inst fldd (make-random-tn (sc-or-lose 'double-reg) (- (tn-offset x) 2))))))
         ((double-stack descriptor-reg)
          (inst fstp fr0)
          (inst fstp fr0)
@@ -2975,9 +2983,7 @@
        (inst fstp fr0)
        (sc-case x
           (double-reg
-           (inst fldd (make-random-tn :kind :normal
-                                      :sc (sc-or-lose 'double-reg)
-                                      :offset (- (tn-offset x) 2))))
+           (inst fldd (make-random-tn (sc-or-lose 'double-reg) (- (tn-offset x) 2))))
           (double-stack
            (inst fldd (ea-for-df-stack x)))
           (descriptor-reg
@@ -3075,9 +3081,7 @@
        (inst fstp fr0)
        (sc-case x
           (double-reg
-           (inst fldd (make-random-tn :kind :normal
-                                      :sc (sc-or-lose 'double-reg)
-                                      :offset (- (tn-offset x) 2))))
+           (inst fldd (make-random-tn (sc-or-lose 'double-reg) (- (tn-offset x) 2))))
           (double-stack
            (inst fldd (ea-for-df-stack x)))
           (descriptor-reg
@@ -3085,9 +3089,7 @@
        ;; Load y to fr0
        (sc-case y
           (double-reg
-           (inst fldd (make-random-tn :kind :normal
-                                      :sc (sc-or-lose 'double-reg)
-                                      :offset (1- (tn-offset y)))))
+           (inst fldd (make-random-tn (sc-or-lose 'double-reg) (1- (tn-offset y)))))
           (double-stack
            (inst fldd (ea-for-df-stack y)))
           (descriptor-reg
@@ -3168,9 +3170,7 @@
        (t
         (inst fstp fr0)
         (inst fstp fr0)
-        (inst fldd (make-random-tn :kind :normal
-                                   :sc (sc-or-lose 'double-reg)
-                                   :offset (- (tn-offset x) 2)))))
+        (inst fldd (make-random-tn (sc-or-lose 'double-reg) (- (tn-offset x) 2)))))
     (inst fptan)
     ;; Result is in fr1
     (case (tn-offset y)
@@ -3247,9 +3247,7 @@
        (t
         (inst fstp fr0)
         (inst fstp fr0)
-        (inst fldd (make-random-tn :kind :normal
-                                   :sc (sc-or-lose 'double-reg)
-                                   :offset (- (tn-offset x) 2)))))
+        (inst fldd (make-random-tn (sc-or-lose 'double-reg) (- (tn-offset x) 2)))))
     (inst fptan)
     (inst fnstsw)                        ; status word to ax
     (inst and ah-tn #x04)                ; C2
@@ -3418,9 +3416,7 @@
              (inst fstp fr0)
              (inst fstp fr0)
              (inst fldln2)
-             (inst fldd (make-random-tn :kind :normal
-                                        :sc (sc-or-lose 'double-reg)
-                                        :offset (1- (tn-offset x))))))
+             (inst fldd (make-random-tn (sc-or-lose 'double-reg) (1- (tn-offset x))))))
          (inst fyl2x))
         ((long-stack descriptor-reg)
          (inst fstp fr0)
@@ -3469,9 +3465,7 @@
              (inst fstp fr0)
              (inst fstp fr0)
              (inst fldlg2)
-             (inst fldd (make-random-tn :kind :normal
-                                        :sc (sc-or-lose 'double-reg)
-                                        :offset (1- (tn-offset x))))))
+             (inst fldd (make-random-tn (sc-or-lose 'double-reg) (1- (tn-offset x))))))
          (inst fyl2x))
         ((long-stack descriptor-reg)
          (inst fstp fr0)
@@ -3569,9 +3563,7 @@
        (inst fstp fr0)
        (sc-case y
           (long-reg
-           (inst fldd (make-random-tn :kind :normal
-                                      :sc (sc-or-lose 'double-reg)
-                                      :offset (- (tn-offset y) 2))))
+           (inst fldd (make-random-tn (sc-or-lose 'double-reg) (- (tn-offset y) 2))))
           (long-stack
            (inst fldl (ea-for-lf-stack y)))
           (descriptor-reg
@@ -3579,9 +3571,7 @@
        ;; Load x to fr0
        (sc-case x
           (long-reg
-           (inst fldd (make-random-tn :kind :normal
-                                      :sc (sc-or-lose 'double-reg)
-                                      :offset (1- (tn-offset x)))))
+           (inst fldd (make-random-tn (sc-or-lose 'double-reg) (1- (tn-offset x)))))
           (long-stack
            (inst fldl (ea-for-lf-stack x)))
           (descriptor-reg
@@ -3648,9 +3638,7 @@
               (inst fild temp))
              (signed-stack
               (inst fild y)))
-           (inst fld (make-random-tn :kind :normal
-                                     :sc (sc-or-lose 'double-reg)
-                                     :offset (1- (tn-offset x)))))))
+           (inst fld (make-random-tn (sc-or-lose 'double-reg) (1- (tn-offset x)))))))
        ((long-stack descriptor-reg)
         (inst fstp fr0)
         (inst fstp fr0)
@@ -3748,9 +3736,7 @@
        (inst fstp fr0)
        (sc-case y
           (long-reg
-           (inst fldd (make-random-tn :kind :normal
-                                      :sc (sc-or-lose 'double-reg)
-                                      :offset (- (tn-offset y) 2))))
+           (inst fldd (make-random-tn (sc-or-lose 'double-reg) (- (tn-offset y) 2))))
           (long-stack
            (inst fldl (ea-for-lf-stack y)))
           (descriptor-reg
@@ -3758,9 +3744,7 @@
        ;; Load x to fr0
        (sc-case x
           (long-reg
-           (inst fldd (make-random-tn :kind :normal
-                                      :sc (sc-or-lose 'double-reg)
-                                      :offset (1- (tn-offset x)))))
+           (inst fldd (make-random-tn (sc-or-lose 'double-reg) (1- (tn-offset x)))))
           (long-stack
            (inst fldl (ea-for-lf-stack x)))
           (descriptor-reg
@@ -3793,9 +3777,7 @@
      ;; x is in a FP reg, not fr0, fr1.
      (inst fstp fr0)
      (inst fstp fr0)
-     (inst fldd (make-random-tn :kind :normal
-                                :sc (sc-or-lose 'double-reg)
-                                :offset (- (tn-offset x) 2)))
+     (inst fldd (make-random-tn (sc-or-lose 'double-reg) (- (tn-offset x) 2)))
      ;; Check the range
      (inst push #x3e947ae1)     ; Constant 0.29
      (inst fabs)
@@ -3807,9 +3789,7 @@
      (inst jmp :z WITHIN-RANGE)
      ;; Out of range for fyl2xp1.
      (inst fld1)
-     (inst faddd (make-random-tn :kind :normal
-                                 :sc (sc-or-lose 'double-reg)
-                                 :offset (- (tn-offset x) 1)))
+     (inst faddd (make-random-tn (sc-or-lose 'double-reg) (- (tn-offset x) 1)))
      (inst fldln2)
      (inst fxch fr1)
      (inst fyl2x)
@@ -3817,9 +3797,7 @@
 
      WITHIN-RANGE
      (inst fldln2)
-     (inst fldd (make-random-tn :kind :normal
-                                :sc (sc-or-lose 'double-reg)
-                                :offset (- (tn-offset x) 1)))
+     (inst fldd (make-random-tn (sc-or-lose 'double-reg) (- (tn-offset x) 1)))
      (inst fyl2xp1)
      DONE
      (inst fld fr0)
@@ -3861,9 +3839,7 @@
              (inst fstp fr0)
              (inst fstp fr0)
              (inst fldln2)
-             (inst fldd (make-random-tn :kind :normal
-                                        :sc (sc-or-lose 'double-reg)
-                                        :offset (1- (tn-offset x)))))))
+             (inst fldd (make-random-tn (sc-or-lose 'double-reg) (1- (tn-offset x)))))))
         ((long-stack descriptor-reg)
          (inst fstp fr0)
          (inst fstp fr0)
@@ -3906,9 +3882,7 @@
              ;; x is in a FP reg, not fr0 or fr1
              (inst fstp fr0)
              (inst fstp fr0)
-             (inst fldd (make-random-tn :kind :normal
-                                        :sc (sc-or-lose 'double-reg)
-                                        :offset (- (tn-offset x) 2))))))
+             (inst fldd (make-random-tn (sc-or-lose 'double-reg) (- (tn-offset x) 2))))))
         ((long-stack descriptor-reg)
          (inst fstp fr0)
          (inst fstp fr0)
@@ -3954,9 +3928,7 @@
        (inst fstp fr0)
        (sc-case x
           (long-reg
-           (inst fldd (make-random-tn :kind :normal
-                                      :sc (sc-or-lose 'double-reg)
-                                      :offset (- (tn-offset x) 2))))
+           (inst fldd (make-random-tn (sc-or-lose 'double-reg) (- (tn-offset x) 2))))
           (long-stack
            (inst fldl (ea-for-lf-stack x)))
           (descriptor-reg
@@ -4050,9 +4022,7 @@
        (inst fstp fr0)
        (sc-case x
           (long-reg
-           (inst fldd (make-random-tn :kind :normal
-                                      :sc (sc-or-lose 'double-reg)
-                                      :offset (- (tn-offset x) 2))))
+           (inst fldd (make-random-tn (sc-or-lose 'double-reg) (- (tn-offset x) 2))))
           (long-stack
            (inst fldl (ea-for-lf-stack x)))
           (descriptor-reg
@@ -4060,9 +4030,7 @@
        ;; Load y to fr0
        (sc-case y
           (long-reg
-           (inst fldd (make-random-tn :kind :normal
-                                      :sc (sc-or-lose 'double-reg)
-                                      :offset (1- (tn-offset y)))))
+           (inst fldd (make-random-tn (sc-or-lose 'double-reg) (1- (tn-offset y)))))
           (long-stack
            (inst fldl (ea-for-lf-stack y)))
           (descriptor-reg
@@ -4222,9 +4190,7 @@
     (cond ((sc-is x complex-single-reg complex-double-reg
                   #+long-float complex-long-reg)
            (let ((value-tn
-                  (make-random-tn :kind :normal
-                                  :sc (sc-or-lose 'double-reg)
-                                  :offset (+ offset (tn-offset x)))))
+                  (make-random-tn (sc-or-lose 'double-reg) (+ offset (tn-offset x)))))
              (unless (location= value-tn r)
                (cond ((zerop (tn-offset r))
                       (copy-fp-reg-to-fr0 value-tn))

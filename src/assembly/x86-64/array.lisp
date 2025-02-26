@@ -25,16 +25,49 @@
                           (:arg  end    (any-reg descriptor-reg) rsi-offset)
                           (:res  res    (descriptor-reg) rdx-offset)
                           (:temp count unsigned-reg rcx-offset)
+                          (:temp end-card-index unsigned-reg rbx-offset)
                           ;; storage class doesn't matter since all float regs
                           ;; and sse regs map to the same storage base.
                           (:temp wordpair double-reg float0-offset))
+  (progn end-card-index)
   (move res vector) ; to "use" res
+
+  ;; Mark each GC card of the vector unless ITEM is not a pointer
+  ;; (NIL is non-pointer) or the COUNT is 0.
+  #+soft-card-marks
+  (progn
+  (inst cmp start end)
+  (inst jmp :ge DONE)
+  (inst lea :dword count (ea -3 item)) ; same as POINTERP (see type-vops)
+  (inst test :byte count #b11)
+  (inst jmp :nz DONE-CARD-MARKING)
+  (inst cmp item nil-value)
+  (inst jmp :e DONE-CARD-MARKING)
+
+  (let ((disp (- (ash vector-data-offset word-shift) other-pointer-lowtag))
+        (card-index count)
+        (loop (gen-label)))
+    ;; Compute EA of starting and ending (inclusive) indices
+    (inst lea card-index (ea disp vector start (ash 1 (- word-shift n-fixnum-tag-bits))))
+    (inst lea end-card-index (ea (- disp n-word-bytes)
+                                 vector end (ash 1 (- word-shift n-fixnum-tag-bits))))
+    (inst shr card-index gencgc-card-shift)
+    (inst shr end-card-index gencgc-card-shift)
+    (inst and :dword card-index card-index-mask)
+    (inst and :dword end-card-index card-index-mask)
+    (emit-label LOOP)
+    (inst mov :byte (ea gc-card-table-reg-tn card-index) CARD-MARKED) ; mark one card
+    (inst cmp card-index end-card-index)
+    (inst jmp :e DONE-CARD-MARKING)
+    (inst inc :dword card-index)
+    (inst and :dword card-index card-index-mask)
+    (inst jmp LOOP)))
+
+  DONE-CARD-MARKING
   (move count end)
   (inst sub count start)
-  ;; 'start' and 'limit' will be interior pointers into 'vector',
+  ;; 'start' is an interior pointer to 'vector',
   ;; but 'vector' is pinned because it's in a register, so this is ok.
-  ;; If we had a precise GC we'd want to keep start and limit as offsets
-  ;; because we couldn't tie them both to the vector.
   (inst lea start (ea (- (ash vector-data-offset word-shift) other-pointer-lowtag)
                       vector start (ash 1 (- word-shift n-fixnum-tag-bits))))
   ;; REP STOS has a fixed cost that makes it suboptimal below
@@ -96,3 +129,180 @@
   (inst add start n-word-bytes)
   (inst cmp start count)
   (inst jmp :b FINAL-LOOP))
+
+(define-assembly-routine (%data-vector-and-index
+                          (:translate %data-vector-and-index)
+                          (:policy :fast-safe)
+                          (:arg-types t positive-fixnum)
+                          (:result-types t positive-fixnum))
+    ((:arg array descriptor-reg rdx-offset)
+     (:arg index any-reg rdi-offset)
+     (:temp temp unsigned-reg rcx-offset)
+     (:res result descriptor-reg rdx-offset)
+     (:res offset any-reg rdi-offset))
+  (declare (ignore result offset))
+  LOOP
+  (inst mov :byte temp (ea (- other-pointer-lowtag) array))
+
+  (inst cmp :byte temp simple-array-widetag)
+  (inst jmp :eq SKIP)
+  (inst cmp :byte temp complex-base-string-widetag)
+  (inst jmp :l DONE)
+  SKIP
+
+  (inst add index (object-slot-ea array array-displacement-slot other-pointer-lowtag))
+  (loadw array array array-data-slot other-pointer-lowtag)
+  (inst jmp LOOP)
+  DONE)
+
+
+(define-assembly-routine (%data-vector-and-index/check-bound
+                          (:translate %data-vector-and-index/check-bound)
+                          (:policy :fast-safe)
+                          (:arg-types t positive-fixnum)
+                          (:result-types t positive-fixnum))
+    ((:arg array descriptor-reg rdx-offset)
+     (:arg index any-reg rdi-offset)
+     (:temp temp any-reg rcx-offset)
+     (:res result descriptor-reg rdx-offset)
+     (:res offset any-reg rdi-offset))
+  (declare (ignore result offset))
+  (let ((error
+          (assemble (:elsewhere)
+            error
+            ;; Fake up a stack frame so that backtraces come out right.
+            (inst push rbp-tn)
+            (inst mov rbp-tn rsp-tn)
+            (emit-error-break nil error-trap
+                              (error-number-or-lose 'invalid-array-index-error)
+                              (list array temp index))
+            (progn error))))
+    (assemble ()
+      (inst mov :byte temp (ea (- other-pointer-lowtag) array))
+      (inst cmp :byte temp simple-array-widetag)
+      (inst jmp :eq HEADER)
+      (inst cmp :byte temp complex-base-string-widetag)
+      (inst jmp :ge HEADER)
+
+      (loadw temp array array-fill-pointer-slot other-pointer-lowtag)
+      (inst cmp temp index)
+      (inst jmp :be error)
+      (inst jmp DONE)
+
+      HEADER
+      (loadw temp array array-elements-slot other-pointer-lowtag)
+      (inst cmp temp index)
+      (inst jmp :be error)
+
+      LOOP
+      (inst add index (object-slot-ea array array-displacement-slot other-pointer-lowtag))
+      (loadw array array array-data-slot other-pointer-lowtag)
+
+      (inst mov :byte temp (ea (- other-pointer-lowtag) array))
+      (inst cmp :byte temp simple-array-widetag)
+      (inst jmp :eq LOOP)
+      (inst cmp :byte temp complex-base-string-widetag)
+      (inst jmp :ge LOOP)
+
+      DONE)))
+
+(define-assembly-routine (%data-vector-pop
+                          (:translate %data-vector-pop)
+                          (:policy :fast-safe)
+                          (:arg-types t)
+                          (:result-types t positive-fixnum))
+    ((:arg array descriptor-reg rdx-offset)
+     (:temp temp any-reg rcx-offset)
+     (:res result descriptor-reg rdx-offset)
+     (:res offset any-reg rdi-offset))
+  (declare (ignore result))
+  (let ((error
+          (assemble (:elsewhere)
+            error
+            ;; Fake up a stack frame so that backtraces come out right.
+            (inst push rbp-tn)
+            (inst mov rbp-tn rsp-tn)
+            (emit-error-break nil error-trap
+                              (error-number-or-lose 'fill-pointer-error)
+                              (list array))
+            (progn error))))
+    (assemble ()
+      (inst mov :dword temp (ea (- other-pointer-lowtag) array))
+      (inst cmp :byte temp complex-base-string-widetag)
+      (inst jmp :l ERROR)
+
+      (inst test :word temp (ash sb-vm:+array-fill-pointer-p+
+                                 sb-vm:array-flags-data-position))
+      (inst jmp :nz ERROR)
+
+      (loadw offset array array-fill-pointer-slot other-pointer-lowtag)
+      (inst test offset offset)
+      (inst jmp :z ERROR)
+      (inst sub offset (fixnumize 1))
+      (storew offset array array-fill-pointer-slot other-pointer-lowtag)
+
+
+      LOOP
+      (inst add offset (object-slot-ea array array-displacement-slot other-pointer-lowtag))
+      (loadw array array array-data-slot other-pointer-lowtag)
+
+      (inst mov :byte temp (ea (- other-pointer-lowtag) array))
+      (inst cmp :byte temp simple-array-widetag)
+      (inst jmp :eq LOOP)
+      (inst cmp :byte temp complex-base-string-widetag)
+      (inst jmp :ge LOOP)
+
+      DONE)))
+
+(define-assembly-routine (%data-vector-push
+                          (:translate %data-vector-push)
+                          (:policy :fast-safe)
+                          (:arg-types t)
+                          (:result-types t t))
+    ((:arg array descriptor-reg rdx-offset)
+     (:temp temp any-reg rcx-offset)
+     (:res result descriptor-reg rdx-offset)
+     (:res offset descriptor-reg rdi-offset))
+  (declare (ignore result))
+  (let ((error
+          (assemble (:elsewhere)
+            error
+            ;; Fake up a stack frame so that backtraces come out right.
+            (inst push rbp-tn)
+            (inst mov rbp-tn rsp-tn)
+            (emit-error-break nil error-trap
+                              (error-number-or-lose 'fill-pointer-error)
+                              (list array))
+            (progn error))))
+    (assemble ()
+      (inst mov :dword temp (ea (- other-pointer-lowtag) array))
+      (inst cmp :byte temp complex-base-string-widetag)
+      (inst jmp :l ERROR)
+
+      (inst test :word temp (ash sb-vm:+array-fill-pointer-p+
+                                 sb-vm:array-flags-data-position))
+      (inst jmp :nz ERROR)
+
+      (loadw offset array array-fill-pointer-slot other-pointer-lowtag)
+      (loadw temp array array-elements-slot other-pointer-lowtag)
+      (inst cmp temp offset)
+      (inst jmp :ne SKIP)
+      (inst mov offset nil-value)
+      (inst ret)
+
+      SKIP
+      (inst lea temp (ea (fixnumize 1) offset))
+      (storew temp array array-fill-pointer-slot other-pointer-lowtag)
+
+
+      LOOP
+      (inst add offset (object-slot-ea array array-displacement-slot other-pointer-lowtag))
+      (loadw array array array-data-slot other-pointer-lowtag)
+
+      (inst mov :byte temp (ea (- other-pointer-lowtag) array))
+      (inst cmp :byte temp simple-array-widetag)
+      (inst jmp :eq LOOP)
+      (inst cmp :byte temp complex-base-string-widetag)
+      (inst jmp :ge LOOP)
+
+      DONE)))

@@ -17,19 +17,28 @@
 (define-alien-routine ("os_context_float_register_addr" context-float-register-addr)
   (* unsigned) (context (* os-context-t)) (index int))
 
-(defun context-float-register (context index format)
+(defun context-float-register (context index format &optional integer)
   (let ((sap (alien-sap (context-float-register-addr context index))))
     (ecase format
       (single-float
-       (sap-ref-single sap 0))
+       (if integer
+           (values (sap-ref-32 sap 0) 4)
+           (sap-ref-single sap 0)))
       (double-float
-       (sap-ref-double sap 0))
+       (if integer
+           (values (sap-ref-64 sap 0) 8)
+           (sap-ref-double sap 0)))
       (complex-single-float
        (complex (sap-ref-single sap 0)
                 (sap-ref-single sap 4)))
       (complex-double-float
-       (complex (sap-ref-double sap 0)
-                (sap-ref-double sap 8))))))
+       (if integer
+           (values (dpb (sap-ref-64 sap 8)
+                        (byte 64 64)
+                        (sap-ref-64 sap 0))
+                   16)
+           (complex (sap-ref-double sap 0)
+                    (sap-ref-double sap 8)))))))
 
 (defun %set-context-float-register (context index format value)
   (let ((sap (alien-sap (context-float-register-addr context index))))
@@ -68,7 +77,9 @@
                          (t
                           (prog1 (sap-ref-8 pc 4)
                             (setf pc (sap+ pc 1))))))
-         (first-arg (ldb (byte 8 13) instruction)))
+         (first-arg (ldb (byte 8 13) instruction))
+         (first-offset (ldb (byte 5 0) first-arg))
+         (first-sc (ldb (byte 2 5) first-arg)))
     (declare (type system-area-pointer pc))
     (if (= trap-number invalid-arg-count-trap)
         (values #.(error-number-or-lose 'invalid-arg-count-error)
@@ -80,13 +91,17 @@
                       (zerop length))
             (decf length))
           (setf pc (sap+ pc 4))
-          (let ((args (loop repeat length
-                            with index = 0
+          (let ((args (loop with index = 0
+                            repeat length
                             collect (sb-c:sap-read-var-integerf pc index))))
             (values error-number
-                    (if (= first-arg zr-offset)
+                    (if (= first-offset zr-offset)
                         args
-                        (cons (make-sc+offset sb-vm:descriptor-reg-sc-number first-arg)
+                        (cons (make-sc+offset (case first-sc
+                                                (1 sb-vm:unsigned-reg-sc-number)
+                                                (2 sb-vm:signed-reg-sc-number)
+                                                (t sb-vm:descriptor-reg-sc-number))
+                                              first-offset)
                               args))
                     trap-number))))))
 
@@ -99,13 +114,11 @@
              (entry (+ (sap-ref-word (int-sap fun-addr)
                                      (- (ash simple-fun-self-slot word-shift)
                                         fun-pointer-lowtag))
-                       (- (ash simple-fun-insts-offset word-shift)
-                          fun-pointer-lowtag))))
+                       4))) ;; tail call
         (when arg-count
           (setf (context-register context nargs-offset)
                 (get-lisp-obj-address arg-count)))
-        (setf (context-register context lexenv-offset) fun-addr
-              (context-register context lr-offset) entry)
+        (setf (context-register context lexenv-offset) fun-addr)
         (set-context-pc context entry)))))
 
 #+darwin-jit
@@ -115,20 +128,11 @@
     (address unsigned)
     (value unsigned))
 
-  (define-alien-routine jit-patch-int
+  (define-alien-routine jit-patch-code
     void
-    (address unsigned)
-    (value int))
-
-  (define-alien-routine jit-patch-uint
-    void
-    (address unsigned)
-    (value unsigned-int))
-
-  (define-alien-routine jit-patch-uchar
-    void
-    (address unsigned)
-    (value unsigned-char))
+    (code unsigned)
+    (value unsigned)
+    (index unsigned))
 
   (define-alien-routine jit-memcpy
     void
@@ -136,35 +140,27 @@
     (src (* char))
     (char signed))
 
+  (define-alien-routine jit-copy-code-constants
+    void
+    (dst unsigned)
+    (src unsigned))
+
   (defun (setf sap-ref-word-jit) (value sap offset)
     (jit-patch (+ (sap-int sap) offset) value))
 
-  (defun (setf signed-sap-ref-32-jit) (value sap offset)
-    (jit-patch-int (+ (sap-int sap) offset) value))
-
-  (defun signed-sap-ref-32-jit (sap offset)
-    (signed-sap-ref-32 sap offset))
-
-  (defun (setf sap-ref-32-jit) (value sap offset)
-    (jit-patch-uint (+ (sap-int sap) offset) value))
-
-  (defun sap-ref-32-jit (sap offset)
-    (sap-ref-32 sap offset))
-
-  (defun (setf sap-ref-8-jit) (value sap offset)
-    (jit-patch-uchar (+ (sap-int sap) offset) value))
-
   (defun (setf code-header-ref) (value code index)
     (with-pinned-objects (code value)
-      (jit-patch (+ (get-lisp-obj-address code)
-                    (- other-pointer-lowtag)
-                    (* index n-word-bytes))
-                 (get-lisp-obj-address value)))
-    value)
+      (jit-patch-code (get-lisp-obj-address code)
+                      (get-lisp-obj-address value)
+                      index))
+    value))
 
-  (defun (setf %code-debug-info) (value code)
-    (with-pinned-objects (code value)
-      (jit-patch (+ (get-lisp-obj-address code)
-                    (- other-pointer-lowtag)
-                    (* code-debug-info-slot n-word-bytes))
-                 (get-lisp-obj-address value)))))
+(defconstant n-bit 31)
+(defconstant z-bit 30)
+(defconstant c-bit 29)
+(defconstant v-bit 28)
+
+(defun context-overflow-carry-flags (context)
+  (let ((flags (context-flags context)))
+    (values (logbitp v-bit flags)
+            (logbitp c-bit flags))))

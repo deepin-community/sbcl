@@ -1,9 +1,14 @@
-Description: Fix build on kfreebsd-*
-Author: Christoph Egger <christoph@debian.org>
-Forwarded: no
-Last-Update: 2018-04-07
+From: Christoph Egger <christoph@debian.org>
+Date: Sat, 7 Apr 2018 00:00:00 +0000
+Subject: Fix build on kfreebsd-*
+
 ---
-This patch header follows DEP-3: http://dep.debian.net/deps/dep3/
+ src/runtime/Config.x86-64-gnu-kfreebsd | 4 ++--
+ src/runtime/thread.c                   | 2 +-
+ 2 files changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/src/runtime/Config.x86-64-gnu-kfreebsd b/src/runtime/Config.x86-64-gnu-kfreebsd
+index 6fd4cdd..5bc5b6c 100644
 --- a/src/runtime/Config.x86-64-gnu-kfreebsd
 +++ b/src/runtime/Config.x86-64-gnu-kfreebsd
 @@ -19,6 +19,6 @@ OS_LIBS += -lutil -ldl -Wl,-no-as-needed
@@ -15,9 +20,11 @@ This patch header follows DEP-3: http://dep.debian.net/deps/dep3/
 +  OS_LIBS += -lpthread
 +  #OS_LIBS += -lthr
  endif
+diff --git a/src/runtime/thread.c b/src/runtime/thread.c
+index 3862ab4..a67d374 100644
 --- a/src/runtime/thread.c
 +++ b/src/runtime/thread.c
-@@ -706,7 +706,7 @@ static void attach_os_thread(init_thread
+@@ -789,7 +789,7 @@ static void attach_os_thread(init_thread_data *scribble)
  # else
      pthread_attr_t attr;
      pthread_attr_init(&attr);

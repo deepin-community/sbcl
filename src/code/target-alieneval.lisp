@@ -155,8 +155,8 @@ This is SETFable."
                                  (foreign-symbol-sap ,initial-value ,datap) 0 ,alien-type)))
                            ,@body)))
                       (:local
-                       (let* ((var (sb-xc:gensym "VAR"))
-                              (initval (if initial-value (sb-xc:gensym "INITVAL")))
+                       (let* ((var (gensym "VAR"))
+                              (initval (if initial-value (gensym "INITVAL")))
                               (info (make-local-alien-info :type alien-type))
                               (inner-body
                                 `((note-local-alien-type ',info ,var)
@@ -262,9 +262,12 @@ Examples:
                    (error
                     "cannot override the size of zero-dimensional arrays"))
                  (when (constantp size)
-                   (setf alien-type (copy-structure alien-type))
-                   (setf (alien-array-type-dimensions alien-type)
-                         (cons (constant-form-value size) (cdr dims)))))
+                   (setf alien-type
+                         (make-alien-array-type
+                          :dimensions (cons (constant-form-value size) (cdr dims))
+                          :element-type (alien-array-type-element-type alien-type)
+                          :bits (alien-type-bits alien-type)
+                          :alignment (alien-type-alignment alien-type)))))
                 (dims
                  (setf size (car dims)))
                 (t
@@ -715,7 +718,7 @@ type specifies the argument and result types."
        (let ((stub (alien-fun-type-stub type)))
          (unless stub
            (setf stub
-                 (let ((fun (sb-xc:gensym "FUN"))
+                 (let ((fun (gensym "FUN"))
                        (parms (make-gensym-list (length args))))
                    (compile nil
                             `(lambda (,fun ,@parms)
@@ -787,38 +790,41 @@ way that the argument is passed.
               (arg-types) (alien-vars)
               (alien-args) (results))
       (dolist (arg args)
-        (if (stringp arg)
-            (docs arg)
-            (destructuring-bind (name type &optional (style :in)) arg
-              (unless (member style '(:in :copy :out :in-out))
-                (error "bogus argument style ~S in ~S" style arg))
-              (when (and (member style '(:out :in-out))
-                         (typep (parse-alien-type type lexenv)
-                                'alien-pointer-type))
-                (error "can't use :OUT or :IN-OUT on pointer-like type:~%  ~S"
-                       type))
-              (let (arg-type)
-                (cond ((eq style :in)
-                       (setq arg-type type)
-                       (alien-args name))
-                      (t
-                       (setq arg-type `(* ,type))
-                       (if (eq style :out)
-                           (alien-vars `(,name ,type))
-                           (alien-vars `(,name ,type ,name)))
-                       (alien-args `(addr ,name))))
-                (arg-types arg-type)
-                (unless (eq style :out)
-                  (lisp-args name)
-                  (lisp-arg-types t
-                                  ;; FIXME: It should be something
-                                  ;; like `(ALIEN ,ARG-TYPE), except
-                                  ;; for we also accept SAPs where
-                                  ;; pointers are required.
-                                  )))
-              (when (or (eq style :out) (eq style :in-out))
-                (results name)
-                (lisp-result-types `(alien ,type))))))
+        (cond ((stringp arg)
+               (docs arg))
+              ((eq arg '&optional)
+               (arg-types arg))
+              (t
+               (destructuring-bind (name type &optional (style :in)) arg
+                 (unless (member style '(:in :copy :out :in-out))
+                   (error "bogus argument style ~S in ~S" style arg))
+                 (when (and (member style '(:out :in-out))
+                            (typep (parse-alien-type type lexenv)
+                                   'alien-pointer-type))
+                   (error "can't use :OUT or :IN-OUT on pointer-like type:~%  ~S"
+                          type))
+                 (let (arg-type)
+                   (cond ((eq style :in)
+                          (setq arg-type type)
+                          (alien-args name))
+                         (t
+                          (setq arg-type `(* ,type))
+                          (if (eq style :out)
+                              (alien-vars `(,name ,type))
+                              (alien-vars `(,name ,type ,name)))
+                          (alien-args `(addr ,name))))
+                   (arg-types arg-type)
+                   (unless (eq style :out)
+                     (lisp-args name)
+                     (lisp-arg-types t
+                                     ;; FIXME: It should be something
+                                     ;; like `(ALIEN ,ARG-TYPE), except
+                                     ;; for we also accept SAPs where
+                                     ;; pointers are required.
+                                     )))
+                 (when (or (eq style :out) (eq style :in-out))
+                   (results name)
+                   (lisp-result-types `(alien ,type)))))))
       `(progn
          ;; The theory behind this automatic DECLAIM is that (1) if
          ;; you're calling C, static typing is what you're doing
@@ -826,7 +832,13 @@ way that the argument is passed.
          ;; alien values) both messy to do by hand and very important
          ;; for performance of later code which uses the return value.
          (declaim (ftype (function ,(lisp-arg-types)
-                                   (values ,@(lisp-result-types) &optional))
+                                   ;; c-string also accepts aliens and
+                                   ;; byte-arrays, but on output it
+                                   ;; produces strings.
+                                   (values ,@(substitute '(or simple-string null)
+                                                         '(alien c-string)
+                                                         (lisp-result-types)
+                                                         :test #'equal) &optional))
                          ,lisp-name))
          (defun ,lisp-name ,(lisp-args)
            ,@(docs)
@@ -854,3 +866,14 @@ way that the argument is passed.
 
 (defun alien-void-type-p (type)
   (and (alien-values-type-p type) (not (alien-values-type-values type))))
+
+;;; Assert that two important types aren't messed up
+(eval-when (:compile-toplevel)
+  (flet ((check-size (tag)
+           (let ((alien-type (parse-alien-type `(struct ,tag) nil)))
+             (unless (= (alien-type-bits alien-type)
+                        (* (symbol-value (package-symbolicate "SB-UNIX" "SIZEOF-" tag))
+                           sb-vm:n-byte-bits))
+               (error "(STRUCT ~S) has unexpected size" tag)))))
+    (check-size 'sb-unix::timespec)
+    (check-size 'sb-unix::timeval)))

@@ -6,10 +6,10 @@
 (in-package #:sb-sprof)
 
 (defconstant +alloc-region-size+
-  #-gencgc
+  #-generational
   sb-c:+backend-page-bytes+
-  #+gencgc
-  (max sb-vm:gencgc-alloc-granularity sb-vm:gencgc-card-bytes))
+  #+generational
+  (max sb-vm:gencgc-alloc-granularity sb-vm:gencgc-page-bytes))
 
 (deftype report-type ()
   '(member nil :flat :graph))

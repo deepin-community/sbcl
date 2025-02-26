@@ -14,10 +14,14 @@ ARCH_SRC = x86-64-arch.c
 OS_SRC = haiku-os.c x86-64-haiku-os.c
 
 LINKFLAGS += -Wl,--export-dynamic
-OS_LIBS += -lbe -lnetwork
+OS_LIBS += -lbe -lnetwork -lbsd
 
 ifdef LISP_FEATURE_SB_THREAD
   OS_LIBS += -lpthread
+endif
+
+ifdef LISP_FEATURE_SB_CORE_COMPRESSION
+  OS_LIBS += -lzstd
 endif
 
 CFLAGS += -Wunused-parameter -fno-omit-frame-pointer -momit-leaf-frame-pointer -gdwarf-2
@@ -28,7 +32,7 @@ CFLAGS += -Wunused-parameter -fno-omit-frame-pointer -momit-leaf-frame-pointer -
 DISABLE_PIE=no
 
 ifdef LISP_FEATURE_IMMOBILE_SPACE
-  GC_SRC = fullcgc.c gencgc.c traceroot.c immobile-space.c elf.c
+  GC_SRC = fullcgc.c gencgc.c traceroot.c immobile-space.c
 else
   GC_SRC = fullcgc.c gencgc.c traceroot.c
 endif
@@ -37,7 +41,3 @@ ifdef LISP_FEATURE_SB_LINKABLE_RUNTIME
   LIBSBCL = sbcl.o
   USE_LIBSBCL = sbcl.o
 endif
-
-# Nothing to do for after-grovel-headers.
-.PHONY: after-grovel-headers
-after-grovel-headers:

@@ -9,7 +9,7 @@
 ;;;; absolutely no warranty. See the COPYING and CREDITS files for
 ;;;; more information.
 
-#+interpreter (sb-ext:exit :code 104)
+#+interpreter (invoke-restart 'run-tests::skip-file)
 
 (with-test (:name :heap)
   (let* ((size 1000)
@@ -87,7 +87,7 @@
 
 (with-test (:name (:timer :relative)
             :fails-on (and :sparc :linux)
-            :skipped-on :win32)
+            :skipped-on (or :win32 :gc-stress))
   (let* ((has-run-p nil)
          (timer (make-timer (lambda () (setq has-run-p t))
                             :name "simple timer")))
@@ -100,7 +100,7 @@
 
 (with-test (:name (:timer :absolute)
             :fails-on (and :sparc :linux)
-            :skipped-on :win32)
+            :skipped-on (or :win32 :gc-stress))
   (let* ((has-run-p nil)
          (timer (make-timer (lambda () (setq has-run-p t))
                             :name "simple timer")))
@@ -177,7 +177,8 @@
            (sb-ext:with-timeout 0.2
              (sleep 1)))))
 
-(with-test (:name (:with-timeout :fall-through) :skipped-on :win32)
+(with-test (:name (:with-timeout :fall-through)
+            :skipped-on (or :win32 :gc-stress))
   (assert (not (raises-timeout-p
                 (sb-ext:with-timeout 0.3
                   (sleep 0.1))))))

@@ -1,8 +1,10 @@
 kfreebsd-pthread-futex.patch
 disable-version-build.patch
 testsuite-homedir.patch
-armhf-is-not-v5.patch
 disable-timer-test.patch
 skip-some-autopkgtests.patch
 disable-fcb-threads-test.patch
 fix-chill-test.patch
+disable-genheaders.test.sh-under-autopkgtest.patch
+Exclude-Debian-specific-stage1-from-whitespace-canonicali.patch
+Enable-debug-printing-in-WASTE-HEAP-test.patch

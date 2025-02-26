@@ -62,7 +62,7 @@
 
     (test-case 1.1s0 'complex                                      #C(1.1s0 .0s0)   t)
     (test-case 1.1s0 '(complex real)                               #C(1.1s0 .0s0)   t)
-    (test-case 1.1s0 '(complex (real 1))                           nil              t)
+    (test-case 1.1s0 '(complex (real 1))                           #C(1.1s0 0s0)    t)
     (test-case 1.1s0 '(complex rational)                           nil              t)
     (test-case 1.1s0 '(complex (rational 1))                       nil              t)
     (test-case 1.1s0 '(complex (or (rational -3 -2) (rational 1))) nil              t)
@@ -70,7 +70,7 @@
     (test-case 1.1s0 '(complex double-float)                       (coerce #C(1.1s0 .0s0) '(complex double-float)))
     (test-case 1.1s0 '(complex single-float)                       #C(1.1s0 .0s0))
     (test-case 1.1s0 '(complex integer)                            nil              t)
-    (test-case 1.1s0 '(complex (or (real 1) (integer -1 0)))       nil              t)
+    (test-case 1.1s0 '(complex (or (real 1) (integer -1 0)))       #C(1.1s0 0s0)    t)
 
     (test-case   1/2 'complex                                      1/2              t)
     (test-case   1/2 '(complex real)                               1/2              t)
@@ -121,9 +121,9 @@
   ;; But at least it's generally an improvement
   ;; to fail earlier than later in many cases.
   (multiple-value-bind (fun failure-p warnings)
-      (checked-compile '(lambda ()
+      (checked-compile '(lambda (z)
                          (locally (declare (notinline sort))
-                           (sort () #'< :key 'and)))
+                           (sort () z :key 'and)))
                        :allow-warnings t)
     (declare (ignore failure-p))
     (assert (= 1 (length warnings)))

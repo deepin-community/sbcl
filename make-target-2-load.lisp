@@ -6,9 +6,23 @@
 (defvar *compile-files-p* nil)
 (load (merge-pathnames "src/cold/warm.lisp" *load-pathname*))
 
+;; sb-xref-for-internals is actively harmful to tree-shaking.
+;; Remove some symbols to make the hide-packages test pass.
+#+(and sb-xref-for-internals (not sb-devel))
+(progn
+  (fmakunbound 'sb-kernel::type-class-fun-slot)
+  (fmakunbound 'sb-kernel::new-ctype))
+
+(sb-impl::!recompile-globaldb-checkfuns)
+
+;;; Users don't want to know if there are multiple TLABs per se, but they do want
+;;; to know if NEW-ARENA returns an arena, so give them a sensible feature name.
+#+system-tlabs (push :arena-allocator *features*)
+
 ;;; Remove symbols from CL:*FEATURES* that should not be exposed to users.
 (export 'sb-impl::+internal-features+ 'sb-impl)
-(let* ((non-target-features
+(let* (#-sb-devel
+       (non-target-features
         ;;
         ;; FIXME: I suspect that this list should be changed to its inverse-
         ;; features that _SHOULD_ go into SB-IMPL:+INTERNAL-FEATURES+ and
@@ -35,10 +49,19 @@
           ;; more-or-less confined to serve-event, except for a test which now
           ;; detects whether COMPUTE-POLLFDS is defined and therefore testable.
           :OS-PROVIDES-POLL
+          ;; Silly feature we add in because additive features are more sensible
+          ;; than subtractive ones. So you opt out, not in, to having *LOAD-TRUENAME*
+          ;; eagerly bound.
+          :ANSI-COMPLIANT-LOAD-TRUENAME
           ;; The final batch of symbols is strictly for C. The LISP_FEATURE_
           ;; prefix on the corresponding #define is unfortunate.
           :GCC-TLS :USE-SYS-MMAP
-          :OS-PROVIDES-BLKSIZE-T)")) ; only for 'src/runtime/wrap.h'
+          ;;; Enforce using of posix semaphores on Darwin instead of dispatch.
+          :USE-DARWIN-POSIX-SEMAPHORES
+          ;; only for 'src/runtime/wrap.h'
+          :OS-PROVIDES-BLKSIZE-T
+          ;; only for src/runtime/run-program.c
+          :OS-PROVIDES-CLOSE-RANGE-WRAPPER)"))
        (public-features
         (cons
          sb-impl::!sbcl-architecture
@@ -51,7 +74,8 @@
            :MACH-O :ELF ; obj file format: pick zero or one
            ;; I would argue that this should not be exposed,
            ;; but I would also anticipate blowback from removing it.
-           :CHENEYGC :GENCGC ; GC: pick one and only one
+           :GENCGC :MARK-REGION-GC ; GC: pick one and only one
+           :ARENA-ALLOCATOR :ALLOCATION-SIZE-HISTOGRAM
            ;; Can't use s-l-a-d :compression safely without it
            :SB-CORE-COMPRESSION
            ;; Features that are also in *FEATURES-POTENTIALLY-AFFECTING-FASL-FORMAT*
@@ -70,36 +94,14 @@
            :PACKAGE-LOCAL-NICKNAMES
            ;; Developer mode features. A release build will never have them,
            ;; hence it makes no difference whether they're public or not.
-           :METASPACE
-           :SB-FLUID :SB-DEVEL :SB-DEVEL-LOCK-PACKAGES)")))
+           :SB-DEVEL :SB-DEVEL-LOCK-PACKAGES)")))
+       #-sb-devel
        (removable-features
         (append non-target-features public-features)))
   (defconstant sb-impl:+internal-features+
-    ;;; Well, who would have guessed that our internal features list would nicely
-    ;;; repair damage induced by ASDF, namely: ASDF removes features when loaded.
-    ;;; Take a look at (DEFUN DETECT-OS) in uiop.lisp if you don't believe it,
-    ;;; and watch it in action after (require "ASDF") -
-    ;;;
-    ;;; * *FEATURES* =>
-    ;;; (:X86-64 :64-BIT :ANSI-CL :COMMON-LISP :ELF :GENCGC :HAIKU :IEEE-FLOATING-POINT
-    ;;; :LITTLE-ENDIAN :PACKAGE-LOCAL-NICKNAMES :SB-LDB
-    ;;; :SB-PACKAGE-LOCKS :SB-UNICODE :SBCL :UNIX)
-    ;;;
-    ;;; * (require :asdf)
-    ;;; ("ASDF" "asdf" "UIOP" "uiop")
-    ;;; * *FEATURES*
-    ;;; (:ASDF3.3 :ASDF3.2 :ASDF3.1 :ASDF3 :ASDF2 :ASDF :OS-UNIX
-    ;;; :NON-BASE-CHARS-EXIST-P :ASDF-UNICODE :X86-64 :64-BIT :ANSI-CL :COMMON-LISP
-    ;;; :ELF :GENCGC :IEEE-FLOATING-POINT :LITTLE-ENDIAN :PACKAGE-LOCAL-NICKNAMES
-    ;;; :SB-LDB :SB-PACKAGE-LOCKS :SB-UNICODE :SBCL :UNIX)
-    ;;;
-    ;;; So, what the heck happened to :HAIKU? It's gone.
-    ;;; Well this is pure evil. Just madness.
-    ;;; However, by stashing an extra copy of :HAIKU in the internal feature list,
-    ;;; we can stuff it back in because our contrib builder first loads ASDF
-    ;;; and then rebinds *FEATURES* with the union of the internal ones.
-    (append #+haiku '(:haiku)
-            (remove-if (lambda (x) (member x removable-features)) *features*)))
+            (remove-if (lambda (x) (member x #+sb-devel public-features
+                                             #-sb-devel removable-features))
+                       *features*))
   (setq *features* (remove-if-not (lambda (x) (member x public-features))
                                   *features*)))
 
@@ -112,7 +114,7 @@
 ;;; uninterned.
 ;;; Additionally, you can specify an arbitrary way to destroy
 ;;; random bootstrap stuff on per-package basis.
-(defun !unintern-init-only-stuff (&aux result)
+(defun !unintern-init-only-stuff ()
   (dolist (package (list-all-packages))
     (sb-int:awhen (find-symbol "!REMOVE-BOOTSTRAP-SYMBOLS" package)
       (funcall sb-int:it)))
@@ -129,21 +131,34 @@
                  (memq symbol
                        '(sb-c::sb-pcl sb-c::sb-impl sb-c::sb-kernel
                          sb-c::sb-c sb-c::sb-int))))))
+    ;; Delete bootstrap-only vops
+    (flet ((drop-keys (table)
+             (loop for symbol being each hash-key of table
+                   when (uninternable-p symbol) do (remhash symbol table))))
+      (drop-keys sb-c::*backend-parsed-vops*)
+      (drop-keys sb-c::*backend-template-names*))
     ;; A structure constructor name, in particular !MAKE-SAETP,
     ;; can't be uninterned if referenced by a defstruct-description.
     ;; So loop over all structure classoids and clobber any
     ;; symbol that should be uninternable.
-    (maphash (lambda (classoid wrapper)
+    (maphash (lambda (classoid layout)
                (when (structure-classoid-p classoid)
-                 (let ((dd (wrapper-%info wrapper)))
+                 (let ((dd (layout-%info layout)))
                    (setf (dd-constructors dd)
                          (delete-if (lambda (x)
                                       (and (consp x) (uninternable-p (car x))))
                                     (dd-constructors dd))))))
              (classoid-subclasses (find-classoid t)))
+
+    (loop for type in '(pathname ;; PATHNAME is not a structure-classoid
+                        sb-c:storage-class
+                        sb-c:storage-base)
+          do
+          (setf (sb-kernel:dd-constructors (sb-kernel:find-defstruct-description type))
+                nil))
     ;; Todo: perform one pass, then a full GC, then a final pass to confirm
     ;; it worked. It should be an error if any uninternable symbols remain,
-    ;; but at present there are about 13 other "!" symbols with referrers.
+    ;; but at present there are about 7 symbols with referrers.
     (with-package-iterator (iter (list-all-packages) :internal :external)
       (loop (multiple-value-bind (winp symbol accessibility package) (iter)
               (declare (ignore accessibility))
@@ -157,23 +172,26 @@
                 ;; with non-cold-init lambdas. Though the cold-init function is
                 ;; never called post-build, it is not discarded. Also, I suspect
                 ;; that the following loop should print nothing, but it does:
-#|
-                (sb-vm:map-allocated-objects
-                  (lambda (obj type size)
-                    (declare (ignore size))
-                    (when (= type sb-vm:code-header-widetag)
-                      (let ((name (sb-c::debug-info-name
-                                   (sb-kernel:%code-debug-info obj))))
-                        (when (and (stringp name) (search "COLD-INIT-FORMS" name))
-                          (print obj)))))
-                  :dynamic)
-|#
+                #|
+                (sb-vm:map-allocated-objects ;
+                (lambda (obj type size) ;
+                (declare (ignore size)) ;
+                (when (= type sb-vm:code-header-widetag) ;
+                (let ((name (sb-c::debug-info-name ;
+                (sb-kernel:%code-debug-info obj)))) ;
+                (when (and (stringp name) (search "COLD-INIT-FORMS" name)) ;
+                (print obj)))))         ;
+                :dynamic)               ;
+                |#
                 (fmakunbound symbol)
                 (unintern symbol package))))))
   (sb-int:dohash ((k v) sb-c::*backend-parsed-vops*)
     (declare (ignore k))
     (setf (sb-c::vop-parse-body v) nil))
-  result)
+  ;; Used for inheriting from other VOPs, not needed in the target.
+  (setf sb-c::*backend-parsed-vops* (make-hash-table))
+  nil)
+
 
 ;;; Check for potentially bad format-control strings
 (defun scan-format-control-strings ()
@@ -205,22 +223,17 @@
        :all)
       (when wps
         (dolist (wp wps)
-          (format t "Found string ~S~%" (weak-pointer-value wp)))
+          (sb-int:binding* ((v (weak-pointer-value wp) :exit-if-null))
+            (format t "Found string ~S~%" v)))
         (warn "Potential problem with format-control strings.
 Please check that all strings which were not recognizable to the compiler
 (as the first argument to WARN, etc.) are wrapped in SB-FORMAT:TOKENS"))
       wps)))
 
-;;; Either set some more package docstrings, or remove any and all docstrings
-;;; that snuck in (as can happen with any file compiled in warm load)
-;;; depending on presence of the :sb-doc internal feature.
-(if (member :sb-doc sb-impl:+internal-features+)
-  (setf (documentation (find-package "COMMON-LISP") t)
-        "public: home of symbols defined by the ANSI language specification"
-        (documentation (find-package "COMMON-LISP-USER") t)
-        "public: the default package for user code and data"
-        (documentation (find-package "KEYWORD") t)
-        "public: home of keywords")
+;;; If the SB-DOC internal feature is not present, remove any and all
+;;; docstrings that snuck in (as can happen with any file compiled in
+;;; warm load).
+(unless (member :sb-doc sb-impl:+internal-features+)
   (let ((count 0))
     (macrolet ((clear-it (place)
                  `(when ,place
@@ -258,6 +271,17 @@ Please check that all strings which were not recognizable to the compiler
       (format t "~&Removed ~D doc string~:P" count)))
 )
 
+#+sb-core-compression
+(defun compress-debug-info (code)
+  (let ((info (sb-c::%code-debug-info code)))
+    (when (typep info 'sb-c::compiled-debug-info)
+      (let ((map (sb-c::compiled-debug-info-fun-map info)))
+        (when (typep map '(simple-array (unsigned-byte 8) (*)))
+          (sb-alien:with-alien ((compress-vector (function int unsigned size-t) :extern))
+            (sb-sys:with-pinned-objects (map)
+              (sb-alien:alien-funcall compress-vector
+                                      (sb-kernel:get-lisp-obj-address map)
+                                      (length map)))))))))
 (progn
   ;; Remove source forms of compiled-to-memory lambda expressions.
   ;; The disassembler is the major culprit for retention of these,
@@ -273,6 +297,8 @@ Please check that all strings which were not recognizable to the compiler
        (when (typep obj 'sb-c::core-debug-source)
          (setf (sb-c::core-debug-source-form obj) nil)))
       (#.sb-vm:code-header-widetag
+       #+sb-core-compression
+       (compress-debug-info obj)
        (dotimes (i (sb-kernel:code-n-entries obj))
          (let ((fun (sb-kernel:%code-entry-point obj i)))
            (when (sb-kernel:%simple-fun-lexpr fun)
@@ -309,28 +335,27 @@ Please check that all strings which were not recognizable to the compiler
 
   ;; Unintern no-longer-needed stuff before the possible PURIFY in
   ;; SAVE-LISP-AND-DIE.
-  #-(or sb-fluid sb-devel) (!unintern-init-only-stuff)
+  #-sb-devel (!unintern-init-only-stuff)
 
-  ;; Mark interned immobile symbols so that COMPILE-FILE knows
-  ;; which symbols will always be physically in immobile space.
-  ;; Due to the possibility of interning a symbol that was allocated in dynamic
-  ;; space, it's not the case that all interned symbols are immobile.
-  ;; And we can't promise anything across reload, which makes it impossible
-  ;; for x86-64 codegen to know which symbols are immediate constants.
-  ;; Except that symbols which existed at SBCL build time must be.
-  (do-all-symbols (symbol)
-    (when (sb-kernel:immobile-space-obj-p symbol)
-      (sb-kernel:logior-header-bits
-       symbol (ash 1 sb-vm::+initial-core-symbol-bit+))))
 
-  ;; A symbol whose INFO slot underwent any kind of manipulation
-  ;; such that it now has neither properties nor globaldb info,
-  ;; can have the slot set back to NIL if it wasn't already.
   (do-all-symbols (symbol)
-    (when (and (sb-kernel:symbol-info symbol)
-               (null (sb-kernel:symbol-info-vector symbol))
+    ;; Don't futz with the header of static symbols.
+    ;; Technically LOGIOR-HEADER-BITS can only be used on an OTHER-POINTER-LOWTAG
+    ;; objects, so modifying NIL should not ever work, but it's especially wrong
+    ;; on ppc64 where OTHER- and LIST- pointer lowtags are 10 bytes apart instead
+    ;; of 8, so this was making a random alteration to the header.
+    (unless (eq (heap-allocated-p symbol) :static)
+      (sb-kernel:logior-header-bits symbol sb-vm::+symbol-initial-core+))
+
+    ;; A symbol whose INFO slot underwent any kind of manipulation
+    ;; such that it now has neither properties nor globaldb info,
+    ;; can have the slot set back to NIL if it wasn't already.
+    (when (and (sb-kernel:symbol-%info symbol) ; "raw" value is something
+               ;; but both "cooked" values are empty
+               (null (sb-kernel:symbol-dbinfo symbol))
                (null (symbol-plist symbol)))
-      (setf (sb-kernel:symbol-info symbol) nil)))
+      (sb-sys:%primitive sb-c:set-slot symbol nil
+                         'make-symbol sb-vm:symbol-info-slot sb-vm:other-pointer-lowtag)))
 )
 
 (sb-ext:gc :full t)
@@ -351,9 +376,6 @@ Please check that all strings which were not recognizable to the compiler
 
 ;;; The system is complete now, all standard functions are
 ;;; defined.
-;;; The call to CTYPE-OF-CACHE-CLEAR is probably redundant.
-;;; SAVE-LISP-AND-DIE calls DEINIT which calls DROP-ALL-HASH-CACHES.
-(sb-kernel::ctype-of-cache-clear)
 
 ;;; In case there is xref data for internals, repack it here to
 ;;; achieve a more compact encoding.
@@ -390,12 +412,19 @@ Please check that all strings which were not recognizable to the compiler
                        (sb-impl::package-external-symbol-count x)
                        (sb-impl::package-internal-symbol-count x)))
                (sort (list-all-packages) #'string< :key 'package-name))))
+  #-sb-devel
+  ;; Remove inline expansions
+  (do-symbols (symbol #.(find-package "SB-C"))
+    (when (equal (symbol-package symbol) #.(find-package "SB-C"))
+      (sb-int:clear-info :function :inlining-data symbol)
+      (sb-int:clear-info :function :inlinep symbol)))
   (sb-impl::shake-packages
    ;; Development mode: retain all symbols with any system-related properties
    #+sb-devel
    (lambda (symbol accessibility)
      (declare (ignore accessibility))
-     (or (sb-kernel:symbol-info symbol)
+     (or (sb-kernel:symbol-%info symbol)
+         (sb-kernel:%symbol-function symbol)
          (and (boundp symbol) (not (keywordp symbol)))))
    ;; Release mode: retain all symbols satisfying this intricate test
    #-sb-devel
@@ -404,28 +433,40 @@ Please check that all strings which were not recognizable to the compiler
       (#.(find-package "SB-VM")
        (or (eq accessibility :external)
            ;; overapproximate what we need for contribs and tests
-           (member symbol '(sb-vm::map-referencing-objects
+           (member symbol `(sb-vm::map-referencing-objects
                             sb-vm::map-stack-references
                             sb-vm::reconstitute-object
+                            sb-vm::points-to-arena
                             ;; need this for defining a vop which
                             ;; tests the x86-64 allocation profiler
                             sb-vm::pseudo-atomic
+                            ,@(or #+(or x86 x86-64) '(sb-vm::%vector-cas-pair
+                                                      sb-vm::%instance-cas-pair
+                                                      sb-vm::%cons-cas-pair))
                             ;; Naughty outside-world code uses these.
                             #+x86-64 sb-vm::reg-in-size))
            (let ((s (string symbol))) (and (search "THREAD-" s) (search "-SLOT" s)))
            (search "-OFFSET" (string symbol))
            (search "-TN" (string symbol))))
-      ((#.(find-package "SB-C")
-        #.(find-package "SB-ASSEM")
-        #.(find-package "SB-DISASSEM")
-        #.(find-package "SB-IMPL")
-        #.(find-package "SB-UNIX")
-        #.(find-package "SB-PCL")
-        #.(find-package "SB-MOP")
-        #.(find-package "SB-PRETTY")
-        #.(find-package "SB-KERNEL"))
+      (#.(find-package "SB-ALIEN")
+       (or (eq accessibility :external) (eq symbol 'sb-alien::alien-callback-p)))
+      (#.(mapcar 'find-package
+                 '("SB-ASSEM" "SB-BROTHERTREE" "SB-DISASSEM" "SB-FORMAT"
+                   "SB-IMPL" "SB-KERNEL" "SB-MOP" "SB-PCL" "SB-PRETTY" "SB-PROFILE"
+                   "SB-REGALLOC" "SB-SYS" "SB-UNICODE" "SB-UNIX" "SB-WALKER"))
        ;; Assume all and only external symbols must be retained
-       (eq accessibility :external))
+         (eq accessibility :external))
+      (#.(find-package "SB-C")
+       (or (eq accessibility :external)
+           (member symbol '(sb-c::tab sb-c::scramble))))
+      (#.(find-package "SB-LOOP")
+       (or (eq accessibility :external)
+           ;; Retain some internals to keep CLSQL working.
+           (member symbol '(sb-loop::*loop-epilogue*
+                            sb-loop::add-loop-path))))
+      (#.(find-package "SB-LOCKLESS")
+       (or (eq accessibility :external)
+           (member symbol '(sb-lockless::+hash-nbits+)))) ; for a test
       (#.(find-package "SB-THREAD")
        (or (eq accessibility :external)
            ;; for some reason a recent change caused the tree-shaker to drop MAKE-SPINLOCK
@@ -439,16 +480,20 @@ Please check that all strings which were not recognizable to the compiler
        (and (eq accessibility :external)
             (constantp symbol)))
       (#.(find-package "SB-BIGNUM")
-       ;; There are 2 important external symbols for sb-gmp.
+       ;; There are 2 important external symbols for sb-gmp, and 2
+       ;; important external symbols for sb-rotate-byte.
        ;; Other externals can disappear.
        (member symbol '(sb-bignum:%allocate-bignum
+                        sb-bignum:maximum-bignum-length
+                        sb-bignum:bit-index
                         sb-bignum:make-small-bignum)))
       (t
        (if (eq (symbol-package symbol)
                sb-assem::*backend-instruction-set-package*)
            (or (eq accessibility :external) (asm-inst-p symbol))
            ;; By default, retain any symbol with any attachments
-           (or (sb-kernel:symbol-info symbol)
+           (or (sb-kernel:symbol-%info symbol)
+               (sb-kernel:%symbol-function symbol)
                (and (boundp symbol) (not (keywordp symbol))))))))
    :verbose nil :print nil)
   (unintern 'sb-impl::shake-packages 'sb-impl)
@@ -462,6 +507,8 @@ Please check that all strings which were not recognizable to the compiler
              (delta-int (- int (caddr entry))))
         (incf sum-delta-ext delta-ext)
         (incf sum-delta-int delta-int)
+        (assert (<= delta-ext 0))
+        (assert (<= delta-int 0))
         (format t "~20a | ~5d (~5@d) | ~5d (~5@d)~%"
                 (package-name (car entry))
                 ext delta-ext int delta-int)))
@@ -470,6 +517,26 @@ Please check that all strings which were not recognizable to the compiler
             (+ sum-delta-ext sum-delta-int))))
 
 (scan-format-control-strings)
+
+(macrolet ((def-backward-compatible-sb-c-specials (pairs) ; for UIOP + ASDF
+             `(progn
+                ,@(mapcar (lambda (pair)
+                            `(define-symbol-macro ,(car pair)
+                                 (,(sb-int:package-symbolicate "SB-C" "CU-" (cdr pair) "-COUNT")
+                                   sb-c::*compilation-unit*)))
+                          pairs))))
+  ;; coece to a strict boolean
+  (define-symbol-macro sb-c::*in-compilation-unit* (not (null sb-c::*compilation-unit*)))
+  ;; the "specials" are all SETFable when and only when *IN-COMPILATION-UNIT* is T
+  (def-backward-compatible-sb-c-specials
+      sb-c::((*aborted-compilation-unit-count* . "ABORTED")
+             (*compiler-error-count* . "ERROR")
+             (*compiler-warning-count*  . "WARNING")
+             (*compiler-style-warning-count* . "STYLE-WARNING")
+             (*compiler-note-count* . "NOTE"))))
+
+#+sb-devel
+(rename-package "COMMON-LISP" "COMMON-LISP" '("SB-XC" "CL"))
 
 ;;; Lock internal packages
 #-(and sb-devel
@@ -489,64 +556,3 @@ Please check that all strings which were not recognizable to the compiler
 
 ;; See comments in 'readtable.lisp'
 (setf (readtable-base-char-preference *readtable*) :symbols)
-
-#+sb-devel
-(sb-impl::%enter-new-nicknames (find-package :cl) '("SB-XC" "CL"))
-"done with warm.lisp, about to SAVE-LISP-AND-DIE"
-
-#|
-This is the actual "name" of a toplevel code component that gets dumped to fasl
-when compiling src/pcl/boot. Not only does it contain a format control string in
-its raw representation, this is a complete and utter waste of time to dump.
-We really ought to try a LOT harder not to produce such garbage metadata:
-
-* (progn (terpri)
-   (write (sb-c::compiled-debug-fun-toplevel-name
-           (elt (sb-c::compiled-debug-info-fun-map *cdi*) 0))
-          :level nil :length nil))
-
-(SB-C::TOP-LEVEL-FORM
- (LABELS ((WARN-PARSE (SPECIALIZER &OPTIONAL CONDITION)
-            (STYLE-WARN "~@<Cannot parse specializer ~S in ~S~@[: ~A~].~@:>"
-                        SPECIALIZER # CONDITION))
-          (WARN-FIND (CONDITION NAME PROTO-GENERIC-FUNCTION PROTO-METHOD)
-            (WARN CONDITION :FORMAT-CONTROL
-                  #<(SIMPLE-BASE-STRING
-                     228) ~@<Cannot find type for specializer ~
-                  ~/sb-ext:print-symbol-with-prefix/ when executing ~S ~
-                  for a ~/sb-impl:print-type-specifier/ of a ~
-                  ~/sb-imp... {1003A2BC8F}>
-                  :FORMAT-ARGUMENTS #))
-          (CLASS-NAME-TYPE-SPECIFIER
-              (NAME PROTO-GENERIC-FUNCTION PROTO-METHOD &OPTIONAL #)
-            (LET #
-              #)))
-   (DEFUN REAL-SPECIALIZER-TYPE-SPECIFIER/SYMBOL
-          (PROTO-GENERIC-FUNCTION PROTO-METHOD SPECIALIZER)
-     (LET (#)
-       (WHEN SPECIALIZER #)))
-   (DEFUN REAL-SPECIALIZER-TYPE-SPECIFIER/T
-          (PROTO-GENERIC-FUNCTION PROTO-METHOD SPECIALIZER)
-     (LET (#)
-       (WHEN SPECIALIZER #)))
-   (DEFUN REAL-SPECIALIZER-TYPE-SPECIFIER/CLASS-EQ-SPECIALIZER
-          (PROTO-GENERIC-FUNCTION PROTO-METHOD SPECIALIZER)
-     (SPECIALIZER-TYPE-SPECIFIER PROTO-GENERIC-FUNCTION PROTO-METHOD
-      (SPECIALIZER-CLASS SPECIALIZER)))
-   (DEFUN REAL-SPECIALIZER-TYPE-SPECIFIER/EQL-SPECIALIZER
-          (PROTO-GENERIC-FUNCTION PROTO-METHOD SPECIALIZER)
-     (DECLARE (IGNORE PROTO-GENERIC-FUNCTION PROTO-METHOD))
-     `(EQL SB-IMPL::COMMA))
-   (DEFUN REAL-SPECIALIZER-TYPE-SPECIFIER/STRUCTURE-CLASS
-          (PROTO-GENERIC-FUNCTION PROTO-METHOD SPECIALIZER)
-     (DECLARE (IGNORE PROTO-GENERIC-FUNCTION PROTO-METHOD))
-     (CLASS-NAME SPECIALIZER))
-   (DEFUN REAL-SPECIALIZER-TYPE-SPECIFIER/SYSTEM-CLASS
-          (PROTO-GENERIC-FUNCTION PROTO-METHOD SPECIALIZER)
-     (DECLARE (IGNORE PROTO-GENERIC-FUNCTION PROTO-METHOD))
-     (CLASS-NAME SPECIALIZER))
-   (DEFUN REAL-SPECIALIZER-TYPE-SPECIFIER/CLASS
-          (PROTO-GENERIC-FUNCTION PROTO-METHOD SPECIALIZER)
-     (LET (#)
-       (WHEN # #)))))
-|#

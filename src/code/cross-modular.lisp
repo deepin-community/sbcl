@@ -45,11 +45,9 @@
       (do-mfuns *tagged-modular-class*)))
   `(progn ,@(forms)))
 
-#.`
-(defun ,(intern (format nil "ASH-LEFT-MOD~D" sb-vm:n-machine-word-bits)
-                "SB-VM")
+(defun #.(intern (format nil "ASH-LEFT-MOD~D" sb-vm:n-machine-word-bits) "SB-VM")
     (integer amount)
-  (ldb (byte ,sb-vm:n-machine-word-bits 0) (ash integer amount)))
+  (ldb (byte #.sb-vm:n-machine-word-bits 0) (ash integer amount)))
 
 #+(or x86 x86-64 arm arm64)
 (defun sb-vm::ash-left-modfx (integer amount)
@@ -82,3 +80,13 @@
   (let ((count (ldb (byte (1- (integer-length sb-vm:n-word-bits)) 0) count)))
     #+big-endian (ash number (- count))
     #+little-endian (logand (ash number count) most-positive-word)))
+
+(defun get-lisp-obj-address (x)
+  (etypecase x
+    (standard-char
+     (dpb (char-code x)
+          (byte (- sb-vm:n-word-bits
+                   sb-vm:n-widetag-bits) sb-vm:n-widetag-bits)
+          sb-vm:character-widetag))
+    (sb-xc:fixnum
+     (ldb (byte sb-vm:n-word-bits 0) (ash x sb-vm:n-fixnum-tag-bits)))))

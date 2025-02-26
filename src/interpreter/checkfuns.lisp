@@ -55,7 +55,7 @@
              (symbol-function pred))))
        (simplify (type)
          (etypecase type
-           ((or named-type numeric-type member-type classoid
+           ((or named-type numeric-union-type member-type classoid
                 character-set-type unknown-type hairy-type
                 alien-type-type #+sb-simd-pack simd-pack-type
                                 #+sb-simd-pack-256 simd-pack-256-type)
@@ -84,17 +84,11 @@
                    (new-opt (mapcar #'simplify old-opt))
                    (old-rest (values-type-rest type))
                    (new-rest (when old-rest (simplify old-rest))))
-              ;; VALUES types that are not fun-types can't have &KEY.
-              (aver (and (null (sb-kernel::values-type-keyp type))
-                         (null (sb-kernel::values-type-keywords type))
-                         (null (sb-kernel::values-type-allowp type))))
               (if (and (every #'eq old-req new-req)
                        (every #'eq old-opt new-opt)
                        (eq old-rest new-rest))
                   type
-                  (make-values-type :required new-req
-                                    :optional new-opt
-                                    :rest new-rest))))
+                  (make-values-type new-req new-opt new-rest))))
            (array-type
             (let* ((original (array-type-element-type type))
                    (new (simplify original)))

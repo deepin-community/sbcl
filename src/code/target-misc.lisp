@@ -119,19 +119,8 @@ the file system."
            (close *dribble-stream*)
            (apply #'install-streams (pop *previous-dribble-streams*)))))
   (values))
-
-;;;; some *LOAD-FOO* variables
-
-(defvar *load-print* nil
-  "the default for the :PRINT argument to LOAD")
-
-(defvar *load-verbose* nil
-  ;; Note that CMU CL's default for this was T, and ANSI says it's
-  ;; implementation-dependent. We choose NIL on the theory that it's
-  ;; a nicer default behavior for Unix programs.
-  "the default for the :VERBOSE argument to LOAD")
-
-;;; DEFmumble helpers
+
+;;;; DEFmumble helpers
 
 (defun %defglobal (name value source-location &optional (doc nil docp))
   (%compiler-defglobal name :always-bound
@@ -171,7 +160,7 @@ the file system."
   (when (and (fboundp name)
              *type-system-initialized*)
     (handler-bind (((satisfies sb-c::handle-condition-p)
-                     #'sb-c::handle-condition-handler))
+                     'sb-c::handle-condition-handler))
       (warn 'redefinition-with-defun :name name :new-function def)))
   (sb-c:%compiler-defun name nil inline-lambda extra-info)
   (setf (fdefinition name) def)
@@ -183,33 +172,54 @@ the file system."
   (sb-c::note-name-defined name :function)
   name)
 
+(defun %defun-specialized-xep (name def specialized-xep specialized-type &optional extra-info)
+  (declare (type function def specialized-xep))
+  (aver (legal-fun-name-p name))
+  (when (and (fboundp name)
+             *type-system-initialized*)
+    (handler-bind (((satisfies sb-c::handle-condition-p)
+                     'sb-c::handle-condition-handler))
+      (warn 'redefinition-with-defun :name name :new-function def)))
+  (let ((xep-name (list* 'specialized-xep name specialized-type)))
+    (sb-c:%compiler-defun name nil nil extra-info specialized-type)
+    (setf (fdefinition xep-name) specialized-xep)
+    (setf-fdefinition def name nil)
+    (sb-c::%set-inline-expansion name nil nil extra-info)
+    (sb-c::note-name-defined name :function))
+  name)
+
+(macrolet
+    ((cast-it ()
+       `(when s
+          #-sb-unicode
+          (if (and (simple-base-string-p s) (ok-space))
+              s
+              (replace (make-string (length s)) s))
+          #+sb-unicode
+          ;; whether a copy is needed depends both on contents and simplicity
+          (let* ((base-p (base-string-p s))
+                 (recast (and (not base-p) (every #'base-char-p s))))
+            (if (and (simple-string-p s) (not recast) (ok-space))
+                s
+                (let ((n (length s)))
+                  ;; I think this could be done with a single allocator
+                  ;; and a length calculation. I don't care to do that.
+                  (replace (if (or base-p recast)
+                               (make-string n :element-type 'base-char)
+                               (make-string n))
+                           s)))))))
+;;; Ensure basicness if possible, and simplicity always
+  (defun possibly-base-stringize (s)
+    (macrolet ((ok-space () 't))
+      (cast-it)))
+;;; As above but copy dynamic-extent or other off-heap lisp strings
+  (defun possibly-base-stringize-to-heap (s)
+    (declare (sb-c::tlab :system))
+    (macrolet ((ok-space () '(or (dynamic-space-obj-p s) (read-only-space-obj-p s))))
+      (cast-it)))
+  ) ; end MACROLET
+
 (in-package "SB-C")
-
-(defun real-function-name (name)
-  ;; Resolve the actual name of the function named by NAME
-  ;; e.g. (setf (name-function 'x) #'car)
-  ;; (real-function-name 'x) => CAR
-  (cond ((not (fboundp name))
-         nil)
-        ((and (symbolp name)
-              (macro-function name))
-         (let ((name (%fun-name (macro-function name))))
-           (and (consp name)
-                (eq (car name) 'macro-function)
-                (cadr name))))
-        (t
-         (%fun-name (fdefinition name)))))
-
-(defun random-documentation (name type)
-  (cdr (assoc type (info :random-documentation :stuff name))))
-
-(defun (setf random-documentation) (new-value name type)
-  (let ((pair (assoc type (info :random-documentation :stuff name))))
-    (if pair
-        (setf (cdr pair) new-value)
-        (push (cons type new-value)
-              (info :random-documentation :stuff name))))
-  new-value)
 
 (defun split-version-string (string)
   (loop with subversion and start = 0
@@ -256,24 +266,3 @@ version 1[.0.0...] or greater."
   (declare (type (or null string) string))
   (push (list string name doc-type) sb-pcl::*!docstrings*)
   string)
-
-(in-package "SB-LOCKLESS")
-(defstruct (list-node
-            (:conc-name nil)
-            (:constructor %make-sentinel-node ())
-            (:copier nil))
-  (%node-next nil))
-
-;;; Specialized list variants will be created for
-;;;  fixnum, integer, real, string, generic "comparable"
-;;; but the node type and list type is the same regardless of key type.
-(defstruct (linked-list
-            (:constructor %make-lfl
-                          (head inserter deleter finder inequality equality))
-            (:conc-name list-))
-  (head       nil :type list-node :read-only t)
-  (inserter   nil :type function :read-only t)
-  (deleter    nil :type function :read-only t)
-  (finder     nil :type function :read-only t)
-  (inequality nil :type function :read-only t)
-  (equality   nil :type function :read-only t))

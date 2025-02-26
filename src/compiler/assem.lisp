@@ -44,8 +44,7 @@
 ;;; the maximum alignment we can guarantee given the object format. If
 ;;; the loader only loads objects 8-byte aligned, we can't do any
 ;;; better than that ourselves.
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  (defconstant max-alignment 5))
+(defconstant max-alignment 5)
 
 (deftype alignment ()
   `(integer 0 ,max-alignment))
@@ -54,7 +53,9 @@
 ;;;; the SEGMENT structure
 
 ;;; This structure holds the state of the assembler.
-(defstruct (segment (:copier nil))
+(defstruct (segment (:constructor make-segment
+                        (&optional run-scheduler (header-skew 0)))
+                    (:copier nil))
   ;; This is a vector where instructions are written.
   ;; It used to be an adjustable array, but we now do the array size
   ;; management manually for performance reasons (as of 2006-05-13 hairy
@@ -139,16 +140,6 @@
   (collect-dynamic-statistics nil))
 (declaim (freeze-type segment))
 (defprinter (segment :identity t))
-
-;;; Record a FIXUP of KIND occurring at the current position in SEGMENT
-(defun sb-c:note-fixup (segment kind fixup)
-  (emit-back-patch
-   segment
-   0
-   (lambda (segment posn)
-     (push (sb-c:make-fixup-note kind fixup
-                                  (- posn (segment-header-skew segment)))
-           (segment-fixup-notes segment)))))
 
 (declaim (inline segment-current-index))
 (defun segment-current-index (segment)
@@ -257,13 +248,13 @@
   ;; (second) instruction.
   ;;
   ;; instructions whose writes this instruction tries to read
-  (read-dependencies (make-sset) :type sset)
+  (read-dependencies (make-sset) :type sset :read-only t)
   ;; instructions whose writes or reads are overwritten by this instruction
-  (write-dependencies (make-sset) :type sset)
+  (write-dependencies (make-sset) :type sset :read-only t)
   ;; instructions which write what we read or write
-  (write-dependents (make-sset) :type sset)
+  (write-dependents (make-sset) :type sset :read-only t)
   ;; instructions which read what we write
-  (read-dependents (make-sset) :type sset))
+  (read-dependents (make-sset) :type sset :read-only t))
 (declaim (freeze-type instruction))
 #+sb-show-assem (defvar *inst-ids* (make-hash-table :test 'eq))
 #+sb-show-assem (defvar *next-inst-id* 0)
@@ -317,9 +308,9 @@
 (defun section-start (section) (car section))
 (defmacro section-tail (section) `(cdr ,section))
 
-(defstruct asmstream
+(defstruct (asmstream (:constructor make-asmstream ())
+                      (:copier nil))
   (data-section (make-section) :read-only t)
-  (indirections-section (make-section) :read-only t)
   (code-section (make-section) :read-only t)
   (elsewhere-section (make-section) :read-only t)
   (data-origin-label (gen-label "data start") :read-only t)
@@ -342,15 +333,15 @@
   ;; can print "in the {x} section" whenever it changes.
   (tracing-state (list nil nil) :read-only t)) ; segment and vop
 (declaim (freeze-type asmstream))
-;;; FIXME: suboptimal since *asmstream* was declaimed earlier because reasons.
-;;; (so we're missing uses of the known type even though the special var is known)
+
+(defvar *asmstream*)
 (declaim (type asmstream *asmstream*))
 
 (defun get-allocation-points (asmstream)
   ;; Convert the label positions to a packed integer
   ;; Utilize PACK-CODE-FIXUP-LOCS to perform compression.
   (awhen (mapcar 'label-posn (asmstream-alloc-points asmstream))
-    (sb-c::pack-code-fixup-locs it nil)))
+    (sb-c:pack-code-fixup-locs it)))
 
 ;;; Insert STMT after PREDECESSOR.
 (defun insert-stmt (stmt predecessor)
@@ -402,7 +393,7 @@
                       (if (label-p old) (cons old new) (nconc old new)))))
           (multiple-value-bind (mnemonic operands)
               (if (consp thing) (values (car thing) (cdr thing)) thing)
-            (unless (member mnemonic '(.align .byte .skip .coverage-mark))
+            (unless (member mnemonic '(.align .byte .skip))
               ;; This automatically gets the .QWORD pseudo-op which we use on x86-64
               ;; to create jump tables, but it's sort of unfortunate that the mnemonic
               ;; is specific to that backend. It should probably be .LISPWORD instead.
@@ -426,43 +417,66 @@
 ;;; or current segment (if machine-encoding). Use ASSEMBLE to change it.
 (defvar *current-destination*)
 
-(defmacro assemble ((&optional dest vop &key labels) &body body
-                    &environment env)
+;;; This formerly had some absolutely bizarre behavior regarding a manually-specified
+;;; list of labels. It was so confusing that I couldn't figure out either what it was
+;;; designed to do, or what it did do, because they certainly weren't the same thing.
+;;; My best guess is that if you needed labels which were not directly at the "spine"
+;;; of the ASSEMBLE form, but nested within, you could force it to call GEN-LABEL
+;;; for you, which is no different from calling GEN-LABEL _outside_ of the ASSEMBLE.
+;;; (Which most people do anyway if they need to)
+;;; But in anything more than a straightfoward usage, the expansion could be wrong.
+;;; For example this fragment calls EMIT-LABEL on the same label instance twice:
+#|
+ (sb-cltl2:macroexpand-all
+  '(assemble ()
+     B
+     (assemble (nil nil :labels (foo))
+       (inst pop rax-tn)
+       B
+       (assemble ()
+         B
+         (wat)))))
+=>
+(LET* ((B (GEN-LABEL)))
+  (SYMBOL-MACROLET ()
+    (EMIT-LABEL B)
+    (LET* ((B (GEN-LABEL)) (FOO (GEN-LABEL)))
+      (SYMBOL-MACROLET ((SB-ASSEM::..INHERITED-LABELS.. (B)))
+        (INST* 'POP RAX-TN)
+        (EMIT-LABEL B)
+        (LET* ()
+          (SYMBOL-MACROLET ((SB-ASSEM::..INHERITED-LABELS.. NIL))
+            (EMIT-LABEL B)
+            (WAT)))))))
+|#
+
+(defmacro assemble ((&optional dest vop) &body body &environment env)
   "Execute BODY (as a progn) with DEST as the current section or segment."
-  (flet ((label-name-p (thing)
-           (and thing (symbolp thing))))
-    (let* ((visible-labels (remove-if-not #'label-name-p body))
-           (inherited-labels
-             (multiple-value-bind (expansion expanded)
-                 (#+sb-xc-host cl:macroexpand
-                  #-sb-xc-host %macroexpand '..inherited-labels.. env)
-               (if expanded (copy-list expansion) nil)))
-           (new-labels
-             (sort (append labels
-                           (set-difference visible-labels
-                                           inherited-labels))
-                   #'string<))
-           (nested-labels
-             (sort (set-difference (append inherited-labels new-labels)
-                                   visible-labels)
-                   #'string<)))
-      (when (intersection labels inherited-labels)
-        (error "duplicate nested labels: ~S"
-               (intersection labels inherited-labels)))
+  (flet ((label-name-p (thing) (typep thing '(and symbol (not null)))))
+    (let ((inherited (multiple-value-bind (expansion expanded)
+                         (#+sb-xc-host cl:macroexpand-1
+                          #-sb-xc-host %macroexpand-1 '..inherited-labels.. env)
+                       (if expanded expansion)))
+          (new-labels (sort (copy-list (remove-if-not #'label-name-p body)) #'string<)))
+      ;; Compare for dups using STRING=. Two reasons to use that rather than EQ:
+      ;; (1) the assembler input is generally string-like - consider that instruction
+      ;;     mnemonics are looked up by string even though written as symbols.
+      ;; (2) the above SORT could yield an unpredictable result across build hosts
+      (unless (= (length (remove-duplicates new-labels :test #'string=))
+                 (length new-labels))
+        (error "Repeated labels in ASSEMBLE body"))
+      (awhen (intersection inherited new-labels)
+        (style-warn "Shadowed asm labels ~S should be renamed not to conflict" it))
       `(let* (,@(when dest
                   `((*current-destination*
                      ,(case dest
                         (:code '(asmstream-code-section *asmstream*))
                         (:elsewhere '(asmstream-elsewhere-section *asmstream*))
-                        (:indirections
-                         '(asmstream-indirections-section *asmstream*))
                         (t dest)))))
               ,@(when vop `((*current-vop* ,vop)))
-              ,@(mapcar (lambda (name)
-                          `(,name (gen-label)))
+              ,@(mapcar (lambda (name) `(,name (gen-label)))
                         new-labels))
-         (symbol-macrolet (,@(when (or inherited-labels nested-labels)
-                               `((..inherited-labels.. ,nested-labels))))
+         (symbol-macrolet ((..inherited-labels.. ,(append inherited new-labels)))
            ,@(mapcar (lambda (form)
                        (if (label-name-p form)
                            `(emit-label ,form)
@@ -1496,49 +1510,32 @@
   (finalize-segment segment))
 
 ;;; The interface to %ASSEMBLE
-(defun assemble-sections (asmstream simple-fun-labels segment)
-  (let* ((n-entries (length simple-fun-labels))
+(defun assemble-sections (asmstream entries segment)
+  (let* ((n-entries (length entries))
          (trailer-len (* (+ n-entries 1) 4))
          (end-text (gen-label))
          (combined
            (append-sections
             (append-sections (asmstream-data-section asmstream)
-                             (append-sections
-                              (asmstream-code-section asmstream)
-                              (asmstream-indirections-section asmstream)))
-             (let ((section (asmstream-elsewhere-section asmstream)))
-               (emit section
-                     end-text
-                     `(.align 2)
-                     `(.skip ,trailer-len)
-                     `(.align ,sb-vm:n-lowtag-bits))
-               section)))
-         (octets (segment-buffer (%assemble segment combined))))
-    (flet ((store-ub16 (index val)
-             (multiple-value-bind (b0 b1)
-                 #+little-endian
-                 (values (ldb (byte 8 0) val) (ldb (byte 8 8) val))
-                 #+big-endian
-                 (values (ldb (byte 8 8) val) (ldb (byte 8 0) val))
-               (setf (aref octets (+ index 0)) b0
-                     (aref octets (+ index 1)) b1)))
-           (store-ub32 (index val)
-             (multiple-value-bind (b0 b1 b2 b3)
-                 #+little-endian
-                 (values (ldb (byte 8  0) val) (ldb (byte 8  8) val)
-                         (ldb (byte 8 16) val) (ldb (byte 8 24) val))
-                 #+big-endian
-                 (values (ldb (byte 8 24) val) (ldb (byte 8 16) val)
-                         (ldb (byte 8  8) val) (ldb (byte 8  0) val))
-               (setf (aref octets (+ index 0)) b0
-                     (aref octets (+ index 1)) b1
-                     (aref octets (+ index 2)) b2
-                     (aref octets (+ index 3)) b3))))
-      (let ((index (length octets))
-            (fun-offsets))
-        ;; Total size of the code object must be multiple of 2 lispwords
-        (aver (not (logtest (+ (segment-header-skew segment) index)
-                            sb-vm:lowtag-mask)))
+                             (asmstream-code-section asmstream))
+            (let ((section (asmstream-elsewhere-section asmstream)))
+              (emit section
+                    end-text
+                    `(.align 2)
+                    `(.skip ,trailer-len)
+                    `(.align ,sb-vm:n-lowtag-bits))
+              section)))
+         (fun-offsets)
+         (octets (segment-buffer (%assemble segment combined)))
+         (index (length octets)))
+    ;; N-ENTRIES is packed into a uint16 with 5 other bits
+    (declare (type (unsigned-byte 11) n-entries))
+
+    ;; Total size of the code object must be multiple of 2 lispwords
+    (aver (not (logtest (+ (segment-header-skew segment) index)
+                        sb-vm:lowtag-mask)))
+    (sb-sys:with-pinned-objects (octets)
+      (let ((sap (sb-sys:vector-sap octets)))
         ;; TODO: as the comment in GENERATE-CODE suggests, we would like to align
         ;; code objects to 16 bytes for 32-bit x86. That's simple - all we have to do
         ;; is ensure that each code blob is a multiple of 16 bytes in size.
@@ -1550,10 +1547,12 @@
                            (- index trailer-len (label-position end-text)))))
           (unless (and (typep trailer-len '(unsigned-byte 16))
                        (typep n-entries '(unsigned-byte 12))
+                       ;; Padding must be representable in 4 bits at assembly time,
+                       ;; but CODE-HEADER/TRAILER-ADJUST can increase the padding.
                        (typep padding '(unsigned-byte 4)))
             (bug "Oversized code component?"))
-          (store-ub16 (- index 2) trailer-len)
-          (store-ub16 (- index 4) (logior (ash n-entries 4) padding)))
+          (setf (sap-ref-16 sap (- index 2)) trailer-len)
+          (setf (sap-ref-16 sap (- index 4)) (logior (ash n-entries 5) padding)))
         (decf index trailer-len)
         ;; Iteration over label positions occurs from numerically highest
         ;; to lowest, which is right because the 0th indexed simple-fun
@@ -1562,16 +1561,16 @@
         ;;  ... simple-fun-2 | simple-fun-1 | simple-fun-0
         ;; And because we use PUSH, we collect them in forward order
         ;; which is the correct thing to return.
-        (dolist (label simple-fun-labels)
-          (let ((val (label-position label)))
+        (dolist (entry entries)
+          (let ((val (label-position (sb-c::entry-info-offset entry))))
             (push val fun-offsets)
-            (store-ub32 index val)
-            (incf index 4)))
-        (aver (= index (- (length octets) 4)))
-        (values segment
-                (label-position end-text)
-                (segment-fixup-notes segment)
-                fun-offsets)))))
+            (setf (sap-ref-32 sap index) val)
+            (incf index 4)))))
+    (aver (= index (- (length octets) 4)))
+    (values segment
+            (label-position end-text)
+            (segment-fixup-notes segment)
+            fun-offsets)))
 
 ;;; Most backends do not convert register TNs into a different type of
 ;;; internal object prior to handing the operands off to the emitter.
@@ -1668,11 +1667,10 @@
     (trace-inst s :align bits)
     (emit s `(.align ,bits ,pattern))))
 
-(declaim (ftype (sfunction (label &optional t index) (or null index))
-                label-position))
 (defun label-position (label &optional if-after delta)
   "Return the current position for LABEL. Chooser maybe-shrink functions
    should supply IF-AFTER and DELTA in order to ensure correct results."
+  (declare #-sb-xc-host (values (or null index)))
   (let ((posn (label-posn label)))
     (if (and if-after (> posn if-after))
         (- posn delta)
@@ -1734,21 +1732,28 @@
                                  total-bits assembly-unit-bits))
                         quo))
            (bytes (make-array num-bytes :initial-element nil))
-           (segment-arg (sb-xc:gensym "SEGMENT-")))
+           (segment-arg '#:segment))
       (dolist (byte-spec-expr byte-specs)
         (let* ((byte-spec (eval byte-spec-expr))
                (byte-size (byte-size byte-spec))
                (byte-posn (byte-position byte-spec))
-               (arg (sb-xc:gensym (format nil "~:@(ARG-FOR-~S-~)" byte-spec-expr))))
+               ;; if exactly one arg, then it is named literally #:integer
+               (arg (if (cdr byte-specs)
+                        (gensym (format nil "~:@(ARG-FOR-~S-~)" byte-spec-expr))
+                        '#:integer)))
           (when (ldb-test (byte byte-size byte-posn) overall-mask)
             (error "The byte spec ~S either overlaps another byte spec, or ~
                     extends past the end."
                    byte-spec-expr))
           (setf (ldb byte-spec overall-mask) -1)
           (arg-names arg)
-          (arg-types `(type (integer ,(ash -1 (1- byte-size))
-                                     ,(1- (ash 1 byte-size)))
-                            ,arg))
+          (arg-types
+           ;; the two arms of the IF are equivalent,
+           ;; but literal integers get ugly beyond a certain point.
+           (let ((spec (if (<= byte-size 16)
+                           `(integer ,(ash -1 (1- byte-size)) ,(1- (ash 1 byte-size)))
+                           `(or (signed-byte ,byte-size) (unsigned-byte ,byte-size)))))
+             `(type ,spec ,arg)))
           (multiple-value-bind (start-byte offset)
               (floor byte-posn assembly-unit-bits)
             (let ((end-byte (floor (1- (+ byte-posn byte-size))
@@ -1791,6 +1796,10 @@
                           (svref bytes end-byte))))))))))
       (unless (= overall-mask -1)
         (error "There are holes."))
+      ;; Note: the way this would typically be done efficiently
+      ;; (at least in the target) for 2 or 4 bytes is to first ensure
+      ;; adequate buffer space followed by exactly 1 store.
+      ;; For portability we have to split octets apart by hand.
       (let ((forms nil))
         (dotimes (i num-bytes)
           (let ((pieces (svref bytes i)))
@@ -1952,10 +1961,6 @@
 (%def-inst-encoder '.byte
                    (lambda (segment &rest bytes)
                      (dolist (byte bytes) (emit-byte segment byte))))
-(%def-inst-encoder '.coverage-mark
-                   (lambda (segment &rest junk)
-                     (declare (ignore segment junk))
-                     (error "Can't get here")))
 (%def-inst-encoder '.skip
                     (lambda (segment n-bytes &optional (pattern 0))
                       (%emit-skip segment n-bytes pattern)))
@@ -1973,13 +1978,12 @@
        (cond ((label-p val)
               ;; note a fixup prior to writing the backpatch so that the fixup's
               ;; position is the location counter at the patch point
-              ;; (i.e. prior to skipping 8 bytes)
+              ;; (i.e. prior to skipping N-WORD-BYTES bytes)
               ;; This fixup is *not* recorded in code->fixups. Instead, trans_code()
               ;; will fixup a counted initial subsequence of unboxed words.
               ;; Q: why are fixup notes a "compiler" abstractions?
               ;; They seem pretty assembler-related to me.
-              (sb-c:note-fixup segment (or #+64-bit :absolute64 :absolute)
-                               (sb-c:make-fixup nil :code-object 0))
+              (sb-c:note-fixup segment :absolute (sb-c:make-fixup nil :code-object 0))
               (emit-back-patch
                segment
                sb-vm:n-word-bytes
@@ -2053,4 +2057,17 @@
                       (setq next (stmt-prev new-next)
                             any-changes t)
                       (return)))))))))
-      (unless any-changes (return)))))
+      (unless any-changes (return))))
+  #+x86-64
+  ;; Build the label -> stmt map
+  (let ((label->stmt (make-hash-table)))
+    (do ((stmt (section-start section) (stmt-next stmt)))
+        ((null stmt))
+      (dolist (label (ensure-list (stmt-labels stmt)))
+        (aver (not (gethash label label->stmt)))
+        (setf (gethash label label->stmt) stmt)))
+    (perform-jump-to-jump-elimination (section-start section) label->stmt)))
+
+;; Remove macros that users should not invoke
+(push '("SB-ASSEM" define-instruction define-instruction-macro)
+      *!removable-symbols*)

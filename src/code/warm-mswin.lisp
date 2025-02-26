@@ -83,7 +83,7 @@
   (process handle)
   (exit-code uint))
 
-(defun zero-alien (alien type)
+(defmacro zero-alien (alien type)
   `(alien-funcall (extern-alien "memset" (function void system-area-pointer int unsigned))
                   (alien-sap ,alien) 0 (alien-size ,type :bytes)))
 
@@ -161,7 +161,7 @@
 (defvar *console-control-enabled* nil)
 (defvar *console-control-spec* nil)
 
-(sb-alien::define-alien-callback *alien-console-control-handler* (:stdcall int)
+(define-alien-callable alien-console-control-handler (:stdcall int)
     ((event-code int))
   (if (ignore-errors (funcall *console-control-handler* event-code)) 1 0))
 
@@ -183,7 +183,7 @@ true to stop searching)." *console-control-spec*)
      (setf *console-control-enabled* nil))
     ((or symbol function)
      (setf *console-control-handler* new-handler)
-     (aver (plusp (set-console-ctrl-handler *alien-console-control-handler* 1)))))
+     (aver (plusp (set-console-ctrl-handler (alien-callable-function 'alien-console-control-handler) 1)))))
   (setf *console-control-spec* new-handler))
 
 (defun initialize-console-control-handler (&optional reset-to-default-p)
@@ -366,7 +366,7 @@ true to stop searching)." *console-control-spec*)
                                            (t
                                             (let ((last-error (get-last-error)))
                                               (unless (= last-error error-broken-pipe)
-                                                (pending-or-error "ReadFile" last-error)))))))))
+                                                (pending-or-error "GetOverlappedResult" last-error)))))))))
                         (loop for copier across copiers
                            do (try-read copier))
                         (loop for event = (wait-for-multiple-objects-or-signal (cast events
@@ -387,11 +387,5 @@ true to stop searching)." *console-control-spec*)
              (do ()
                  ((= 0
                      (wait-object-or-signal handle))))))
-      (multiple-value-bind (ok code) (get-exit-code-process handle)
-        (when (and (plusp ok) (/= code still-active))
-          (setf (sb-impl::process-handle process) nil)
-          (close-handle handle)
-
-          (setf (sb-impl::process-%status process) :exited
-                (sb-impl::process-%exit-code process) code)))))
+      (sb-impl::get-processes-status-changes)))
   process)

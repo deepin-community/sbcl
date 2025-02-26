@@ -32,13 +32,12 @@
           inhibit-warnings)
     #'equalp)
 
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  (defconstant n-policy-primary-qualities (length +policy-primary-qualities+))
-  ;; 1 bit per quality is stored to indicate whether it was explicitly given
-  ;; a value in a lexical policy. In addition to the 5 ANSI-standard qualities,
-  ;; SBCL defines one more "primary" quality and 16 dependent qualities.
-  ;; Both kinds take up 1 bit in the mask of specified qualities.
-  (defconstant max-policy-qualities 32))
+(defconstant n-policy-primary-qualities (length +policy-primary-qualities+))
+;; 1 bit per quality is stored to indicate whether it was explicitly given
+;; a value in a lexical policy. In addition to the 5 ANSI-standard qualities,
+;; SBCL defines one more "primary" quality and 16 dependent qualities.
+;; Both kinds take up 1 bit in the mask of specified qualities.
+(defconstant max-policy-qualities 32)
 
 ;; Each primary and dependent quality policy is assigned a small integer index.
 ;; The POLICY struct represents a set of policies in an order-insensitive way
@@ -80,6 +79,7 @@
 (defvar *policy-max* nil)
 
 (declaim (type policy *policy*)
+         (always-bound *policy*)
          (type (or policy null) *policy-min* *policy-max*))
 
 (defun restrict-compiler-policy (&optional quality (min 0) (max 3))
@@ -197,20 +197,6 @@ See also :POLICY option in WITH-COMPILATION-UNIT."
              (policy-presence-bits policy)) (if presentp 1 0))
   policy)
 
-;;; Is it deprecated?
-(declaim (ftype function deprecation-warn))
-(defun policy-quality-deprecation-warning (quality)
-  (case quality
-    ((stack-allocate-dynamic-extent stack-allocate-vector stack-allocate-value-cells)
-     (deprecation-warn :late "SBCL" "1.0.19.7" 'policy quality '*stack-allocate-dynamic-extent*
-                       :runtime-error nil)
-     t)
-    ((merge-tail-calls)
-     (deprecation-warn :early "SBCL" "1.0.53.74" 'policy quality nil :runtime-error nil)
-     t)
-    (otherwise
-     nil)))
-
 ;; ANSI-specified default of 1 for each quality.
 (defglobal **baseline-policy** nil)
 ;; Baseline policy altered with (TYPE-CHECK 0)
@@ -300,12 +286,19 @@ See also :POLICY option in WITH-COMPILATION-UNIT."
   ;; can create a POLICY that indicates absence of primary qualities.
   ;; This does not affect RESTRICT-COMPILER-POLICY because a lower bound of 0
   ;; can be assumed for everything. SET-MACRO-POLICY might care though.
+  ;;
+  ;; FIXME: it is wrong IMHO that the min/max are applied lazily, every time
+  ;; they are fetched from a policy. This makes it impossible to create
+  ;; a policy that represents _exactly_ what you want in the internals of the
+  ;; CLOS implementation. Applying the min/max when a policy is created would
+  ;; provide an escape mechanism. Alternatively we could indicate in the policy
+  ;; whether each quality should be treated as absolute.
   (define-getter %policy-quality
     (let ((min *policy-min*)
           (max *policy-max*))
       (macrolet ((quality-min (get-byte)
                    `(if min
-                        (ldb (byte 2 byte-pos) (,get-byte min))
+                       (ldb (byte 2 byte-pos) (,get-byte min))
                         0))
                  (quality-max (get-byte)
                    `(if max
@@ -402,10 +395,9 @@ See also :POLICY option in WITH-COMPILATION-UNIT."
               (values quality raw-value)))
         (let ((index (policy-quality-name-p quality)))
           (cond ((not index)
-                 (or (policy-quality-deprecation-warning quality)
-                     (compiler-warn
-                      "~@<Ignoring unknown optimization quality ~S in:~_ ~S~:>"
-                      quality spec)))
+                 (compiler-warn
+                  "~@<Ignoring unknown optimization quality ~S in:~_ ~S~:>"
+                  quality spec))
                 ((not (typep raw-value 'policy-quality))
                  (compiler-warn
                   "~@<Ignoring bad optimization value ~S in:~_ ~S~:>"

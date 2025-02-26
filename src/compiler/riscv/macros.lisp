@@ -20,11 +20,67 @@
     `(unless (location= ,n-dst ,n-src)
        (inst addi ,n-dst ,n-src 0))))
 
+;;; Add a possibly-too-large immediate value using TEMP. VOP-NAME is merely
+;;; to track where the temp is needed because I might have overdone use of it
+;;; and could potentially remove some uses of this. (Not sure)
+(defun add-imm (result source imm-operand vop-name tmp)
+  (declare (ignorable vop-name))
+  (cond ((typep imm-operand 'short-immediate)
+         (inst addi result source imm-operand))
+        (t
+         (inst li tmp imm-operand)
+         (inst add result source tmp))))
+
 (macrolet ((def-mem-op (op inst shift)
              `(defmacro ,op (object base &optional (offset 0) (lowtag 0))
                 `(inst ,',inst ,object ,base (- (ash ,offset ,,shift) ,lowtag)))))
   (def-mem-op loadw #-64-bit lw #+64-bit ld word-shift)
   (def-mem-op storew #-64-bit sw #+64-bit sd word-shift))
+
+(defun load-frame-word (object base wordindex vop-name tmp)
+  (declare (ignore vop-name))
+  (let ((imm (ash wordindex word-shift)))
+    (cond ((typep imm 'short-immediate)
+           (loadw object base wordindex))
+          (t
+           (unless tmp
+             ;; check that it's OK to temporarily mess up OBJECT
+             (aver (not (location= object base)))
+             (setq tmp object)) ; use OBJECT for pointer arithmetic
+           ;; TOOD: there's a way to do this using only 2 instructions if the
+           ;; immediate is only a little too large: first, "addi TEMP base k"
+           ;; where K gets us nearer to the desired address; then store based off
+           ;; TMP using a smaller immediate index.
+           ;; For now, 3 instructions it shall be.
+           (inst li tmp imm)
+           (inst add tmp base tmp)
+           (inst #-64-bit lw #+64-bit ld object tmp 0)))))
+(defun store-frame-word (object base wordindex vop-name tmp)
+  (declare (ignore vop-name))
+  (let ((imm (ash wordindex word-shift)))
+    (cond ((typep imm 'short-immediate)
+           (storew object base wordindex))
+          (tmp
+           (inst li tmp imm)
+           (inst add tmp base tmp)
+           (inst #-64-bit sw #+64-bit sd object tmp 0))
+          (t
+           ;; Lacking a scratch register, I don't know what else to do but modify
+           ;; the BASE register.
+           ;; FIXME: POSSIBLY DANGEROUS! if a stop-for-GC occurs and the frame-pointer is off
+           ;; from what it should be, the set of values below the frame-pointer omits many
+           ;; words. Maybe it's OK because the Lisp stack grows upward so we only care that
+           ;; the stack is bounded by the stack-pointer and not the frame-pointer?
+           (do ((max-short-imm #x7F0)
+                (adjusted-imm imm)
+                (n-adjustments 0))
+               ((typep adjusted-imm 'short-immediate)
+                (inst #-64-bit sw #+64-bit sd object base adjusted-imm)
+                (dotimes (i n-adjustments)
+                  (inst subi base base max-short-imm)))
+             (inst addi base base max-short-imm)
+             (decf adjusted-imm max-short-imm)
+             (incf n-adjustments))))))
 
 (macrolet ((def-coerce-op (name inst)
              `(defmacro ,name ((reg temp-reg) &body body)
@@ -93,7 +149,7 @@
   (define-tls-accessors load-stepping store-stepping
     thread-stepping-slot sb-impl::*stepping*))
 
-;;; TODO: these two macros would benefit from linkage-table space being
+;;; TODO: these two macros would benefit from alien-linkage-table space being
 ;;; located below static space with linkage entries allocated downward
 ;;; from the end. Then the sequence would reduce to 2 instructions:
 ;;;    lw temp (k)$NULL
@@ -118,26 +174,6 @@
   "Loads the type bits of a pointer into target independent of
 byte-ordering issues."
   `(inst lbu ,target ,source ,offset))
-
-(defun lisp-jump (function)
-  "Jump to the lisp function FUNCTION."
-  (inst jalr zero-tn function (- (ash simple-fun-insts-offset word-shift)
-                                 fun-pointer-lowtag)))
-
-(defun lisp-return (return-pc return-style)
-  "Return to RETURN-PC."
-  (ecase return-style
-    (:single-value (inst li nargs-tn -1))
-    (:multiple-values)
-    (:known))
-  ;; Avoid the LRA header word.
-  (inst jalr zero-tn return-pc (- n-word-bytes other-pointer-lowtag)))
-
-(defun emit-return-pc (label)
-  "Emit a return-pc header word.  LABEL is the label to use for this return-pc."
-  (emit-alignment n-lowtag-bits)
-  (emit-label label)
-  (inst lra-header-word))
 
 
 ;;;; Three Way Comparison
@@ -579,7 +615,7 @@ and
      (let ((offset (tn-offset stack)))
        (sc-case stack
          ((control-stack)
-          (loadw reg cfp-tn offset))))))
+          (load-frame-word reg cfp-tn offset 'load-stack-tn nil))))))
 
 (defmacro store-stack-tn (stack reg)
   `(let ((stack ,stack)
@@ -587,7 +623,7 @@ and
      (let ((offset (tn-offset stack)))
        (sc-case stack
          ((control-stack)
-          (storew reg cfp-tn offset))))))
+          (store-frame-word reg cfp-tn offset 'store-stack-tn nil))))))
 
 (defmacro maybe-load-stack-tn (reg reg-or-stack)
   "Move the TN Reg-Or-Stack into Reg if it isn't already there."
@@ -599,7 +635,7 @@ and
           ((any-reg descriptor-reg)
            (move ,n-reg ,n-stack))
           ((control-stack)
-           (loadw ,n-reg cfp-tn (tn-offset ,n-stack))))))))
+           (load-frame-word ,n-reg cfp-tn (tn-offset ,n-stack) 'maybe-load-stack-tn nil)))))))
 
 (defun align-csp (temp)
   (let ((aligned (gen-label)))
@@ -626,21 +662,21 @@ and
 
 (defun load-alloc-free-pointer (reg)
   #-sb-thread
-  (loadw reg null-tn 0 (- nil-value boxed-region))
+  (loadw reg null-tn 0 (- nil-value-offset mixed-region-offset))
   #+sb-thread
-  (loadw reg thread-base-tn thread-boxed-tlab-slot))
+  (loadw reg thread-base-tn thread-mixed-tlab-slot))
 
 (defun load-alloc-end-addr (reg)
   #-sb-thread
-  (loadw reg null-tn 1 (- nil-value boxed-region))
+  (loadw reg null-tn 1 (- nil-value-offset mixed-region-offset))
   #+sb-thread
-  (loadw reg thread-base-tn (+ thread-boxed-tlab-slot 1)))
+  (loadw reg thread-base-tn (+ thread-mixed-tlab-slot 1)))
 
 (defun store-alloc-free-pointer (reg)
   #-sb-thread
-  (storew reg null-tn 0 (- nil-value boxed-region))
+  (storew reg null-tn 0 (- nil-value-offset mixed-region-offset))
   #+sb-thread
-  (storew reg thread-base-tn thread-boxed-tlab-slot))
+  (storew reg thread-base-tn thread-mixed-tlab-slot))
 
 ;;; This is the main mechanism for allocating memory in the lisp heap.
 ;;;
@@ -659,7 +695,6 @@ and
                                                    stack-allocate-p
                                                    temp-tn)
   (declare (ignorable type))
-  #-gencgc (declare (ignore temp-tn))
   (cond (stack-allocate-p
          ;; Stack allocation
          ;;
@@ -679,20 +714,6 @@ and
            (tn
             (inst add csp-tn csp-tn size))))
         ;; Normal allocation to the heap.
-        #-gencgc
-        (t
-         (load-symbol-value flag-tn *allocation-pointer*)
-         (inst ori result-tn flag-tn lowtag)
-         (etypecase size
-           (short-immediate
-            (inst addi flag-tn flag-tn size))
-           (u+i-immediate
-            (inst li flag-tn (- size lowtag))
-            (inst add flag-tn flag-tn result-tn))
-           (tn
-            (inst add flag-tn flag-tn size)))
-         (store-symbol-value flag-tn *allocation-pointer*))
-        #+gencgc
         (t
          (let ((alloc (gen-label))
                (back-from-alloc (gen-label)))
@@ -721,7 +742,7 @@ and
               (inst ori result-tn result-tn lowtag)))
            (assemble (:elsewhere)
              (emit-label alloc)
-             (invoke-asm-routine (alloc-tramp-stub-name (tn-offset result-tn) type))
+             (inst jal lip-tn (make-fixup (alloc-tramp-stub-name (tn-offset result-tn) type) :assembly-routine))
              (inst j back-from-alloc))))))
 
 (defmacro with-fixed-allocation ((result-tn flag-tn type-code size
@@ -743,7 +764,6 @@ and
                    :flag-tn ,flag-tn
                    :stack-allocate-p ,stack-allocate-p
                    ,@(when temp-tn `(:temp-tn ,temp-tn)))
-       (when ,type-code
-         (inst li ,flag-tn (compute-object-header ,size ,type-code))
-         (storew ,flag-tn ,result-tn 0 ,lowtag))
+       (inst li ,flag-tn (compute-object-header ,size ,type-code))
+       (storew ,flag-tn ,result-tn 0 ,lowtag)
        ,@body)))

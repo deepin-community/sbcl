@@ -10,8 +10,6 @@ typedef struct os_context_t {
 
 typedef long os_context_register_t;
 
-#include "arch-os-generic.inc"
-
 static inline DWORD NT_GetLastError() {
     DWORD result;
     asm("movl %%fs:0x0D,%0":"=r"(result));
@@ -22,5 +20,7 @@ unsigned long os_context_fp_control(os_context_t *context);
 void os_restore_fp_control(os_context_t *context);
 
 os_context_register_t * os_context_fp_addr(os_context_t *context);
+
+#define OS_CONTEXT_PC(context) context->win32_context->Eip
 
 #endif /* _X86_WIN32_OS_H */

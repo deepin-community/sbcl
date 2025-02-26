@@ -31,6 +31,8 @@
   (assert (/= (sxhash #*1010) (sxhash #*0101))))
 
 ;;; This test supposes that no un-accounted-for consing occurs.
+;;; But now that we have to two regions for allocation, it's not necessarily
+;;; the case that any given allocation bumps the mixed-region free pointer.
 (with-test (:name :address-based-hash-counter :skipped-on :interpreter)
   ;; It doesn't particularly matter what ADDRESS-BASED-COUNTER-VAL returns,
   ;; but it's best to verify the assumption that each cons bumps the count
@@ -38,8 +40,10 @@
   ;; hashes.
   (let ((win 0) (n-trials 10) (prev (sb-int:address-based-counter-val)))
     (dotimes (i n-trials)
-      (declare (notinline cons)) ; it's flushable, but don't flush it
-      (cons 1 2)
+      (locally
+          (declare (notinline cons sb-sys:int-sap)) ; it's flushable, but don't flush it
+        #+use-cons-region (sb-sys:int-sap #xf00fa) ; 2 words in mixed-region
+        #-use-cons-region (cons 1 2))
       (let ((ptr (sb-int:address-based-counter-val)))
         (when (= ptr (1+ prev))
           (incf win))
@@ -183,12 +187,13 @@
     (assert (= 0 (hash-table-count map)))))
 
 (with-test (:name :clrhash-clears-rehash-p)
-  (let ((tbl (make-hash-table)))
+  (let ((tbl (make-hash-table :size 128)))
+    (assert (not (sb-impl::flat-hash-table-p tbl)))
     (dotimes (i 10)
       (setf (gethash (cons 'foo (gensym)) tbl) 1))
     (gc)
-    ;; The need-to-rehash bit is set
-    (assert (eql 1 (svref (sb-impl::hash-table-pairs tbl) 1)))
+    ;; Set the need-to-rehash bit
+    (setf (svref (sb-impl::hash-table-pairs tbl) 1) 1)
     (clrhash tbl)
     ;; The need-to-rehash bit is not set
     (assert (eql 0 (svref (sb-impl::hash-table-pairs tbl) 1)))))
@@ -223,9 +228,11 @@
 
 (with-test (:name (hash-table :custom-hashfun-with-standard-test))
   (flet ((kv-flag-bits (ht)
-           (sb-kernel:get-header-data (sb-impl::hash-table-pairs ht))))
+           (ash (sb-kernel:get-header-data (sb-impl::hash-table-pairs ht))
+                (- sb-vm:array-flags-data-position))))
     ;; verify that EQ hashing on symbols is address-sensitive
-    (let ((h (make-hash-table :test 'eq)))
+    (let ((h (make-hash-table :test 'eq :size 128)))
+      (assert (not (sb-impl::flat-hash-table-p h)))
       (setf (gethash 'foo h) 1)
       (assert (logtest (kv-flag-bits h) sb-vm:vector-addr-hashing-flag)))
     (let ((h (make-hash-table :test 'eq :hash-function 'sb-kernel:symbol-hash)))
@@ -238,7 +245,8 @@
     ;; and that function doesn't exist on 32-bit (but should!)
     #+64-bit
     (dolist (test '(eq eql equal equalp))
-      (let ((h (make-hash-table :test test)))
+      (let ((h (make-hash-table :test test :size 128)))
+        (assert (not (sb-impl::flat-hash-table-p h)))
         (setf (gethash #'car h) 1)
         (assert (logtest (kv-flag-bits h) sb-vm:vector-addr-hashing-flag)))
       (let ((h (make-hash-table :test test :hash-function
@@ -263,7 +271,9 @@
 ;;; which has two different freelists - one of cells that REMHASH has made available
 ;;; and one of cells that GC has marked as empty. Since we no longer inhibit GC
 ;;; during table operations, we need to give GC a list of its own to manipulate.
-(with-test (:name (hash-table :gc-smashed-cell-list))
+(with-test (:name (hash-table :gc-smashed-cell-list)
+            :skipped-on :gc-stress
+            :broken-on :mark-region-gc)
   (flet ((f ()
            (dotimes (i 20000) (setf (gethash i *tbl*) (- i)))
            (setf (gethash (cons 1 2) *tbl*) 'foolz)
@@ -340,12 +350,12 @@
   (test-this-object 'equal (find-class 'class)))
 
 (with-test (:name :remhash-eq-comparable-in-equalp-table)
-  ;; EQUALP tables worked a little better, because more objects have
-  ;; are hashed non-address-sensitively by EQUALP-HASH relative to EQUAL-HASH,
+  ;; EQUALP tables worked a little better, because more objects are
+  ;; hashed non-address-sensitively by EQUALP-HASH relative to EQUAL-HASH,
   ;; and those objects have comparators that descend.
   ;; However, there are still some things hashed by address:
   (test-this-object 'equalp (make-weak-pointer "bleep"))
-  (test-this-object 'equalp (sb-kernel::find-fdefn 'cons))
+  (test-this-object 'equalp (sb-int:find-fdefn '(setf car)))
   (test-this-object 'equalp #'car)
   (test-this-object 'equalp (constantly 5))
   (test-this-object 'equal (sb-sys:int-sap 0)))
@@ -356,7 +366,7 @@
 ;;; This affected the performance of TYPECASE.
 (with-test (:name :sxhash-on-layout)
   (dolist (x '(pathname cons array))
-    (let ((l (sb-kernel:wrapper-friend (sb-kernel:find-layout x))))
+    (let ((l (sb-kernel:find-layout x)))
       (assert (= (sxhash l) (sb-kernel:layout-clos-hash l))))))
 
 (with-test (:name :equalp-table-fixnum-equal-to-float)
@@ -364,16 +374,15 @@
     (assert (eql (setf (gethash 3d0 table) 1)
                  (gethash 3   table)))))
 
+;;; Check that hashing a stringlike thing which is possibly NIL uses
+;;; a specialized hasher (after prechecking for NIL via the transform).
 (with-test (:name :transform-sxhash-string-and-bv)
-  (let ((f (compile
-            nil
-            '(lambda (x y)
-               (logxor (ash (sxhash (truly-the (or string null) x)) -3)
-                       (sxhash (truly-the (or bit-vector null) y))))))
-        (fdefn1 (sb-kernel::find-fdefn 'sb-kernel:%sxhash-string))
-        (fdefn2 (sb-kernel::find-fdefn 'sb-kernel:%sxhash-bit-vector)))
-    (every (lambda (x) (member x `(,fdefn1 ,fdefn2)))
-           (ctu:find-code-constants f))))
+  (dolist (case `((bit-vector sb-kernel:%sxhash-bit-vector)
+                  (string sb-kernel:%sxhash-string)
+                  (simple-bit-vector sb-kernel:%sxhash-simple-bit-vector)
+                  (simple-string sb-kernel:%sxhash-simple-string)))
+    (let ((f `(lambda (x) (sxhash (truly-the (or null ,(car case)) x)))))
+      (assert (equal (ctu:ir1-named-calls f) (cdr case))))))
 
 (with-test (:name :sxhash-on-displaced-string
             :fails-on :sbcl)
@@ -400,8 +409,11 @@
     ;; Also the same issue exists with bit-vectors.
     (assert-error (sxhash displaced-string))))
 
-(with-test (:name :array-psxhash-non-consing :skipped-on :interpreter)
-   (let ((a (make-array 1000 :element-type 'double-float)))
+(with-test (:name :array-psxhash-non-consing :skipped-on :interpreter
+            :fails-on :ppc64)
+   (let ((a (make-array 1000 :element-type 'double-float
+                        :initial-element (+ 0d0 #+(or arm64 x86-64)
+                                                1d300))))
      (ctu:assert-no-consing (sb-int:psxhash a))))
 
 (with-test (:name :array-psxhash)
@@ -410,3 +422,365 @@
           (y (make-array 2 :element-type 'double-float :initial-contents '(1.0d0 1.0d0))))
       (setf (gethash x table) t)
       (assert (gethash y table)))))
+
+
+#|
+;;; Our SXHASH has kinda bad behavior on 64-bit fixnums.
+;;; I wonder if we should try to hash fixnum better for users.
+;;; Example:
+* (dotimes (i 20)
+    (let ((a (+ sb-vm:dynamic-space-start (* i 32768))))
+      (format t "~4d ~x ~b~%" i a (sxhash a))))
+   0 1000000000 1000010010001101110100101010000110101100010111010111001001010
+   1 1000008000 1000010010001101110100101010000110101100000111110111001001010
+   2 1000010000 1000010010001101110100101010000110101100110110010111001001010
+   3 1000018000 1000010010001101110100101010000110101100100110110111001001010
+   4 1000020000 1000010010001101110100101010000110101101010101010111001001010
+   5 1000028000 1000010010001101110100101010000110101101000101110111001001010
+   6 1000030000 1000010010001101110100101010000110101101110100010111001001010
+   7 1000038000 1000010010001101110100101010000110101101100100110111001001010
+   8 1000040000 1000010010001101110100101010000110101110010011010111001001010
+   9 1000048000 1000010010001101110100101010000110101110000011110111001001010
+  10 1000050000 1000010010001101110100101010000110101110110010010111001001010
+  11 1000058000 1000010010001101110100101010000110101110100010110111001001010
+  12 1000060000 1000010010001101110100101010000110101111010001010111001001010
+  13 1000068000 1000010010001101110100101010000110101111000001110111001001010
+  14 1000070000 1000010010001101110100101010000110101111110000010111001001010
+  15 1000078000 1000010010001101110100101010000110101111100000110111001001010
+  16 1000080000 1000010010001101110100101010000110101000011111010111001001010
+  ...
+|#
+(with-test (:name :fixnum-hash-with-more-entropy)
+  (flet ((try (hasher)
+           (let (hashes)
+             (dotimes (i 20)
+               (let* ((a (+ #+64-bit sb-vm:dynamic-space-start
+                            #-64-bit #xD7C83000
+                            (* i 32768)))
+                      (hash (funcall hasher a)))
+                 ;; (format t "~4d ~x ~v,'0b~%" i a sb-vm:n-word-bits hash)
+                 (push hash hashes)))
+             ;; Try some 4-bit subsequences of the hashes
+             ;; as various positions and make sure that there
+             ;; are none that match for all inputs.
+             ;; For 64-bit machines, SXHASH yields complete overlap
+             ;; of all the test cases at various positions.
+             ;; 32-bit doesn't seem to suffer from this.
+             (dotimes (position (- sb-vm:n-fixnum-bits 4))
+               (let ((field
+                      (mapcar (lambda (x) (ldb (byte 4 position) x))
+                              hashes)))
+                 ;; (print `(,position , (length (delete-duplicates field))))
+                 (when #-64-bit t #+64-bit (not (eq hasher 'sxhash))
+                   (assert (>= (length (remove-duplicates field)) 8))))))))
+    (try 'sxhash)
+    (try 'sb-int:murmur-hash-word/fixnum)))
+
+;;; Ensure that all layout-clos-hash values have a 1 somewhere
+;;; such that LOGANDing any number of nonzero hashes is nonzero.
+(with-test (:name :layout-hashes-constant-1-bit)
+  (let ((combined most-positive-fixnum))
+    (maphash (lambda (classoid layout)
+               (declare (ignore classoid))
+               (let ((hash (sb-kernel:layout-clos-hash layout)))
+                 (setq combined (logand combined hash))))
+             (sb-kernel:classoid-subclasses (sb-kernel:find-classoid 't)))
+    (assert (/= 0 combined))))
+
+(defun c-murmur-fmix (word)
+  (declare (type sb-vm:word word))
+  (alien-funcall (extern-alien #+64-bit "murmur3_fmix64"
+                               #-64-bit "murmur3_fmix32"
+                               (function unsigned unsigned))
+                 word))
+(compile 'c-murmur-fmix)
+;;; Assert that the Lisp translation of the C murmur hash matches.
+;;; This is slightly redundant with the :ADDRESS-BASED-SXHASH-GCING test,
+;;; though this one is a strictly a unit test of the hashing function,
+;;; and the other is a test that GC does the right thing.
+;;; So it's not a bad idea to have both.
+(defun murmur-compare (random-state n-iter)
+  (let ((limit (1+ sb-ext:most-positive-word)))
+    (loop repeat (the fixnum n-iter)
+          do
+       (let* ((n (random limit random-state))
+              (lisp-hash (sb-impl::murmur3-fmix-word n))
+              (c-hash (c-murmur-fmix n)))
+         (assert (= lisp-hash c-hash))))))
+(compile 'murmur-compare)
+
+(with-test (:name :mumur-hash-compare)
+  (murmur-compare (make-random-state t) 100000))
+
+(with-test (:name :sap-hash)
+  (assert (/= (sxhash (sb-sys:int-sap #x1000))
+              (sxhash (sb-sys:int-sap 0))))
+  #-interpreter
+  (let ((list-of-saps
+          (loop for i below 1000 collect (sb-sys:int-sap i))))
+    (ctu:assert-no-consing
+        (opaque-identity
+         (let ((foo 0))
+           (dolist (sap list-of-saps foo)
+             (setq foo (logxor foo (sxhash sap)))))))))
+
+(defconstant +flat-limit/eq+ 32)
+(defconstant +flat-limit/eql+ 16)
+(defconstant +hft-non-adaptive+ -3)
+(defconstant +hft-safe+ -2)
+(defconstant +hft-flat+ -1)
+(defconstant +hft-eq-mid+ 0)
+
+(with-test (:name :eq-flat-switch)
+  (let ((h (make-hash-table :test 'eq)))
+    (loop for i below +flat-limit/eq+ do
+      (setf (gethash i h) t))
+    (assert (sb-impl::flat-hash-table-p h))
+    (assert (eq (sb-impl::hash-table-gethash-impl h)
+                #'sb-impl::gethash/eq-hash/flat))
+    (assert (eq (sb-impl::hash-table-puthash-impl h)
+                #'sb-impl::puthash/eq-hash/flat))
+    (assert (eq (sb-impl::hash-table-remhash-impl h)
+                #'sb-impl::remhash/eq-hash/flat))
+    (setf (gethash (1+ +flat-limit/eq+) h) t)
+    (assert (not (sb-impl::flat-hash-table-p h)))
+    (assert (eq (sb-impl::hash-table-gethash-impl h)
+                #'sb-impl::gethash/eq-hash/common))
+    (assert (eq (sb-impl::hash-table-puthash-impl h)
+                #'sb-impl::puthash/eq-hash/common))
+    (assert (eq (sb-impl::hash-table-remhash-impl h)
+                #'sb-impl::remhash/eq-hash/common))))
+
+(with-test (:name :eql-flat-switch-point)
+  (let ((h (make-hash-table)))
+    (loop for i below +flat-limit/eql+ do
+      (setf (gethash i h) t))
+    (assert (sb-impl::flat-hash-table-p h))
+    (assert (eq (sb-impl::hash-table-gethash-impl h)
+                #'sb-impl::gethash/eql-hash/flat))
+    (assert (eq (sb-impl::hash-table-puthash-impl h)
+                #'sb-impl::puthash/eql-hash/flat))
+    (assert (eq (sb-impl::hash-table-remhash-impl h)
+                #'sb-impl::remhash/eql-hash/flat))
+    (setf (gethash (1+ +flat-limit/eql+) h) t)
+    (assert (not (sb-impl::flat-hash-table-p h)))
+    (assert (eq (sb-impl::hash-table-gethash-impl h)
+                #'sb-impl::gethash/eql-hash))
+    (assert (eq (sb-impl::hash-table-puthash-impl h)
+                #'sb-impl::puthash/eql-hash))
+    (assert (eq (sb-impl::hash-table-remhash-impl h)
+                #'sb-impl::remhash/eql-hash))))
+
+(with-test (:name :eq-hash-growth-from-non-flat-init)
+  (let ((h (make-hash-table :size 222 :test 'eq)))
+    (assert (= (sb-impl::hash-table-hash-fun-state h) +hft-eq-mid+))
+    (dotimes (i 1000)
+      (setf (gethash i h) i))
+    (assert (= (sb-impl::hash-table-hash-fun-state h) +hft-eq-mid+))))
+
+#+64-bit
+(with-test (:name :eq-hash-switch-to-safe)
+  (let ((h (make-hash-table :test 'eq)))
+    ;; Prevent SB-IMPL::GUESS-EQ-HASH-FUN from finding the shift
+    ;; required to bring the informative bits into range.
+    (setf (gethash t h) t)
+    (dotimes (i (1+ +flat-limit/eq+))
+      (setf (gethash (float i) h) i))
+    (assert (= (sb-impl::hash-table-hash-fun-state h) +hft-safe+))))
+
+(with-test (:name :eq-hash-switch-to-mid)
+  (let ((h (make-hash-table :test 'eq)))
+    (assert (= (sb-impl::hash-table-hash-fun-state h) +hft-flat+))
+    (loop for i below (1+ +flat-limit/eq+)
+          do (setf (gethash (cons nil nil) h) i))
+    (assert (plusp (sb-impl::hash-table-hash-fun-state h)))
+    (loop for i upfrom +flat-limit/eq+ below 8000
+          do (setf (gethash i h) i))
+    (assert (= (sb-impl::hash-table-hash-fun-state h) +hft-eq-mid+))))
+
+(with-test (:name :eq-hash-switch-to-mid/weak)
+  (let ((h (make-hash-table :test 'eq :weakness :value)))
+    (assert (= (sb-impl::hash-table-hash-fun-state h) +hft-eq-mid+))
+    (loop for i below 20
+          do (setf (gethash (cons nil nil) h) i))
+    ;; Weak hash tables are not adaptive, currently.
+    (assert (= (sb-impl::hash-table-hash-fun-state h) +hft-eq-mid+))
+    (loop for i upfrom +flat-limit/eq+ below 8000
+          do (setf (gethash i h) i))
+    (assert (= (sb-impl::hash-table-hash-fun-state h) +hft-eq-mid+))))
+
+(with-test (:name :eq-hash-growth-from-non-flat-init)
+  (let ((h (make-hash-table :size 222 :test 'eq)))
+    (assert (= (sb-impl::hash-table-hash-fun-state h) +hft-eq-mid+))
+    (dotimes (i 1000)
+      (setf (gethash i h) i))
+    (assert (= (sb-impl::hash-table-hash-fun-state h) +hft-eq-mid+))))
+
+;;; For a uniform multinomial distribution with K samples and the same
+;;; number of categories, estimate the distribution of its maximum
+;;; count M (i.e. the number of samples in the most populous
+;;; category). Then, find the X for which p(M <= X) ~= 0.99. Return
+;;; the X for each K in 2^0, 2^1, ..., 2^(MAX-BITS - 1).
+(defun estimate-uniform-multinomial-maximum-cutoff (max-bits n-repeats
+                                                    &key (verbose t)
+                                                      (load-factor 1))
+  (declare (type fixnum n-repeats))
+  (loop
+    for k-bits upfrom 0 below max-bits
+    collect (let* ((k (expt 2 k-bits))
+                   ;; +MIN-HASH-TABLE-SIZE+ implies at least 8 buckets.
+                   (n-buckets (sb-int::power-of-two-ceiling
+                               (max 8 (/ k load-factor))))
+                   (b (make-array n-buckets :element-type '(unsigned-byte 8)))
+                   (m (make-array (1+ k) :element-type '(unsigned-byte 16))))
+              (locally (declare (optimize speed (safety 0)))
+                (loop repeat n-repeats
+                      do (fill b 0)
+                         (loop repeat k
+                               do (incf (aref b (random n-buckets))))
+                         (incf (aref m (loop for c across b maximize c)))))
+              (let ((sum 0)
+                    (best-n-bits nil)
+                    (min-prob 0.99))
+                (when verbose
+                  (format t "~%K=2^~S, ~S, R=~S~%" k-bits
+                          (round (log 2 n-buckets)) n-repeats))
+                (loop for i upto k
+                      do (let ((p (/ (aref m i) n-repeats)))
+                           (incf sum p)
+                           (when verbose
+                             (format t "~S: ~,4F (~,4F)~%" i p sum)))
+                         (when (< min-prob sum)
+                           (setq best-n-bits i)
+                           (return)))
+                (when verbose
+                  (format t "just above prob ~6,4F at ~S~%"
+                          min-prob best-n-bits))
+                best-n-bits))))
+
+(with-test (:name :max-chain-length)
+  ;; The estimation slows down exponentially and gets flakier with
+  ;; higher MAX-BITS, so use a small value for the test. Note that
+  ;; it's still faster than a memoizing implementation of the
+  ;; algorithm in Appendix A of "Computing the exact distributions of
+  ;; some functions of the ordered multinomial counts" by Bonetti et
+  ;; al.
+  (let ((cutoffs (estimate-uniform-multinomial-maximum-cutoff
+                  10 20000 :verbose nil)))
+    (loop for n-bits upfrom 0
+          for cutoff in cutoffs
+          do (assert (<= (abs (- (sb-impl::max-chain-length (ash 1 n-bits))
+                                 cutoff))
+                         1)))))
+
+(defun sxstate-limit (sxstate)
+  (ldb (byte #+64-bit 31 #-64-bit (- sb-vm:n-fixnum-bits 4) 0) sxstate))
+
+(defun ht-limit (ht)
+  (sxstate-limit (sb-impl::hash-table-hash-fun-state ht)))
+
+(defun sxstate-max-chain-length (sxstate)
+  (ldb (byte 4 #+64-bit 31 #-64-bit (- sb-vm:n-fixnum-bits 4)) sxstate))
+
+(defun ht-max-chain-length (ht)
+  (sxstate-max-chain-length (sb-impl::hash-table-hash-fun-state ht)))
+
+(defconstant +truncated-hash-bit+ #-64-bit 29 #+64-bit 31)
+
+(defun truncated-hash-p (hash)
+  (logbitp +truncated-hash-bit+ hash))
+
+(defun check-sxstate-limit (ht)
+  (let* ((kv-vector (sb-impl::hash-table-pairs ht))
+         (hwm (sb-impl::kv-vector-high-water-mark kv-vector))
+         (hash-vector (sb-impl::hash-table-hash-vector ht))
+         (limit (ht-limit ht)))
+    (loop
+      for i upfrom 1 upto hwm
+      do (let ((key (aref kv-vector (* 2 i))))
+           (unless (sb-impl::empty-ht-slot-p key)
+             (assert (eq (not (not (truncated-hash-p (aref hash-vector i))))
+                         (not (not (< limit (length key)))))
+                     () "~@<key: ~S, key length: ~S, limit: ~S, ~
+                         stored hash: ~S (truncatedp: ~S)~:@>"
+                     key (length key) limit (aref hash-vector i)
+                     (truncated-hash-p (aref hash-vector i))))))))
+
+(defun check-sxstate-max-chain-length (ht)
+  (let ((hash-vector (sb-impl::hash-table-hash-vector ht))
+        (index-vector (sb-impl::hash-table-index-vector ht))
+        (next-vector (sb-impl::hash-table-next-vector ht))
+        (max-chain-length (ht-max-chain-length ht)))
+    (loop for i across index-vector do
+      ;; In puthash, we only check for MAX-CHAIN-LENGTH when adding a
+      ;; truncated hash. This test could fail spuriously for some
+      ;; orderings of truncated and non-truncated keys, but in our
+      ;; tests we all keys of the same length.
+      (when (truncated-hash-p (aref hash-vector i))
+        (let ((chain-length (loop for j = i then (aref next-vector j)
+                                  until (zerop j)
+                                  count 1)))
+          (assert (<= chain-length max-chain-length)))))))
+
+(with-test (:name :raise-sxstate-limit-and-rehash)
+  (dolist (weakness '(nil))
+    (dolist (n-keys '(32 64))
+      (dolist (n-constants '(5 6 7 8 13 16 17))
+        (let ((constant-prefix (loop for i below n-constants collect i)))
+          (sb-sys:without-gcing
+            (dolist (size '(7 8 200))
+              (let* ((h (make-hash-table :test 'equal :size size
+                                         :weakness weakness))
+                     (orig-max-chain-length (ht-max-chain-length h)))
+                (format t "weakness: ~S, n-constants: ~S, size: ~S, ~
+                           orig-max-chain-length: ~S~%"
+                        weakness n-constants size orig-max-chain-length)
+                (loop for i below n-keys do
+                  (let ((key (append constant-prefix (list i))))
+                    (setf (gethash key h) t))
+                  (check-sxstate-limit h)
+                  (check-sxstate-max-chain-length h)
+                  (let* ((must-have-raised-limit-p (< orig-max-chain-length
+                                                      (hash-table-count h)))
+                         (n-distinct-hashes
+                           (count 0 (sb-impl::hash-table-index-vector h)
+                                  :test-not #'eql)))
+                    (format t "at count ~S: max-chain-length: ~S, ~
+                             limit: ~S, n-distinct-hashes: ~S~%"
+                            (hash-table-count h)
+                            (ht-max-chain-length h) (ht-limit h)
+                            n-distinct-hashes)
+                    (cond (must-have-raised-limit-p
+                           (assert (< n-constants (ht-limit h)))
+                           (assert (> n-distinct-hashes 1)))
+                          (t
+                           (assert (= n-distinct-hashes 1))))))))))))))
+
+(with-test (:name (:adaptive-equal-hash :truncate-list))
+  (let ((hash-0 (sb-impl::perhaps-truncated-equal-hash () 1)))
+    (assert (not (truncated-hash-p hash-0)))
+    ;; The final NIL does not count towards the limit.
+    (let ((hash-1 (sb-impl::perhaps-truncated-equal-hash '(1) 1)))
+      (assert (not (truncated-hash-p hash-1)))
+      (assert (/= hash-1 hash-0))
+      ;; The final cons is not in the hash.
+      (let ((hash-2 (sb-impl::perhaps-truncated-equal-hash '(1 2) 1))
+            (hash-3 (sb-impl::perhaps-truncated-equal-hash '(1 3) 1)))
+        (assert (truncated-hash-p hash-2))
+        (assert (= hash-2 hash-3))))))
+
+(with-test (:name (:adaptive-equal-hash :truncate-string))
+  (flet ((hash (string limit)
+           (sb-impl::perhaps-truncated-equal-hash string limit)))
+    (let ((hash-0 (hash "1234" 4))
+          (hash-1 (hash "12a34" 4))
+          (hash-2 (hash "12a34" 5)))
+      (assert (not (truncated-hash-p hash-0)))
+      (assert (truncated-hash-p hash-1))
+      (assert (/= hash-0 hash-1))
+      (assert (not (truncated-hash-p hash-2)))
+      (assert (/= hash-1 hash-2)))))
+
+(with-test (:name (:adaptive-equal-hash :eql-hash-not-truncated))
+  (assert (not (truncated-hash-p (sb-impl::perhaps-truncated-equal-hash
+                                  (ash 1 +truncated-hash-bit+) 0)))))

@@ -18,8 +18,7 @@
 #include <stdio.h>
 #include <sys/param.h>
 #include <sys/file.h>
-#include "sbcl.h"
-#include "./signal.h"
+#include "genesis/sbcl.h"
 #include "os.h"
 #include "arch.h"
 #include "globals.h"
@@ -35,7 +34,6 @@
 #include <sys/prctl.h>
 
 #include "validate.h"
-#include "ppc-linux-mcontext.h"
 
 int arch_os_thread_init(struct thread *thread) {
     /* For some reason, PPC Linux appears to default to not generating
@@ -63,84 +61,37 @@ int arch_os_thread_cleanup(struct thread *thread) {
 os_context_register_t   *
 os_context_register_addr(os_context_t *context, int offset)
 {
-#if defined(GLIBC231_STYLE_UCONTEXT)
-    return &((context->uc_mcontext.regs)->gpr[offset]);
-#elif defined(GLIBC232_STYLE_UCONTEXT)
-    return &((context->uc_mcontext.uc_regs->gregs)[offset]);
-#endif
-}
-
-os_context_register_t *
-os_context_pc_addr(os_context_t *context)
-{
-#if defined(GLIBC231_STYLE_UCONTEXT)
-    return &((context->uc_mcontext.regs)->nip);
-#elif defined(GLIBC232_STYLE_UCONTEXT)
-    return &((context->uc_mcontext.uc_regs->gregs)[PT_NIP]);
-#endif
+    return &context->uc_mcontext.regs->gpr[offset];
 }
 
 os_context_register_t *
 os_context_lr_addr(os_context_t *context)
 {
-#if defined(GLIBC231_STYLE_UCONTEXT)
-    return &((context->uc_mcontext.regs)->link);
-#elif defined(GLIBC232_STYLE_UCONTEXT)
-    return &((context->uc_mcontext.uc_regs->gregs)[PT_LNK]);
-#endif
+    return &context->uc_mcontext.regs->link;
 }
 
 os_context_register_t *
 os_context_ctr_addr(os_context_t *context)
 {
-    /* Like os_context_fp_control() and os_context_lr_addr(), this
-     * uses an index beyond the declared end of the array in order to
-     * find the correct register value in the context. */
-#if defined(GLIBC231_STYLE_UCONTEXT)
-    /* FIXME: This probably should be ->ctr instead of ->gpr[PT_CTR]. */
-    return &((context->uc_mcontext.regs)->gpr[PT_CTR]);
-#elif defined(GLIBC232_STYLE_UCONTEXT)
-    return &((context->uc_mcontext.uc_regs)->gregs[PT_CTR]);
-#endif
+    return &context->uc_mcontext.regs->ctr;
 }
 
 os_context_register_t *
 os_context_cr_addr(os_context_t *context)
 {
-    /* Like os_context_fp_control() and os_context_lr_addr(), this
-     * uses an index beyond the declared end of the array in order to
-     * find the correct register value in the context. */
-#if defined(GLIBC231_STYLE_UCONTEXT)
-    /* FIXME: This probably should be ->ccr instead of ->gpr[PT_CCR]. */
-    return &((context->uc_mcontext.regs)->gpr[PT_CCR]);
-#elif defined(GLIBC232_STYLE_UCONTEXT)
-    return &((context->uc_mcontext.uc_regs)->gregs[PT_CCR]);
-#endif
+    return &context->uc_mcontext.regs->ccr;
 }
 
 sigset_t *
 os_context_sigmask_addr(os_context_t *context)
 {
-#if defined(GLIBC231_STYLE_UCONTEXT)
     return &context->uc_sigmask;
-#elif defined(GLIBC232_STYLE_UCONTEXT)
-    return &context->uc_sigmask;
-#endif
 }
 
 unsigned long
 os_context_fp_control(os_context_t *context)
 {
-    /* So this may look like nice, well behaved code. However, closer
-       inspection reveals that gpr is simply the general purpose
-       registers, and PT_FPSCR is an offset that is larger than 32
-       (the number of ppc registers), but that happens to get the
-       right answer. -- CSR, 2002-07-11 */
-#if defined(GLIBC231_STYLE_UCONTEXT)
-    return context->uc_mcontext.regs->gpr[PT_FPSCR];
-#elif defined(GLIBC232_STYLE_UCONTEXT)
-    return context->uc_mcontext.uc_regs->gregs[PT_FPSCR];
-#endif
+    return ((unsigned long*)context->uc_mcontext.regs)[PT_FPSCR];
 }
 
 void

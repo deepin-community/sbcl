@@ -11,12 +11,6 @@
 
 (in-package :sb-concurrency-test)
 
-(defmacro deftest* ((name &key fails-on) form &rest results)
-  `(progn
-     (when (sb-impl::featurep ',fails-on)
-       (pushnew ',name sb-rt::*expected-failures*))
-     (deftest ,name ,form ,@results)))
-
 ;; XXX something like clock_getres(CLOCK_REALTIME, ...) would be better
 (defvar *minimum-sleep*
   #+(or openbsd netbsd sunos) 0.01
@@ -32,7 +26,7 @@
           (a 0)
           (b 0)
           (c 0)
-          (run! nil)
+          (run! (sb-thread:make-semaphore))
           (w-e! (cons :write-oops nil))
           (r-e! (cons :read-oops nil)))
       (flet ((maybe-pause (pause &optional value)
@@ -47,7 +41,7 @@
                     collect
                        (make-thread
                         (lambda ()
-                          (loop until run! do (thread-yield))
+                          (sb-thread:wait-on-semaphore run!)
                           (handler-case
                               (loop repeat read-count
                                     do (multiple-value-bind (a b c)
@@ -62,7 +56,7 @@
               (loop repeat writer-count
                     collect (make-thread
                              (lambda ()
-                               (loop until run! do (thread-yield))
+                               (sb-thread:wait-on-semaphore run!)
                                (handler-case
                                    (loop repeat write-count
                                          do (frlock-write (rw)
@@ -82,12 +76,12 @@
                                  (error (e)
                                    (sb-ext:atomic-update (cdr w-e!) #'cons e))))))
               (progn
-                (setf run! t)
+                (sb-thread:signal-semaphore run! (+ reader-count writer-count))
                 nil))))
       (values (cdr w-e!) (cdr r-e!))))
 
 #+sb-thread
-(deftest* (frlock.1)
+(deftest frlock.1
     (handler-case
         (sb-ext:with-timeout 40
           (test-frlocks #+win32 :outer-write-pause #+win32 t ))

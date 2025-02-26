@@ -47,7 +47,8 @@
                           (declare (ignore c))
                           (setq warnp 'warning))))
          (with-compilation-unit () ,@forms))
-       (when (and (or warnp style-warnp) *fail-on-warnings*)
+       (when (and (string>= (cl:lisp-implementation-version) "2.1")
+                  (or warnp style-warnp) *fail-on-warnings*)
          (cerror "Proceed anyway"
                  "make-host-1 stopped due to unexpected ~A." (or warnp style-warnp))))
 
@@ -70,48 +71,12 @@
 
 ;;; Build the unicode database now. It depends on nothing in the cross-compiler
 ;;; (and let's keep it that way). This code is slow to run, so compile it.
-(let ((inputs '("tools-for-build/ucd.lisp"
-                "tools-for-build/UnicodeData.txt"
-                "tools-for-build/NormalizationCorrections.txt"
-                "tools-for-build/CompositionExclusions.txt"
-                "tools-for-build/SpecialCasing.txt"
-                "tools-for-build/EastAsianWidth.txt"
-                "tools-for-build/Scripts.txt"
-                "tools-for-build/LineBreak.txt"
-                "tools-for-build/DerivedAge.txt"
-                "tools-for-build/allkeys.txt"
-                "tools-for-build/ConfusablesEdited.txt"
-                "tools-for-build/BidiMirroring.txt"
-                "tools-for-build/Blocks.txt"
-                "tools-for-build/Jamo.txt"
-                "tools-for-build/CaseFolding.txt"
-                "tools-for-build/PropList.txt"
-                "tools-for-build/DerivedNormalizationProps.txt"
-                "tools-for-build/more-ucd-consts.lisp-expr"))
-      (outputs '("output/bidi-mirrors.lisp-expr"
-                 "output/block-ranges.lisp-expr"
-                 "output/block-names.lisp-expr"
-                 "output/case.dat"
-                 "output/CaseFolding.txt"
-                 "output/casepages.dat"
-                 "output/casepages.lisp-expr"
-                 "output/collation.dat"
-                 "output/comp.dat"
-                 "output/confusables.lisp-expr"
-                 "output/decomp.dat"
-                 "output/foldcases.lisp-expr"
-                 "output/misc-properties.lisp-expr"
-                 "output/n-collation-entries.lisp-expr"
-                 "output/numerics.lisp-expr"
-                 "output/other-collation-info.lisp-expr"
-                 "output/titlecases.lisp-expr"
-                 "output/ucd1-names.lisp-expr"
-                 "output/ucdhigh.dat"
-                 "output/ucdlow.dat"
-                 "output/ucdmisc.dat"
-                 "output/ucd-names.lisp-expr")))
+(multiple-value-bind (inputs outputs)
+    (with-open-file (stream "src/cold/ucd-filespecs.lisp-expr")
+      (values (read stream) (read stream)))
   (unless (outputs-up-to-date inputs outputs)
     (format t "~&; Building Unicode data~%")
+    (ensure-directories-exist "output/ucd/")
     (let ((*ucd-inputs* (make-hash-table :test 'equal))
           (*ucd-outputs* (make-hash-table :test 'equal)))
       (dolist (input inputs)
@@ -150,6 +115,12 @@
                   ~@[Extra ucd outputs: ~A~%~]"
                  unused-inputs extra-inputs
                  unused-outputs extra-outputs))))))
+
+;;; I don't know the best combination of OPTIMIZE qualities to produce a correct
+;;; and reasonably fast cross-compiler in ECL. At over half an hour to complete
+;;; make-host-{1,2}, I don't really want to waste any more time finding out.
+;;; These settings work, while the defaults do not.
+#+ecl (proclaim '(optimize (safety 2) (debug 2)))
 
 (maybe-with-compilation-unit
   ;; If make-host-1 is parallelized, it will produce host fasls without loading

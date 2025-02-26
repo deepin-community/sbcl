@@ -11,14 +11,15 @@
   ;; to the return address? Without it, backtraces get truncated and
   ;; are incorrect. Are the other backends wrong as well by not adding
   ;; 8?
-  (+ (context-register scp lip-offset) 8))
+  (+ (context-register scp ra-offset) 8))
 
 
 ;;; CONTEXT-FLOAT-REGISTER
 (define-alien-routine ("os_context_float_register_addr" context-float-register-addr)
   (* unsigned) (context (* os-context-t)) (index int))
 
-(defun context-float-register (context index format)
+(defun context-float-register (context index format &optional integer)
+  (declare (ignore integer))
   (let ((sap (alien-sap (context-float-register-addr context index))))
     (ecase format
       (single-float

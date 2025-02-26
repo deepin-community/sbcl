@@ -14,15 +14,12 @@
 ;;; We need to define these predicates, since the TYPEP source
 ;;; transform picks whichever predicate was defined last when there
 ;;; are multiple predicates for equivalent types.
-(define-source-transform short-float-p (x) `(single-float-p ,x))
 #-long-float
 (define-source-transform long-float-p (x) `(double-float-p ,x))
 
 (define-source-transform compiled-function-p (x)
   (once-only ((x x))
-    `(and (functionp ,x)
-          #+(or sb-fasteval sb-eval)
-          (not (typep ,x 'interpreted-function)))))
+    `(and (functionp ,x) (not (funcallable-instance-p ,x)))))
 
 (define-source-transform char-int (x)
   `(char-code ,x))
@@ -32,12 +29,6 @@
 
 (deftransform make-symbol ((string) (simple-string))
   `(%make-symbol 0 string))
-
-#-immobile-space
-(define-source-transform %make-symbol (kind string)
-  (declare (ignore kind))
-  ;; Set "logically read-only" bit in pname.
-  `(sb-vm::%%make-symbol (logior-header-bits ,string ,sb-vm:+vector-shareable+)))
 
 ;;; We don't want to clutter the bignum code.
 #+(and (or x86 x86-64) (not bignum-assertions))
@@ -93,10 +84,18 @@
                          sb-vm:bignum-digits-offset
                          index offset))
 
-(defun dd-contains-raw-slots-p (dd)
-  (dolist (dsd (dd-slots dd))
-    (unless (eq (dsd-raw-type dsd) t) (return t))))
-
+;;; When copying a structure, try to make the best decision possible
+;;; as to placement. This matters in a few circumstances:
+;;; - when the "system" mixed TLAB is different from the "user" mixed TLAB.
+;;; - when we distinguish boxed from mixed allocation to generation 0.
+;;; GIVE-UP-IR1-TRANSFORM might put the allocation in the wrong TLAB,
+;;; as the general fallback doesn't make the same distinctions.
+;;; Unfortunately the DEFSTRUCT-defined copiers were not inlining even when
+;;; explicitly requested, because COPY-SOMESTRUCT always transforms into
+;;; COPY-STRUCTURE, so we've lost any declared inline-ness of COPY-SOMESTRUCT.
+;;; Therefore we just try to infer it based on whether this transform is
+;;; "acting as" COPY-SOMESTRUCT for a particular struct whose copier
+;;; was requested to be inline.
 (deftransform copy-structure ((instance) * * :result result :node node)
   (let* ((classoid (lvar-type instance))
          (name (and (structure-classoid-p classoid) (classoid-name classoid)))
@@ -108,19 +107,22 @@
          (class-eq (and name
                         (eq (classoid-state classoid) :sealed)
                         (not (classoid-subclasses classoid))))
-         (dd (and class-eq (wrapper-info layout)))
+         (dd (and class-eq (layout-info layout)))
+         (dd-copier (and dd (sb-kernel::dd-copier-name dd)))
          (max-inlined-words 5))
     (unless (and result ; could be unused result (but entire call wasn't flushed?)
                  layout
-                 ;; And don't copy if raw slots are present on the precisely GCed backends.
-                 ;; To enable that, we'd want variants for {"all-raw", "all-boxed", "mixed"}
+                 ;; Fail if raw slots are present on the precisely GCed backends.
                  ;; Also note that VAR-ALLOC can not cope with dynamic-extent except where
                  ;; support has been added (x86oid so far); so requiring an exact type here
                  ;; causes VAR-ALLOC to become FIXED-ALLOC which works on more architectures.
-                 #-c-stack-is-control-stack (and dd (not (dd-contains-raw-slots-p dd)))
+                 #-c-stack-is-control-stack (and dd (not (dd-has-raw-slot-p dd)))
 
                  ;; Definitely do this if copying to stack
-                 (or (lvar-dynamic-extent result)
+                 ;; (Allocation has to be inlined, otherwise there's no way to DX it)
+                 (or (node-stack-allocate-p node)
+                     (and dd-copier
+                          (eq (sb-int:info :function :inlinep dd-copier) 'inline))
                      ;; Or if it's a small fixed number of words
                      ;; and speed at least as important as size.
                      (and class-eq
@@ -132,24 +134,27 @@
     ;;   depending on whether layouts are in immobile space.
     ;; - for a small number of slots, copying them is inlined
     (cond ((not dd) ; it's going to be some subtype of NAME
-           `(%copy-instance (%make-instance (%instance-length instance)) instance))
-          ((<= (dd-length dd) max-inlined-words)
-           `(let ((copy (%make-structure-instance ,dd nil)))
-              ;; ASSUMPTION: either %INSTANCE-REF is the correct accessor for this word,
-              ;; or the GC will treat random bit patterns as conservative pointers
-              ;; (i.e. not alter them if %INSTANCE-REF is not the correct accessor)
-              ,@(loop for i from sb-vm:instance-data-start below (dd-length dd)
-                      collect `(%instance-set copy ,i (%instance-ref instance ,i)))
-              copy))
-          (t
-           `(%copy-instance-slots (%make-structure-instance ,dd nil) instance)))))
+           ;; pessimistically assume MIXED rather than choosing at runtime
+           `(%copy-instance (%make-instance/mixed (%instance-length instance)) instance))
+          ((not (logtest (dd-flags dd) +dd-varylen+)) ; fixed length
+           ;; ASSUMPTION: either %INSTANCE-REF is the correct accessor for this word,
+           ;; or the GC will treat random bit patterns as conservative pointers
+           ;; (i.e. not alter them if %INSTANCE-REF is not the correct accessor)
+           (if (> (dd-length dd) max-inlined-words)
+               `(%copy-instance-slots (%make-structure-instance ,dd nil) instance)
+               `(let ((copy (%make-structure-instance ,dd nil)))
+                  ,@(loop for i from sb-vm:instance-data-start below (dd-length dd)
+                       collect `(%instance-set copy ,i (%instance-ref instance ,i)))
+                  copy)))
+          (t ; variable-length
+           `(let ((copy (,(if (dd-has-raw-slot-p dd) '%make-instance/mixed '%make-instance)
+                          (%instance-length instance))))
+              (%set-instance-layout copy (%instance-layout instance))
+              (%copy-instance-slots copy instance))))))
 
 (defun varying-length-struct-p (classoid)
-  ;; This is a nice feature to have in general, but at present it is only possible
-  ;; to make varying length instances of SB-VM:LAYOUT (or WRAPPER if that is the same type),
-  ;; and nothing else.
-  (eq classoid (load-time-value (find-classoid #+metaspace 'sb-vm:layout
-                                               #-metaspace 'wrapper))))
+  (let ((dd (find-defstruct-description (classoid-name classoid))))
+    (logtest (dd-flags dd) +dd-varylen+)))
 
 (deftransform %instance-length ((instance))
   (let ((classoid (lvar-type instance)))
@@ -159,26 +164,133 @@
              (not (varying-length-struct-p classoid))
              ;; TODO: if sealed with subclasses which add no slots, use the fixed length
              (not (classoid-subclasses classoid)))
-        (dd-length (wrapper-dd (sb-kernel::compiler-layout-or-lose (classoid-name classoid))))
+        (dd-length (layout-dd (sb-kernel::compiler-layout-or-lose (classoid-name classoid))))
         (give-up-ir1-transform))))
 
-(define-source-transform %instance-wrapper (x) `(layout-friend (%instance-layout ,x)))
-(define-source-transform %fun-wrapper (x) `(layout-friend (%fun-layout ,x)))
+;;; This doesn't help a whole lot, but it does fire during compilation of 'info-vector'
+;;; which uses variable-length instances of PACKED-INFO, having no slot transforms.
+(define-source-transform (setf %instance-ref) (newval instance index)
+  `(let ((.newval. ,newval)
+         (.instance. ,instance)
+         (.index. ,index))
+     (%instance-set .instance. .index. .newval.)
+     .newval.))
 
-;;; *** These transforms should be the only code, aside from the C runtime
-;;;     with knowledge of the layout index.
 #+compact-instance-header
 (define-source-transform function-with-layout-p (x) `(functionp ,x))
 #-compact-instance-header
 (progn
+  (define-source-transform function-with-layout-p (x) `(funcallable-instance-p ,x))
+  ;; Nothing but these transforms should assume that slot 0 holds a layout
   (define-source-transform %instance-layout (x)
-    `(truly-the sb-vm:layout (%instance-ref ,x 0)))
+    `(truly-the layout (%instance-ref ,x 0)))
   (define-source-transform %set-instance-layout (instance layout)
-    `(%instance-set ,instance 0 (the sb-vm:layout ,layout)))
-  (define-source-transform function-with-layout-p (x)
-    `(funcallable-instance-p ,x)))
+    `(%instance-set ,instance 0 (the layout ,layout))))
 
 ;;;; simplifying HAIRY-DATA-VECTOR-REF and HAIRY-DATA-VECTOR-SET
+
+
+(defun hairy-data-vector-ref-transform (array node accessor)
+  (declare (ignorable node))
+  (let* ((type (lvar-type array))
+         (element-ctype (array-type-upgraded-element-type type))
+         (declared-element-ctype (node-derived-type node))
+         (simple (csubtypep type (specifier-type 'simple-array)))
+         stringp)
+    (unless simple
+      (if-vop-existsp (:named %data-vector-and-index)
+                      (delay-ir1-transform node :ir1-phases)
+                      (give-up-ir1-transform "Not a simple array")))
+
+    (when (and (eq *wild-type* element-ctype)
+               (not (and (not simple)
+                         (setf stringp (csubtypep type (specifier-type 'string))))))
+      (give-up-ir1-transform
+       "Upgraded element type of array is not known at compile time."))
+    ;; (The expansion here is basically a degenerate case of
+    ;; WITH-ARRAY-DATA. Since WITH-ARRAY-DATA is implemented as a
+    ;; macro, and macros aren't expanded in transform output, we have
+    ;; to hand-expand it ourselves.)
+    (let* ((element-type-specifier (type-specifier element-ctype)))
+      `(multiple-value-bind (data offset)
+           (truly-the (simple-array ,element-type-specifier 1)
+                      (,accessor array index))
+         ,(let ((bare-form
+                  (if stringp
+                      `(if (simple-base-string-p data)
+                           (data-vector-ref (truly-the (simple-array base-char (*)) data) offset)
+                           (data-vector-ref (truly-the (simple-array character (*)) data) offset))
+                      '(data-vector-ref data offset))))
+            (cond ((eql element-ctype *empty-type*)
+                   `(data-nil-vector-ref data offset))
+                  ((type= element-ctype declared-element-ctype)
+                   bare-form)
+                  (t
+                   (the-unwild declared-element-ctype bare-form))))))))
+
+(defun hairy-data-vector-set-transform (array new-value node accessor)
+  (declare (ignorable node))
+  (let* ((type (lvar-type array))
+         (element-ctype (array-type-upgraded-element-type type))
+         (declared-element-ctype (declared-array-element-type type))
+         (simple (csubtypep type (specifier-type 'simple-array)))
+         stringp
+         vector-t)
+    (unless simple
+      (if-vop-existsp (:named %data-vector-and-index)
+                      (delay-ir1-transform node :ir1-phases)
+                      (give-up-ir1-transform "Not a simple array")))
+    (when (and (eq *wild-type* element-ctype)
+               (not (and (not simple)
+                         (setf stringp (csubtypep type (specifier-type 'string))))))
+      ;; The new value is only suitable for a simple-vector
+      (if (csubtypep (lvar-type new-value) (specifier-type '(not (or number character))))
+          (setf vector-t t
+                element-ctype *universal-type*)
+          (give-up-ir1-transform
+           "Upgraded element type of array is not known at compile time.")))
+    (let ((element-type-specifier (type-specifier element-ctype)))
+      (multiple-value-bind (new-value truly-new-value)
+          (cond ((type= element-ctype declared-element-ctype)
+                 (values 'new-value 'new-value))
+                (stringp
+                 (values 'new-value '(truly-the character new-value)))
+                (t
+                 (values (the-unwild declared-element-ctype 'new-value)
+                         (truly-the-unwild declared-element-ctype 'new-value))))
+        `(multiple-value-bind (data index) (,accessor array index)
+           (declare ,@(unless stringp
+                        `((type ,element-type-specifier new-value))))
+           ,@(when vector-t
+               `((unless (simple-vector-p data)
+                   (sb-c::%type-check-error/c array 'sb-kernel::object-not-vector-t-error nil))))
+           (let ((data (truly-the (simple-array ,element-type-specifier 1) data)))
+             ,(if stringp
+                  `(if (simple-base-string-p data)
+                       (data-vector-set (truly-the (simple-array base-char (*)) data) index (the base-char ,new-value))
+                       (data-vector-set (truly-the (simple-array character (*)) data) index (the character ,new-value)))
+                  `(data-vector-set data index ,new-value))
+             ,truly-new-value))))))
+
+(deftransform hairy-data-vector-ref ((array index) * * :node node)
+  "avoid runtime dispatch on array element type"
+  (hairy-data-vector-ref-transform array node '%data-vector-and-index))
+
+(deftransform hairy-data-vector-set ((array index new-value)
+                                     (array t t)
+                                     * :node node)
+  "avoid runtime dispatch on array element type"
+  (hairy-data-vector-set-transform array new-value node '%data-vector-and-index))
+
+(when-vop-existsp (:named %data-vector-and-index/check-bound)
+  (deftransform hairy-data-vector-ref/check-bounds ((array index) * * :node node)
+    "avoid runtime dispatch on array element type"
+    (hairy-data-vector-ref-transform array node '%data-vector-and-index/check-bound))
+  (deftransform hairy-data-vector-set/check-bounds ((array index new-value)
+                                                    (array t t)
+                                                    * :node node)
+    "avoid runtime dispatch on array element type"
+    (hairy-data-vector-set-transform array new-value node '%data-vector-and-index/check-bound)))
 
 (deftransform hairy-data-vector-ref ((string index) (simple-string t))
   (let ((ctype (lvar-type string)))
@@ -191,35 +303,6 @@
           #+sb-unicode
           ((simple-array base-char (*))
            (data-vector-ref string index))))))
-
-;;; This and the corresponding -SET transform work equally well on non-simple
-;;; arrays, but after benchmarking (on x86), Nikodemus didn't find any cases
-;;; where it actually helped with non-simple arrays -- to the contrary, it
-;;; only made for bigger and up to 100% slower code.
-(deftransform hairy-data-vector-ref ((array index) (simple-array t) *)
-  "avoid runtime dispatch on array element type"
-  (let* ((type (lvar-type array))
-         (element-ctype (array-type-upgraded-element-type type))
-         (declared-element-ctype (declared-array-element-type type)))
-    (declare (type ctype element-ctype))
-    (when (eq *wild-type* element-ctype)
-      (give-up-ir1-transform
-       "Upgraded element type of array is not known at compile time."))
-    ;; (The expansion here is basically a degenerate case of
-    ;; WITH-ARRAY-DATA. Since WITH-ARRAY-DATA is implemented as a
-    ;; macro, and macros aren't expanded in transform output, we have
-    ;; to hand-expand it ourselves.)
-    (let* ((element-type-specifier (type-specifier element-ctype)))
-      `(multiple-value-bind (array index)
-           (%data-vector-and-index array index)
-         (declare (type (simple-array ,element-type-specifier 1) array))
-         ,(let ((bare-form '(data-vector-ref array index)))
-            (cond ((eql element-ctype *empty-type*)
-                   `(data-nil-vector-ref array index))
-                  ((type= element-ctype declared-element-ctype)
-                   bare-form)
-                  (t
-                   (the-unwild declared-element-ctype bare-form))))))))
 
 ;;; Transform multi-dimensional array to one dimensional data vector
 ;;; access.
@@ -276,41 +359,14 @@
         ;; so explicitly return the NEW-VALUE
         `(typecase string
            ((simple-array character (*))
-            (let ((c (the* (character :context :aref) new-value)))
+            (let ((c (the* (character :context aref-context) new-value)))
               (data-vector-set string index c)
               c))
            #+sb-unicode
            ((simple-array base-char (*))
-            (let ((c (the* (base-char :context :aref :silent-conflict t) new-value)))
+            (let ((c (the* (base-char :context aref-context :silent-conflict t) new-value)))
               (data-vector-set string index c)
               c))))))
-
-;;; This and the corresponding -REF transform work equally well on non-simple
-;;; arrays, but after benchmarking (on x86), Nikodemus didn't find any cases
-;;; where it actually helped with non-simple arrays -- to the contrary, it
-;;; only made for bigger and up 1o 100% slower code.
-(deftransform hairy-data-vector-set ((array index new-value)
-                                     (simple-array t t)
-                                     *)
-  "avoid runtime dispatch on array element type"
-  (let* ((type (lvar-type array))
-         (element-ctype (array-type-upgraded-element-type type))
-         (declared-element-ctype (declared-array-element-type type)))
-    (declare (type ctype element-ctype))
-    (when (eq *wild-type* element-ctype)
-      (give-up-ir1-transform
-       "Upgraded element type of array is not known at compile time."))
-    (let ((element-type-specifier (type-specifier element-ctype)))
-      `(multiple-value-bind (array index)
-           (%data-vector-and-index array index)
-         (declare (type (simple-array ,element-type-specifier 1) array)
-                  (type ,element-type-specifier new-value))
-         ,(if (type= element-ctype declared-element-ctype)
-              '(progn (data-vector-set array index new-value)
-                      new-value)
-              `(progn (data-vector-set array index
-                       ,(the-unwild declared-element-ctype 'new-value))
-                      ,(truly-the-unwild declared-element-ctype 'new-value)))))))
 
 ;;; Transform multi-dimensional array to one dimensional data vector
 ;;; access.
@@ -358,75 +414,92 @@
                              sb-vm:vector-data-offset
                              index offset t))))
 
-(defun simple-array-storage-vector-type (type)
-  (let ((dims (array-type-dimensions type)))
-    (cond ((array-type-complexp type)
-           nil)
-          (t
-           `(simple-array ,(type-specifier
-                            (array-type-specialized-element-type type))
-                          (,(if (and (listp dims)
-                                     (every #'integerp dims))
-                                (reduce #'* dims)
-                                '*)))))))
+(defun array-storage-type (type final)
+  (flet ((one (type)
+           (let ((dims (array-type-dimensions type)))
+             (specifier-type
+              (cond ((not (array-type-complexp type))
+                     `(simple-array ,(type-specifier
+                                      (array-type-specialized-element-type type))
+                                    (,(if (and (listp dims)
+                                               (every #'integerp dims))
+                                          (reduce #'* dims)
+                                          '*))))
+                    (t
+                     (if final
+                         `(simple-array ,(type-specifier (array-type-specialized-element-type type))
+                                        (*))
+                         `(array ,(type-specifier (array-type-specialized-element-type type))))))))))
+    (typecase type
+      (array-type
+       (one type))
+      (union-type
+       (let ((types))
+         (loop for type in (union-type-types type)
+               for derived = (and (array-type-p type)
+                                  (one type))
+               if derived
+               do (push derived types)
+               else return (and final
+                                (specifier-type '(simple-array * (*))))
+               finally (return (sb-kernel::%type-union types)))))
+      (t
+       (when final
+         (specifier-type '(simple-array * (*))))))))
 
 (defoptimizer (array-storage-vector derive-type) ((array))
-  (let ((atype (lvar-type array)))
-    (when (array-type-p atype)
-      (specifier-type (or (simple-array-storage-vector-type atype)
-                          `(simple-array ,(type-specifier
-                                           (array-type-specialized-element-type atype))
-                                         (*)))))))
+  (array-storage-type (lvar-type array) t))
 
 (deftransform array-storage-vector ((array) ((simple-array * (*))))
   'array)
 
 (defoptimizer (%array-data derive-type) ((array))
-  (let ((atype (lvar-type array)))
-    (when (array-type-p atype)
-      (specifier-type (or
-                       (simple-array-storage-vector-type atype)
-                       `(array ,(type-specifier
-                                 (array-type-specialized-element-type atype))))))))
+  (array-storage-type (lvar-type array) nil))
 
-(defoptimizer (%data-vector-and-index derive-type) ((array index))
+(defoptimizers derive-type (%data-vector-and-index
+                            %data-vector-and-index/check-bound) ((array index))
   (let ((atype (lvar-type array))
         (index-type (lvar-type index)))
-    (when (array-type-p atype)
-      (values-specifier-type
-       `(values ,(or
-                  (simple-array-storage-vector-type atype)
-                  `(simple-array ,(type-specifier
-                                   (array-type-specialized-element-type atype))
-                                 (*)))
-                ,(if (and (integer-type-p index-type)
-                          (numeric-type-low index-type))
-                     `(integer ,(numeric-type-low index-type)
-                               (,array-dimension-limit))
-                     `index))))))
+    (values-specifier-type
+     `(values ,(type-specifier (array-storage-type atype t))
+              ,(if (and (integer-type-p index-type)
+                        (numeric-type-low index-type))
+                   `(integer ,(numeric-type-low index-type)
+                             (,array-dimension-limit))
+                   `index)))))
 
-(deftransform %data-vector-and-index ((%array %index)
+(deftransform %data-vector-and-index ((array index)
                                       (simple-array t)
                                       *)
-  ;; KLUDGE: why the percent signs?  Well, ARRAY and INDEX are
-  ;; respectively exported from the CL and SB-INT packages, which
-  ;; means that they're visible to all sorts of things.  If the
-  ;; compiler can prove that the call to ARRAY-HEADER-P, below, either
-  ;; returns T or NIL, it will delete the irrelevant branch.  However,
-  ;; user code might have got here with a variable named CL:ARRAY, and
-  ;; quite often compiler code with a variable named SB-INT:INDEX, so
-  ;; this can generate code deletion notes for innocuous user code:
-  ;; (DEFUN F (ARRAY I) (DECLARE (SIMPLE-VECTOR ARRAY)) (AREF ARRAY I))
-  ;; -- CSR, 2003-04-01
+  (upgraded-element-type-specifier-or-give-up array)
 
-  ;; We do this solely for the -OR-GIVE-UP side effect, since we want
-  ;; to know that the type can be figured out in the end before we
-  ;; proceed, but we don't care yet what the type will turn out to be.
-  (upgraded-element-type-specifier-or-give-up %array)
+  '(if (array-header-p array)
+       (values (%array-data array) index)
+       (values array index)))
 
-  '(if (array-header-p %array)
-       (values (%array-data %array) %index)
-       (values %array %index)))
+(deftransform %data-vector-and-index/check-bound ((array index)
+                                                  (simple-array t))
+  (upgraded-element-type-specifier-or-give-up array)
+  '(multiple-value-bind (data index)
+    (if (array-header-p array)
+        (values (%array-data array) index)
+        (values array index))
+    (%check-bound array (length data) index)
+    (values array index)))
+
+;;; Only use %data-vector-and-index if element-type is known. Always
+;;; using %data-vector-and-index will not help if a call to
+;;; hairy-data-vector-ref is still needed.
+(deftransform %data-vector-and-index/known ((array index) * * :node node)
+  (let ((type (lvar-type array)))
+    (cond ((csubtypep type (specifier-type '(simple-array * (*))))
+           `(values array index))
+          ((and (eq (array-type-upgraded-element-type type) *wild-type*)
+                (not (csubtypep type (specifier-type 'string))))
+           (delay-ir1-transform node :constraint)
+           `(values array index))
+          (t
+           `(%data-vector-and-index array index)))))
 
 ;;;; BIT-VECTOR hackery
 
@@ -436,42 +509,43 @@
 ;;; of the last word to be operated on, so they are effectively
 ;;; in an indeterminate state which is why equality testing, COUNT,
 ;;; and FIND have to ignore them.
-(deftransform bit-op->word-op ((bit-array-1 bit-array-2 result-bit-array)
-                               (simple-bit-vector simple-bit-vector simple-bit-vector)
-                               *
-                               :node node :defun-only t :info wordfun)
-  `(let ((length (vector-length result-bit-array)))
-     ,@(unless (policy node (zerop safety))
-         `((unless (= length
-                      ,@(unless (same-leaf-ref-p bit-array-1 result-bit-array)
-                          '((vector-length bit-array-1)))
-                      (vector-length bit-array-2))
-             (error "Argument and/or result bit arrays are not the same length:~
+(defun make-bit-op->word-op-transform (wordfun)
+  (deftransform bit-op->word-op ((bit-array-1 bit-array-2 result-bit-array)
+                                 (simple-bit-vector simple-bit-vector simple-bit-vector)
+                                 *
+                                 :node node :defun-only lambda)
+    `(let ((length (vector-length result-bit-array)))
+       ,@(unless (policy node (zerop safety))
+           `((unless (= length
+                        ,@(unless (same-leaf-ref-p bit-array-1 result-bit-array)
+                            '((vector-length bit-array-1)))
+                        (vector-length bit-array-2))
+               (error "Argument and/or result bit arrays are not the same length:~
                          ~%  ~S~%  ~S  ~%  ~S"
-                    bit-array-1 bit-array-2 result-bit-array))))
-     (dotimes (index (ceiling length sb-vm:n-word-bits))
-       (declare (optimize (speed 3) (safety 0)) (type index index))
-       (setf (%vector-raw-bits result-bit-array index)
-             (,wordfun (%vector-raw-bits bit-array-1 index)
-                       (%vector-raw-bits bit-array-2 index))))
-     result-bit-array))
+                      bit-array-1 bit-array-2 result-bit-array))))
+       (dotimes (index (ceiling length sb-vm:n-word-bits))
+         (declare (optimize (speed 3) (safety 0)) (type index index))
+         (setf (%vector-raw-bits result-bit-array index)
+               (,wordfun (%vector-raw-bits bit-array-1 index)
+                         (%vector-raw-bits bit-array-2 index))))
+       result-bit-array)))
 
 (flet ((policy-test (node) (policy node (>= speed space))))
-(macrolet ((def (bitfun wordfun)
-             `(%deftransform ',bitfun #'policy-test
-                             '(function (simple-bit-vector simple-bit-vector simple-bit-vector)
-                                        *)
-                             (cons #'bit-op->word-op ',wordfun))))
- (def bit-and word-logical-and)
- (def bit-ior word-logical-or)
- (def bit-xor word-logical-xor)
- (def bit-eqv word-logical-eqv)
- (def bit-nand word-logical-nand)
- (def bit-nor word-logical-nor)
- (def bit-andc1 word-logical-andc1)
- (def bit-andc2 word-logical-andc2)
- (def bit-orc1 word-logical-orc1)
- (def bit-orc2 word-logical-orc2)))
+  (macrolet ((def (bitfun wordfun)
+               `(%deftransform ',bitfun #'policy-test
+                               '(function (simple-bit-vector simple-bit-vector simple-bit-vector)
+                                 *)
+                               (make-bit-op->word-op-transform ',wordfun))))
+    (def bit-and word-logical-and)
+    (def bit-ior word-logical-or)
+    (def bit-xor word-logical-xor)
+    (def bit-eqv word-logical-eqv)
+    (def bit-nand word-logical-nand)
+    (def bit-nor word-logical-nor)
+    (def bit-andc1 word-logical-andc1)
+    (def bit-andc2 word-logical-andc2)
+    (def bit-orc1 word-logical-orc1)
+    (def bit-orc2 word-logical-orc2)))
 
 (deftransform bit-not
               ((bit-array result-bit-array)
@@ -531,48 +605,6 @@
           (if (zerop (lvar-value item)) '(- length count) 'count)
           '(if (zerop item) (- length count) count))))
 
-;;; This transform does not require that ITEM be derived as BIT,
-;;; but at runtime it has to be.
-(deftransform fill ((sequence item) (simple-bit-vector t) *
-                    :policy (>= speed space))
-  `(let ((value (logand (- (the bit item)) most-positive-word)))
-     ;; Unlike for the SIMPLE-BASE-STRING case, we are allowed to touch
-     ;; bits beyond LENGTH with impunity.
-     (dotimes (index (ceiling (vector-length sequence) sb-vm:n-word-bits))
-       (declare (optimize (speed 3) (safety 0))
-                (type index index))
-       (setf (%vector-raw-bits sequence index) value))
-     sequence))
-
-(deftransform fill ((sequence item) (simple-base-string t) *
-                                    :policy (>= speed space))
-  (let ((multiplier (logand #x0101010101010101 most-positive-word)))
-    `(let* ((value ,(if (and (constant-lvar-p item) (typep item 'base-char))
-                        (* multiplier (char-code (lvar-value item)))
-                        ;; Use multiplication if it's known to be cheap
-                        #+(or x86 x86-64)
-                        `(* ,multiplier (char-code (the base-char item)))
-                        #-(or x86 x86-64)
-                        '(let ((code (char-code (the base-char item))))
-                          (setf code (dpb code (byte 8 8) code))
-                          (setf code (dpb code (byte 16 16) code))
-                          #+64-bit (dpb code (byte 32 32) code))))
-            (len (vector-length sequence))
-            (words (truncate len sb-vm:n-word-bytes)))
-       (dotimes (index words)
-         (declare (optimize (speed 3) (safety 0))
-                  (type index index))
-         (setf (%vector-raw-bits sequence index) value))
-       ;; For 64-bit:
-       ;;  if 1 more byte should be written, then shift-towards-start 56
-       ;;  if 2 more bytes ...               then shift-towards-start 48
-       ;;  etc
-       ;; This correctly rewrites the trailing null in its proper place.
-       (let ((bits (ash (mod len sb-vm:n-word-bytes) 3)))
-         (when (plusp bits)
-           (setf (%vector-raw-bits sequence words)
-                 (shift-towards-start value (- bits)))))
-       sequence)))
 
 ;;;; %BYTE-BLT
 
@@ -583,7 +615,7 @@
 ;;; currently (ca. sbcl-0.6.12.30) the main interface for code in
 ;;; SB-KERNEL and SB-SYS (e.g. i/o code). It's not clear that it's the
 ;;; ideal interface, though, and it probably deserves some thought.
-(deftransform %byte-blt ((src src-start dst dst-start dst-end)
+(deftransform %byte-blt ((src src-start dst dst-start nbytes)
                          ((or (simple-unboxed-array (*)) system-area-pointer)
                           index
                           (or (simple-unboxed-array (*)) system-area-pointer)
@@ -617,19 +649,21 @@
               (sap-ref-8 dst (1- dst-end)) (sap-ref-8 dst (1- dst-end))))
       (memmove (sap+ (sapify dst) dst-start)
                (sap+ (sapify src) src-start)
-               (- dst-end dst-start)))
+               nbytes))
      (values)))
 
 ;;;; transforms for EQL of floating point values
 (unless (vop-existsp :named sb-vm::eql/single-float)
-(deftransform eql ((x y) (single-float single-float))
-  '(= (single-float-bits x) (single-float-bits y))))
+(deftransform eql ((x y) (single-float single-float) * :node node)
+  (delay-ir1-transform node :ir1-phases)
+  '(eql (single-float-bits x) (single-float-bits y))))
 
 (unless (vop-existsp :named sb-vm::eql/double-float)
-(deftransform eql ((x y) (double-float double-float))
-  #-64-bit '(and (= (double-float-low-bits x) (double-float-low-bits y))
-                  (= (double-float-high-bits x) (double-float-high-bits y)))
-  #+64-bit '(= (double-float-bits x) (double-float-bits y))))
+(deftransform eql ((x y) (double-float double-float) * :node node)
+  (delay-ir1-transform node :ir1-phases)
+  #-64-bit '(and (eql (double-float-low-bits x) (double-float-low-bits y))
+             (eql (double-float-high-bits x) (double-float-high-bits y)))
+  #+64-bit '(eql (double-float-bits x) (double-float-bits y))))
 
 
 ;;;; modular functions
@@ -653,7 +687,7 @@
                      (push `(define-good-modular-fun ,fun :untagged t) result)
                      (push `(define-good-modular-fun ,fun :tagged t) result))))))
   (define-good-signed-modular-funs
-      logand logandc1 logandc2 logeqv logior lognand lognor lognot
+      logand logandc2 logeqv logior lognand lognor lognot
       logorc1 logorc2 logxor))
 
 ;;;; word-wise logical operations
@@ -689,7 +723,7 @@
   `(logand (logorc2 x y) ,most-positive-word))
 
 (deftransform word-logical-andc1 ((x y))
-  `(logand (logandc1 x y) ,most-positive-word))
+  `(logand (logandc2 y x) ,most-positive-word))
 
 (deftransform word-logical-andc2 ((x y))
   `(logand (logandc2 x y) ,most-positive-word))
@@ -757,15 +791,14 @@
   (logior sb-vm:character-widetag
           (ash (char-code (lvar-value obj)) sb-vm:n-widetag-bits)))
 
+;;; FIXME: The following should really be done by defining
+;;; UNBOUND-MARKER as a primitive object.
 ;; So that the PCL code walker doesn't observe any use of %PRIMITIVE,
 ;; MAKE-UNBOUND-MARKER is an ordinary function, not a macro.
 #-sb-xc-host
 (defun make-unbound-marker () ; for interpreters
   (sb-sys:%primitive make-unbound-marker))
-;; Get the main compiler to transform MAKE-UNBOUND-MARKER
-;; without the fopcompiler seeing it - the fopcompiler does
-;; expand compiler-macros, but not source-transforms -
-;; because %PRIMITIVE is not generally fopcompilable.
+;; Get the main compiler to transform MAKE-UNBOUND-MARKER.
 (sb-c:define-source-transform make-unbound-marker ()
   `(sb-sys:%primitive make-unbound-marker))
 

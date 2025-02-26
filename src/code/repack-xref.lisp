@@ -19,48 +19,6 @@
 
 (in-package "SB-C")
 
-(labels ((functoid-simple-fun (functoid)
-           (typecase functoid
-             (fdefn
-              (functoid-simple-fun (fdefn-fun functoid)))
-             (closure
-              (let ((fun (%closure-fun functoid)))
-                (if (and (eq (%fun-name fun) 'sb-impl::encapsulation))
-                    (functoid-simple-fun
-                     (sb-impl::encapsulation-info-definition
-                      (sb-impl::encapsulation-info functoid)))
-                    fun)))
-             ((and function (not funcallable-instance))
-              (%fun-fun functoid)))))
-
-  ;;; Note that this function is used by sb-introspect.
-  (defun map-simple-funs (function)
-    (let ((function (%coerce-callable-to-fun function)))
-      (labels ((process (name value)
-                 (awhen (functoid-simple-fun value)
-                   (funcall function name it))))
-        (call-with-each-globaldb-name
-         (lambda (name)
-           ;; In general it might be unsafe to call INFO with a NAME
-           ;; that is not valid for the kind of info being retrieved,
-           ;; as when the defaulting function tries to perform a
-           ;; sanity-check. But here it's safe.
-           (awhen (or (info :function :macro-function name)
-                      (info :function :definition name))
-             (cond
-               ((and (fdefn-p it)
-                     (typep (fdefn-fun it) 'generic-function))
-                (loop for method in (sb-mop:generic-function-methods (fdefn-fun it))
-                   for fun = (sb-pcl::safe-method-fast-function method)
-                   when fun do (process (sb-kernel:%fun-name fun) fun)))
-               ;; Methods are already processed above
-               ((and (fdefn-p it)
-                     (typep (fdefn-name it)
-                            '(cons (member sb-pcl::slow-method
-                                           sb-pcl::fast-method)))))
-               (t
-                (process name it))))))))))
-
 ;;; Repack all xref data vectors in the system, potentially making
 ;;; them compact, but without changing their meaning:
 ;;;
@@ -83,7 +41,10 @@
         (counts-by-name (make-hash-table :test #'equal))
         (all-unpacked '())
         (old-size 0)
-        (new-size 0))
+        (new-size 0)
+        (code-objects (make-array 64000 :fill-pointer 0)))
+    (sb-vm:map-code-objects (lambda (code) (vector-push-extend code code-objects)))
+
     (flet ((xref-size (xref)
              ;; Disregarding overhead for array headers, required
              ;; space is number of octets in nested octet-vector plus
@@ -94,31 +55,30 @@
       ;; Unpack (using old values of
       ;; **MOST-COMMON-XREF-NAMES-BY-{INDEX,NAME}**) xref data and count
       ;; occurrence frequencies of names.
-      (map-simple-funs
-       (lambda (name fun)
-         (declare (ignore name))
-         (binding* ((xrefs (%simple-fun-xrefs fun) :exit-if-null)
-                    (seen (make-hash-table :test #'equal))
-                    (unpacked '()))
-           ;; Record size of the xref data for this simple fun.
-           (incf old-size (xref-size xrefs))
-           (map-packed-xref-data
-            (lambda (kind name number)
-              ;; Count NAME, but only once for each FUN.
-              (unless (gethash name seen)
-                (setf (gethash name seen) t)
-                (incf (cdr (ensure-gethash name counts-by-name
-                                           (let ((cell (cons name 0)))
-                                             (push cell counts)
-                                             cell)))))
-              ;; Store (KIND NAME NUMBER) tuple for repacking.
-              (setf (getf unpacked kind) (nconc (getf unpacked kind)
-                                                (list (cons name number)))))
-            xrefs)
-           (unless unpacked (break))
-           ;; Store FUN and UNPACKED for repacking.
-           (push (cons fun unpacked) all-unpacked))))
-
+      (dovector (code code-objects)
+        (dotimes (i (code-n-entries code))
+          (let ((fun (%code-entry-point code i)))
+            (binding* ((xrefs (%simple-fun-xrefs fun) :exit-if-null)
+                       (seen (make-hash-table :test #'equal))
+                       (unpacked '()))
+              ;; Record size of the xref data for this simple fun.
+              (incf old-size (xref-size xrefs))
+              (map-packed-xref-data
+               (lambda (kind name number)
+                 ;; Count NAME, but only once for each FUN.
+                 (unless (gethash name seen)
+                   (setf (gethash name seen) t)
+                   (incf (cdr (ensure-gethash name counts-by-name
+                                (let ((cell (cons name 0)))
+                                  (push cell counts)
+                                  cell)))))
+                 ;; Store (KIND NAME NUMBER) tuple for repacking.
+                 (setf (getf unpacked kind) (nconc (getf unpacked kind)
+                                                   (list (cons name number)))))
+               xrefs)
+              (unless unpacked (break))
+              ;; Store FUN and UNPACKED for repacking.
+              (push (cons fun unpacked) all-unpacked)))))
       ;; Update **MOST-COMMON-XREF-NAMES-BY-{INDEX,NAME}**.
       (let* ((sorted-names (mapcar #'car (stable-sort counts #'> :key #'cdr)))
              (new-names (subseq sorted-names 0 (min (length sorted-names)
@@ -145,6 +105,13 @@
              (incf new-size (xref-size new-xrefs))
              (aver (vectorp new-xrefs))
              (let ((info (%simple-fun-info fun)))
+               ;; Don't actually save xref for the internals.
+               #-(and sb-xref-for-internals sb-devel)
+               (setf (%simple-fun-info fun)
+                     (if (typep info '(cons t simple-vector))
+                         (car info)
+                         nil))
+               #+(and sb-xref-for-internals sb-devel)
                (if (typep info '(cons t simple-vector))
                    (rplacd info new-xrefs)
                    (setf (%simple-fun-info fun) new-xrefs))))))

@@ -384,10 +384,9 @@
   (:info foreign-symbol)
   (:results (res :scs (sap-reg)))
   (:result-types system-area-pointer)
-  (:temporary (:scs (non-descriptor-reg)) addr)
   (:generator 2
-    (inst lr addr (make-fixup foreign-symbol :foreign-dataref))
-    (loadw res addr)))
+    (inst lr res (make-fixup foreign-symbol :foreign-dataref))
+    (loadw res res)))
 
 (define-vop (call-out)
   (:args (function :scs (sap-reg) :target cfunc)
@@ -485,11 +484,9 @@
   #-darwin
   (defun alien-callback-assembler-wrapper (index result-type argument-types)
     (flet ((make-gpr (n)
-             (make-random-tn :kind :normal :sc (sc-or-lose 'any-reg) :offset n))
+             (make-random-tn (sc-or-lose 'any-reg) n))
            (make-fpr (n)
-             (make-random-tn :kind :normal :sc (sc-or-lose
-                                                'double-reg) :offset
-                                                n)))
+             (make-random-tn (sc-or-lose 'double-reg) n)))
       (let* ((segment (make-segment)))
         (assemble (segment 'nil)
           ;; Copy args from registers or stack to new position
@@ -672,10 +669,10 @@
                  )
                 (t
                  (loop with gprs = (mapcar #'make-gpr '(3 4))
-                       repeat n-return-area-words
                        for gpr = (pop gprs)
                        for offset from (- return-area-pos)
                        by n-word-bytes
+                       repeat n-return-area-words
                        do
                        (unless gpr
                          (bug "Out of return registers in alien-callback trampoline."))
@@ -703,9 +700,9 @@
   #+darwin
   (defun alien-callback-assembler-wrapper (index result-type argument-types)
     (flet ((make-gpr (n)
-             (make-random-tn :kind :normal :sc (sc-or-lose 'any-reg) :offset n))
+             (make-random-tn (sc-or-lose 'any-reg) n))
            (make-fpr (n)
-             (make-random-tn :kind :normal :sc (sc-or-lose 'double-reg) :offset n)))
+             (make-random-tn (sc-or-lose 'double-reg) n)))
       (let* ((segment (make-segment)))
         (assemble (segment)
           ;; To save our arguments, we follow the algorithm sketched in the
