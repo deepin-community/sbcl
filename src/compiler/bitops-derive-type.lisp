@@ -258,52 +258,59 @@
                        -1))))
        (t
         ;; X might be either positive or negative.
-        (cond ((not y-pos)
-               ;; But Y is negative. The result will be negative.
-               (specifier-type
-                `(integer ,(or y-low '*)
-                          -1)))
-              ((and y-low
-                    (> y-low 0))
-               (specifier-type `(or (integer ,(or x-low '*) -1)
-                                    ,(if (and x-high
-                                              y-len)
-                                         (multiple-value-bind (low high)
-                                             (logior-derive-unsigned-bounds (specifier-type `(integer 0 ,x-high))
-                                                                            y)
-                                           `(integer ,low ,high))
-                                         `(integer ,y-low)))))
-              ((and x-low
-                    (> x-low 0))
-               (specifier-type `(or (integer ,(or y-low '*) -1)
-                                    ,(if (and y-high
-                                              x-len)
-                                         (multiple-value-bind (low high)
-                                             (logior-derive-unsigned-bounds (specifier-type `(integer 0 ,y-high))
-                                                                            x)
-                                           `(integer ,low ,high))
-                                         `(integer ,x-low)))))
-              (t
-               (let ((type
-                       (cond ((and x-len y-len)
-                              (specifier-type `(integer ,(min x-low y-low)
-                                                        ,(nth-value 1 (logior-derive-unsigned-bounds x y)))))
-                             ((and x-high y-high)
-                              (specifier-type `(integer * ,(nth-value 1 (logior-derive-unsigned-bounds x y)))))
-                             (t
-                              (specifier-type 'integer)))))
-                 (flet ((contains-zero (low high)
-                          (cond ((and low high)
-                                 (<= low 0 high))
-                                (low
-                                 (<= low 0))
-                                (high
-                                 (>= high 0))
-                                (t))))
-                   (if (and (contains-zero x-low x-high)
-                            (contains-zero y-low y-high))
-                       type
-                       (type-intersection type (specifier-type '(and integer (not (eql 0)))))))))))))))
+        (flet ((add-one (a-low b-low b-high)
+                 ;; Add one to a negative low power of two bound if
+                 ;; there are some bits set in the second parameter.
+                 (if (or (>= a-low 0)
+                         (not b-high)
+                         (<= b-low 0 b-high))
+                     a-low
+                     (let* ((length (integer-length a-low))
+                            (expt (expt 2 length)))
+                       (if (and (= a-low (- expt))
+                                (> b-low a-low)
+                                (< b-high (1- expt)))
+                           (if (= b-low b-high)
+                               (logior a-low b-low)
+                               (1+ a-low))
+                           a-low)))))
+          (cond ((not y-pos)
+                 ;; But Y is negative. The result will be negative.
+                 (specifier-type
+                  `(integer ,(or y-low '*)
+                            -1)))
+                ((and y-low
+                      (> y-low 0))
+                 (specifier-type `(or (integer ,(if x-low
+                                                    (add-one x-low y-low y-high)
+                                                    '*) -1)
+                                      ,(if (and x-high
+                                                y-len)
+                                           (multiple-value-bind (low high)
+                                               (logior-derive-unsigned-bounds (specifier-type `(integer 0 ,x-high))
+                                                                              y)
+                                             `(integer ,low ,high))
+                                           `(integer ,y-low)))))
+                ((and x-low
+                      (> x-low 0))
+                 (specifier-type `(or (integer ,(if y-low
+                                                    (add-one y-low x-low x-high)
+                                                    '*) -1)
+                                      ,(if (and y-high
+                                                x-len)
+                                           (multiple-value-bind (low high)
+                                               (logior-derive-unsigned-bounds (specifier-type `(integer 0 ,y-high))
+                                                                              x)
+                                             `(integer ,low ,high))
+                                           `(integer ,x-low)))))
+                (t
+                 (cond ((and x-len y-len)
+                        (specifier-type `(integer ,(min x-low y-low)
+                                                  ,(nth-value 1 (logior-derive-unsigned-bounds x y)))))
+                       ((and x-high y-high)
+                        (specifier-type `(integer * ,(nth-value 1 (logior-derive-unsigned-bounds x y)))))
+                       (t
+                        (specifier-type 'integer)))))))))))
 
 (defun logxor-derive-unsigned-bounds (x y)
   (let* ((a (numeric-type-low x))
@@ -362,51 +369,75 @@
 (macrolet ((deffrob (logfun)
              (let ((fun-aux (symbolicate logfun "-DERIVE-TYPE-AUX")))
              `(defoptimizer (,logfun derive-type) ((x y))
-                (two-arg-derive-type x y #',fun-aux #',logfun)))))
+                (two-arg-derive-type x y #',fun-aux)))))
   (deffrob logand)
-  (deffrob logior)
-  (deffrob logxor))
+  (deffrob logior))
+
+(defoptimizer (logxor derive-type) ((x y))
+  (let ((type (two-arg-derive-type x y #'logxor-derive-type-aux)))
+    (flet ((try (x y)
+             ;; If it's (logxor x (1- x)) then it will be a positive number,
+             ;; except for 0 => -1. This is used to count unset bits.
+             (or (multiple-value-bind (name combination args)
+                     (combination-matches* '(-) '(* 1) (lvar-uses y) :cast-type (specifier-type 'integer))
+                   (declare (ignore name))
+                   (when combination
+                     (when (same-leaf-ref-p x (car args))
+                       (let ((r (if (types-equal-or-intersect (lvar-type x) (specifier-type '(eql 0)))
+                                    (specifier-type '(integer -1))
+                                    (specifier-type '(integer 1)))))
+                         (if type
+                             (type-intersection type r)
+                             (specifier-type r))))))
+                 ;; (logxor x (1+ x)) is positive, except -1 => -1.
+                 (multiple-value-bind (name combination args)
+                     (combination-matches* '(+) '(* 1) (lvar-uses y) :cast-type (specifier-type 'integer))
+                   (declare (ignore name))
+                   (when combination
+                     (when (same-leaf-ref-p x (car args))
+                       (let ((r (if (types-equal-or-intersect (lvar-type x) (specifier-type '(eql -1)))
+                                    (specifier-type '(integer -1))
+                                    (specifier-type '(integer 1)))))
+                         (if type
+                             (type-intersection type r)
+                             (specifier-type r)))))))))
+      (or (try x y)
+          (try y x)
+          type))))
 
 (defoptimizer (logeqv derive-type) ((x y))
   (two-arg-derive-type x y (lambda (x y same-leaf)
                              (lognot-derive-type-aux
-                              (logxor-derive-type-aux x y same-leaf)))
-                       #'logeqv))
+                              (logxor-derive-type-aux x y same-leaf)))))
 (defoptimizer (lognand derive-type) ((x y))
   (two-arg-derive-type x y (lambda (x y same-leaf)
                              (lognot-derive-type-aux
-                              (logand-derive-type-aux x y same-leaf)))
-                       #'lognand))
+                              (logand-derive-type-aux x y same-leaf)))))
 (defoptimizer (lognor derive-type) ((x y))
   (two-arg-derive-type x y (lambda (x y same-leaf)
                              (lognot-derive-type-aux
-                              (logior-derive-type-aux x y same-leaf)))
-                       #'lognor))
+                              (logior-derive-type-aux x y same-leaf)))))
 (defoptimizer (logandc1 derive-type) ((x y))
   (two-arg-derive-type x y (lambda (x y same-leaf)
                              (if same-leaf
                                  (specifier-type '(eql 0))
                                  (logand-derive-type-aux
-                                  (lognot-derive-type-aux x) y)))
-                       #'logandc1))
+                                  (lognot-derive-type-aux x) y)))))
 (defoptimizer (logandc2 derive-type) ((x y))
   (two-arg-derive-type x y (lambda (x y same-leaf)
                              (if same-leaf
                                  (specifier-type '(eql 0))
                                  (logand-derive-type-aux
-                                  x (lognot-derive-type-aux y))))
-                       #'logandc2))
+                                  x (lognot-derive-type-aux y))))))
 (defoptimizer (logorc1 derive-type) ((x y))
   (two-arg-derive-type x y (lambda (x y same-leaf)
                              (if same-leaf
                                  (specifier-type '(eql -1))
                                  (logior-derive-type-aux
-                                  (lognot-derive-type-aux x) y)))
-                       #'logorc1))
+                                  (lognot-derive-type-aux x) y)))))
 (defoptimizer (logorc2 derive-type) ((x y))
   (two-arg-derive-type x y (lambda (x y same-leaf)
                              (if same-leaf
                                  (specifier-type '(eql -1))
                                  (logior-derive-type-aux
-                                  x (lognot-derive-type-aux y))))
-                       #'logorc2))
+                                  x (lognot-derive-type-aux y))))))

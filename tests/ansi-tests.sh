@@ -41,9 +41,16 @@ rm -fr sandbox/scratch
  "PRINT.BACKQUOTE.RANDOM.4" "PRINT.BACKQUOTE.RANDOM.5" "PROCLAIM.ERROR.7"
  "SHIFTF.7"
  "SXHASH.17" "SXHASH.18" "SXHASH.19" "PRINT-STRUCTURE.1"
- "UNION.FOLD.1" "SUBTYPEP-COMPLEX.8"
- (append #+win32 (list "PROBE-FILE.4")
-         #+x86 (list "CIS.4")
+ "UNION.FOLD.1" "SUBTYPEP-COMPLEX.8" "FORMAT./.17"
+ "REMOVE-DUPLICATES.FOLD.4" "REMOVE-DUPLICATES.FOLD.3"
+ "REMOVE-DUPLICATES.FOLD.2" "REMOVE-DUPLICATES.FOLD.1" "REMOVE-IF-NOT.FOLD.2"
+ "REMOVE-IF.FOLD.4" "REMOVE-IF.FOLD.3" "REMOVE-IF.FOLD.1"
+ "REMOVE.FOLD.4" "REMOVE.FOLD.3" "REMOVE.FOLD.2" "REMOVE.FOLD.1"
+ "SUBSTITUTE-IF-NOT.FOLD.2" "SUBSTITUTE-IF-NOT.FOLD.1" "SUBSTITUTE-IF.FOLD.4"
+ "SUBSTITUTE-IF.FOLD.3" "SUBSTITUTE-IF.FOLD.2" "SUBSTITUTE-IF.FOLD.1"
+ "SUBSTITUTE.FOLD.4" "SUBSTITUTE.FOLD.3" "SUBSTITUTE.FOLD.2"
+ "SUBSTITUTE.FOLD.1"  "SUBSTITUTE-IF-NOT.FOLD.3"
+ (append #+x86 (list "CIS.4")
          #+(or arm (and arm64 (not darwin)))
            (list "EXP.ERROR.4" "EXP.ERROR.5" "EXP.ERROR.6" "EXP.ERROR.7" "EXPT.ERROR.4"
                  "EXPT.ERROR.5" "EXPT.ERROR.6" "EXPT.ERROR.7")
@@ -52,14 +59,14 @@ rm -fr sandbox/scratch
              (list "INTERSECTION.FOLD.1" "UNION.FOLD.1" "SET-DIFFERENCE.FOLD.1"
                    "SET-EXCLUSIVE-OR.FOLD.1"
                    "ALL-STRUCTURE-CLASSES-ARE-SUBTYPES-OF-STRUCTURE-OBJECT.2" "TRACE.8")
-             (list "MAP.48" "SYMBOL-FUNCTION.ERROR.5"))
+             (list "MAP.48" "SYMBOL-FUNCTION.ERROR.5"
+                   "SUBSTITUTE-IF-NOT.FOLD.4" "REMOVE-IF.FOLD.2"
+                    "REMOVE-IF-NOT.FOLD.1" "REMOVE-IF-NOT.FOLD.3" "REMOVE-IF-NOT.FOLD.4"))
 
          #+sb-unicode (list "BOTH-CASE-P.2" "CHAR-DOWNCASE.2" "CHAR-UPCASE.2"))))
-                         (failing (remove "FORMAT.E.26"
-                                          (mapcar (function string) regression-test:*failed-tests*)
-                                          :test (function equal)))
-                         #+sb-devel
-                         (failing (remove "COMMON-LISP-PACKAGE-NICKNAMES" failing :test (function equal)))
+                         (failing (mapcar (function string) regression-test:*failed-tests*))
+                         (failing (set-difference failing (list "FORMAT.E.26" #+sb-devel "COMMON-LISP-PACKAGE-NICKNAMES")
+                          :test (function equal)))
                          (diff1 (set-difference failing  expected :test (function equal)))
                          (diff2 (set-difference expected failing :test (function equal))))
    (cond ((or diff1 diff2)

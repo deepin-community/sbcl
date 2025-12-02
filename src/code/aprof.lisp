@@ -85,6 +85,8 @@
 
 (define-alien-variable alloc-profile-buffer system-area-pointer)
 (defun aprof-reset ()
+  (setf (extern-alien "close_region_nfillers" int) 0)
+  (setf (extern-alien "close_region_tot_bytes_wasted" unsigned) 0)
   (let ((buffer alloc-profile-buffer))
     (unless (= (sap-int buffer) 0)
       (alien-funcall (extern-alien "memset" (function void system-area-pointer int size-t))
@@ -131,10 +133,8 @@
                            ;; produce one absolute fixup per allocation site.
                            ((and (sap>= target insts)
                                  (sap< target (sap+ insts (%code-text-size code)))
-                                 (= (sap-ref-8 target 0) #xFF)
-                                 (= (sap-ref-8 target 1) #x24)
-                                 (= (sap-ref-8 target 2) #x25))
-                            (let ((ea (sap-ref-32 target 3)))
+                                 (= (sap-ref-32 target 0) #x24A4FF41)) ; JMP [R12-disp32]
+                            (let ((ea (sap-ref-32 target 4)))
                               (cond ((= ea enable-counted-indirect)
                                      (alien-funcall allocation-tracker-counted (vector-sap stack)))
                                     ((= ea enable-sized-indirect)
@@ -297,7 +297,7 @@
                         (cmp :qword ?end :tlab-limit)
                         (jmp :a ?_)
                         (mov :qword :tlab-freeptr ?end)
-                        (:repeat (:or (mov . ignore) (lea . ignore)))
+                        (:repeat (:or (mov . ignore) (movaps . ignore) (add . ignore) (lea . ignore)))
                         (:or (or ?free ?lowtag)
                              (lea :qword ?result (ea ?lowtag ?free))))))
 
@@ -492,14 +492,15 @@
   (let* ((bindings
           (matchp iterator
                   (load-time-value
-                   `((mov ?scratch ?header)
-                     (or :qword ?scratch
-                         (ea ,(ash sb-vm::thread-function-layout-slot sb-vm:word-shift)
-                             ,(get-gpr :qword sb-vm::thread-reg)))
+                   `(;(mov ?scratch ?header)
+                     (mov :qword ?scratch (ea -57 ,(get-gpr :qword 12)))
+                     (mov :word ?scratch ?header)
                      (mov :qword (ea ,(- sb-vm:fun-pointer-lowtag) ?result) ?scratch))
                    t)
                   bindings))
          (header (and (listp bindings) (cdr (assoc '?header bindings)))))
+    ;; FIXME: This never detects CLOSURE. I don't understand the pattern syntax
+    ;; and there was no regression test
     (if (and (integerp header) (eq (logand header #xFF) sb-vm:closure-widetag))
         'closure
         'function)))
@@ -606,10 +607,15 @@
          (dstate (sb-disassem:make-dstate nil))
          (collection (make-hash-table :test 'equal)))
     (when stream
-      (format stream "~&~d (of ~d max) profile entries consumed~2%"
-              n-hit metadata-len))
+      (format stream "~&~d (of ~d max) profile entries consumed, ~D GCs done~2%"
+              n-hit metadata-len (extern-alien "n_gcs_done" int)))
     (loop
      (when (>= index n-counters)
+       ;; Add an item accounting for waste caused by closing regions on unfull pages
+       (let ((count (extern-alien "close_region_nfillers" int))
+             (total-bytes (extern-alien "close_region_tot_bytes_wasted" unsigned)))
+         (push (make-alloc total-bytes count 'sb-vm::filler 0)
+               (gethash 'sb-vm::filler collection)))
        (return collection))
      (let ((count (sap-ref-word sap (* index 8))))
        (multiple-value-bind (code pc-offset total-bytes)

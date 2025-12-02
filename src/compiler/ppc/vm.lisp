@@ -33,13 +33,7 @@
                (let ((offset-sym (symbolicate name "-OFFSET")))
                  `(eval-when (:compile-toplevel :load-toplevel :execute)
                    (defconstant ,offset-sym ,offset)
-                   (setf (svref *register-names* ,offset-sym) ,(symbol-name name)))))
-
-           (defregset (name &rest regs)
-               `(eval-when (:compile-toplevel :load-toplevel :execute)
-                 (defparameter ,name
-                   (list ,@(mapcar #'(lambda (name)
-                                       (symbolicate name "-OFFSET")) regs))))))
+                   (setf (svref *register-names* ,offset-sym) ,(symbol-name name))))))
 
   (defreg zero 0)
   (defreg nsp 1)
@@ -92,7 +86,7 @@
 
 
  (defregset *register-arg-offsets*  a0 a1 a2 a3)
- (defparameter register-arg-names '(a0 a1 a2 a3)))
+ (defconstant-eqx register-arg-names '(a0 a1 a2 a3) #'equal))
 
 
 
@@ -302,7 +296,7 @@
 
 ;;; A list of TN's describing the register arguments.
 ;;;
-(defparameter *register-arg-tns*
+(define-load-time-global *register-arg-tns*
   (mapcar #'(lambda (n)
               (make-random-tn (sc-or-lose 'descriptor-reg) n))
           *register-arg-offsets*))

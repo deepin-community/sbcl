@@ -100,6 +100,7 @@
   (let ((stream (out-stream-from-designator stream-designator))
         (*print-right-margin* (or *print-right-margin* 72))
         (*print-circle* t)
+        (*print-circle-not-shared* t)
         (*print-pretty* t)
         (*suppress-print-errors*
          (if (subtypep 'serious-condition *suppress-print-errors*)
@@ -528,7 +529,9 @@
          (let ((expansion (info :variable :macro-expansion name)))
            (format stream "~@:_Expansion: ~S" expansion)))
         ((boundp name)
-         (format stream "~:@_Value: ~S" (symbol-value name)))
+         (let ((*print-length* 100)
+               (*print-vector-length* 200))
+          (format stream "~:@_Value: ~S" (symbol-value name))))
         ((not (eq kind :unknown))
          (format stream "~:@_Currently unbound.")))
       (describe-documentation name 'variable stream))))
@@ -733,18 +736,22 @@
   (let* ((kind (info :type :kind name))
          (fun (and kind (info :type :expander name)))
          (fun (if (listp fun) (car fun) fun)))
-    (when fun
-      (describe-block (stream "~A names a ~@[primitive~* ~]type-specifier:"
-                              name (eq kind :primitive))
-        (describe-deprecation 'type name stream)
-        (describe-documentation name 'type stream (eq t fun))
-        (when (functionp fun)
-          (describe-lambda-list (%fun-lambda-list fun) stream)
-          (multiple-value-bind (expansion ok)
-              (handler-case (typexpand-1 name)
-                (error () (values nil nil)))
-            (when ok
-              (format stream "~@:_Expansion: ~S" expansion))))))))
+    (cond (fun
+           (describe-block (stream "~A names a ~@[primitive~* ~]type-specifier:"
+                                   name (eq kind :primitive))
+             (describe-deprecation 'type name stream)
+             (describe-documentation name 'type stream (eq t fun))
+             (when (functionp fun)
+               (describe-lambda-list (%fun-lambda-list fun) stream)
+               (multiple-value-bind (expansion ok)
+                   (handler-case (typexpand-1 name)
+                     (error () (values nil nil)))
+                 (when ok
+                   (format stream "~@:_Expansion: ~S" expansion))))))
+          ((info :type :deprecated name)
+           (describe-block (stream "~A names a deprecated type" name)
+             (describe-deprecation 'type name stream)
+             (describe-documentation name 'type stream (eq t fun)))))))
 
 (defun describe-declaration (name stream)
   (let ((kind (cond

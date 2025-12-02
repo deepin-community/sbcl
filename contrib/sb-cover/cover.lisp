@@ -381,20 +381,14 @@ report, otherwise ignored. The default value is CL:IDENTITY.
                  (loop with *current-package* = (find-package "CL-USER")
                        with map = nil
                        with form = nil
-                       with eof = nil
                        for i from 0
                        do (setf (values form map)
-                                (handler-case
-                                    (read-and-record-source-map stream)
-                                  (end-of-file ()
-                                    (setf eof t))
+                                (handler-case (read-and-record-source-map stream)
                                   (error (error)
                                     (warn "Error when recording source map for toplevel form ~A:~%  ~A" i error)
-                                    (values nil
-                                            (make-hash-table)))))
-                       until eof
-                       when map
-                       collect (cons form map)))))
+                                    (values nil (make-hash-table)))))
+                       when map collect (cons form map)
+                       when (eql form sb-int:*eof-object*) do (loop-finish)))))
     (mapcar (lambda (map)
               (maphash (lambda (k locations)
                          (declare (ignore k))
@@ -659,6 +653,7 @@ The source locations are stored in SOURCE-MAP."
     ;; Portability concerns aside, it doesn't work in the latest code,
     ;; but first changing the function for #. and then # in that order works.
     (suppress-sharp-dot tab)
+    (suppress-sharp-c tab)
     (dotimes (code 128)
       (let ((char (code-char code)))
         (multiple-value-bind (fn term) (get-macro-character char tab)
@@ -725,6 +720,22 @@ The source locations are stored in SOURCE-MAP."
                                         (apply sharp-dot args)))
                                     readtable))))
 
+(defun suppress-sharp-c (readtable)
+  (when (get-macro-character #\# readtable)
+    (let ((sharp-c (get-dispatch-macro-character #\# #\c readtable)))
+      (when sharp-c
+        ;; we don't actually use *READ-SUPPRESS* here because we don't
+        ;; want to annotate the list part of the complex as
+        ;; conditionalized out.
+        (flet ((sharp-c-replacement (stream subchar numarg)
+                 (declare (ignore subchar numarg))
+                 (let ((thing (read stream t nil t)))
+                   (cond
+                     (*read-suppress* nil)
+                     ((and (listp thing) (= (length thing) 2)) #c(0 0))
+                     (t (sb-int:simple-reader-error stream "illegal complex number format: #C~S" thing))))))
+          (set-dispatch-macro-character #\# #\c #'sharp-c-replacement readtable))))))
+
 ;;; The detection logic for "IN-PACKAGE" is stolen from swank's
 ;;; source-path-parser.lisp.
 ;;;
@@ -767,8 +778,11 @@ subexpressions of the object to stream positions."
          (start (file-position stream))
          (form (let ((*readtable* (make-source-recording-readtable *readtable* source-map))
                      (*package* *current-package*))
-                 (read stream)))
+                 (read stream nil sb-int:*eof-object*)))
          (end (file-position stream)))
+    (when (eql form sb-int:*eof-object*)
+      ;; we might have suppressed some content under #+ or similar
+      (return-from read-and-record-source-map (values form source-map)))
     (look-for-in-package-form-in-stream stream start end)
     ;; ensure that at least FORM is in the source-map
     (unless (gethash form source-map)
@@ -784,7 +798,11 @@ Return the form and the source-map."
       (read stream)))
   (let ((*read-suppress* nil)
         (*read-eval* nil))
-    (read-and-record-source-map stream)))
+    (multiple-value-bind (form source-map)
+        (read-and-record-source-map stream)
+      (if (eql form sb-int:*eof-object*)
+          (error 'end-of-file :stream stream)
+          (values form source-map)))))
 
 (defun source-path-stream-position (path stream)
   "Search the source-path PATH in STREAM and return its position."
@@ -822,7 +840,7 @@ of the deepest (i.e. smallest) possible form is returned."
                          real-form
                          (car real-form))
           for positions = (gethash form source-map)
-          until (and positions (null (cdr positions)))
-          finally (destructuring-bind ((start end suppress)) positions
+          until positions
+          finally (destructuring-bind ((start end suppress)) (last positions)
                     (declare (ignore suppress))
                     (return (values (1- start) end))))))

@@ -2085,7 +2085,7 @@
                                      (declare (optimize (speed 3)))
                                      (+ x 2))))))
     ;; forced-to-do GENERIC-+, etc, possible word -> bignum conversion note
-    (assert (> (length notes) 1)))
+    (assert (> (length notes) 0)))
 
   (let ((notes (nth-value
                 4 (checked-compile '(lambda (x)
@@ -3101,6 +3101,15 @@
            (setq x (make-array '(4 4)))
            (adjust-array y '(3 5))
            (array-dimension y 0)))
+    (((make-array '(4 4) :initial-element nil :adjustable t)) 3))
+  (checked-compile-and-assert (:optimize nil)
+      `(lambda (x)
+         (declare (optimize speed))
+         (declare (type (array * (4 4)) x))
+         (let ((y x))
+           (setq x (make-array '(4 4)))
+           (adjust-array y '(3 5))
+           (array-dimension (the (array t) y) 0)))
     (((make-array '(4 4) :initial-element nil :adjustable t)) 3)))
 
 (with-test (:name :with-timeout-code-deletion-note)
@@ -3375,19 +3384,6 @@
                                   `(lambda ()
                                      (declare (optimize (sb-c::float-accuracy 0)))
                                      ,lambda-form)))))
-             ;; Let's make sure there is no substraction at runtime: for x86
-             ;; and x86-64 that implies an FSUB, SUBSS, or SUBSD instruction,
-             ;; so look for SUB in the disassembly. It's a terrible KLUDGE,
-             ;; but it works. Unless FLOAT-ACCURACY is zero, we leave the
-             ;; substraction in in to catch SNaNs.
-             #+x86
-             (assert (and (ctu:asm-search "FSUB" fun1)
-                          (not (ctu:asm-search "FSUB" fun2))))
-             #+x86-64
-             (let ((inst (if (typep result 'double-float)
-                             "SUBSD" "SUBSS")))
-               (assert (and (ctu:asm-search inst fun1)
-                            (not (ctu:asm-search inst fun2)))))
              (assert (eql result (funcall fun1 arg)))
              (assert (eql result (funcall fun2 arg))))))
     (test `(lambda (x) (declare (single-float x)) (- x 0)) 123.45)
@@ -4079,22 +4075,18 @@
                    (sb-kernel:%simple-fun-type f)))))
 
 (with-test (:name (:bug-793771 *))
-  (let ((f (checked-compile
-            `(lambda (x)
-               (declare (type (single-float (0.0)) x))
-               (* x 0.1)))))
-    (assert (equal `(function ((single-float (0.0)))
-                              (values (single-float 0.0) &optional))
-                   (sb-kernel:%simple-fun-type f)))))
+  (assert-type
+   (lambda (x)
+     (declare (type (single-float (0.0)) x))
+     (* x 0.1))
+   (or (member 0.0) (single-float (0.0)))))
 
 (with-test (:name (:bug-793771 /))
-  (let ((f (checked-compile
-            `(lambda (x)
-               (declare (type (single-float (0.0)) x))
-               (/ x 3.0)))))
-    (assert (equal `(function ((single-float (0.0)))
-                              (values (single-float 0.0) &optional))
-                   (sb-kernel:%simple-fun-type f)))))
+  (assert-type
+   (lambda (x)
+     (declare (type (single-float (0.0)) x))
+     (/ x 3.0))
+   (or (member 0.0) (single-float (0.0)))))
 
 (with-test (:name (compile :bug-486812 single-float))
   (checked-compile `(lambda ()
@@ -4339,26 +4331,6 @@
                                (type (and fixnum a) x))
                       x)
                    :allow-style-warnings t))
-
-(with-test (:name (compile :bug-959687))
-  (flet ((test (form)
-           (multiple-value-bind (fun failure-p warnings style-warnings)
-               (checked-compile form :allow-failure t :allow-style-warnings t)
-             (declare (ignore warnings))
-             (assert (and failure-p style-warnings))
-             (assert-error(funcall fun t)))))
-    (test `(lambda (x)
-             (case x
-               (t
-                :its-a-t)
-               (otherwise
-                :somethign-else))))
-    (test `(lambda (x)
-             (case x
-               (otherwise
-                :its-an-otherwise)
-               (t
-                :somethign-else))))))
 
 (with-test (:name (compile :bug-924276))
   (assert (nth-value

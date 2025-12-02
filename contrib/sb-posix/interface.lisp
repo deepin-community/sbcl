@@ -361,9 +361,8 @@
     "Forks the current process, returning 0 in the new process and the PID of
 the child process in the parent. Forking while multiple threads are running is
 not supported."
-    ;; It would be easy enough to to allow fork in multithreaded code - we'd need the new
-    ;; process to set *ALL-THREADS* to contain only one thread, and unmap other threads'
-    ;; stack to avoid a memory leak. The tricky part would be adhering the the POSIX caveats.
+    ;; Supporting fork in multithreaded code is not worth the hassle, as users would
+    ;; be prone to violating the constraints of the various operating systems:
     ;; Linux:
     ;;   After a fork() in a multithreaded program, the child can safely call only async-signal-safe
     ;;   functions (see signal-safety(7)) until such time as it calls execve(2).
@@ -375,23 +374,24 @@ not supported."
     ;;   To be totally safe you should restrict yourself to only executing async-signal safe
     ;;   operations until such time as one of the exec functions is called.
     #+sb-thread
-    (when (cdr (sb-int:with-system-mutex (sb-thread::*make-thread-lock*)
-                 (sb-impl::finalizer-thread-stop)
-                 ;; Dead threads aren't pruned from *ALL-THREADS* until the Pthread join.
-                 ;; Do that now so that the forked process has only the main thread
-                 ;; in *ALL-THREADS* and nothing in *JOINABLE-THREADS*.
-                 (sb-thread::%dispose-thread-structs)
-                 ;; Threads are added to ALL-THREADS before they have an OS thread,
-                 ;; but newborn threads are not exposed in SB-THREAD:LIST-ALL-THREADS.
-                 ;; So we need to go lower-level to sense whether any exist.
-                 (sb-thread:avltree-list sb-thread::*all-threads*)))
+    (when (sb-int:with-system-mutex (sb-thread::*make-thread-lock*)
+            (sb-impl::finalizer-thread-stop)
+            ;; Dead threads aren't pruned from *ALL-THREADS* until the Pthread join.
+            ;; Do that now so that the forked process has only the main thread
+            ;; in *ALL-THREADS* and nothing in *JOINABLE-THREADS*.
+            (sb-thread::%dispose-thread-structs)
+            ;; Threads are added to ALL-THREADS before they have an OS thread,
+            ;; but newborn threads are not exposed in SB-THREAD:LIST-ALL-THREADS.
+            ;; So we need to go lower-level to sense whether any exist.
+            (> (sb-thread::avl-count sb-thread::*all-threads*) 1))
       (sb-impl::finalizer-thread-start)
       (error "Cannot fork with multiple threads running."))
-    (let ((pid (posix-fork)))
-      (when (= pid 0) ; child
-        (alien-funcall (extern-alien "sb_posix_after_fork" (function void))))
-      #+sb-thread (sb-impl::finalizer-thread-start)
-      pid))
+    (sb-sys:without-interrupts
+      (let ((pid (posix-fork)))
+        (when (= pid 0)                 ; child
+          (alien-funcall (extern-alien "sb_posix_after_fork" (function void))))
+        #+sb-thread (sb-impl::finalizer-thread-start)
+        pid)))
   (export 'fork :sb-posix)
 
   (define-call "getpgid" pid-t minusp (pid pid-t))
@@ -446,17 +446,21 @@ not supported."
   (export 'getcwd :sb-posix)
   (defun getcwd ()
     "Returns the process's current working directory as a string."
+    #+(or android linux openbsd freebsd netbsd sunos darwin dragonfly haiku)
+    (sb-unix:posix-getcwd)
+    #-(or android linux openbsd freebsd netbsd sunos darwin dragonfly haiku)
     (flet ((%getcwd (buffer size)
              (alien-funcall
               (extern-alien #-win32 "getcwd"
                             #+win32 "_getcwd" (function c-string (* t) int))
               buffer size)))
+     (sb-int:possibly-base-stringize
       (with-growing-c-string (buf size)
         (let ((result (%getcwd buf size)))
           (cond (result
                  (buf))
                 ((/= (get-errno) sb-posix:erange)
-                 (syscall-error 'getcwd))))))))
+                 (syscall-error 'getcwd)))))))))
 
 #-win32
 (progn
@@ -744,11 +748,13 @@ not supported."
 (defmacro define-stat-call (name arg designator-fun type)
   ;; FIXME: this isn't the documented way of doing this, surely?
   (let ((lisp-name (lisp-for-c-symbol name))
-        (real-name #+inode64 (format nil "~A$INODE64" name)
-                   #-inode64 name))
+        (real-name (or #+inode64
+                       (format nil "~A$INODE64" name)
+                       #+(and ucrt 64-bit)
+                       (format nil "~A64" name)
+                       name)))
     `(progn
       (export ',lisp-name :sb-posix)
-      (declaim (inline ,lisp-name))
       (defun ,lisp-name (,arg &optional stat)
         (declare (type (or null stat) stat))
         (with-alien-stat a-stat ()
@@ -960,17 +966,9 @@ not supported."
 
 ;;; environment
 
-(defun getenv (name)
-  ;; SUSv4 doesn't define any errors for getenv, but some systems do.
-  (set-errno 0)
-  (let ((r (alien-funcall
-            (extern-alien "getenv" (function (* char) (c-string :not-null t)))
-            name)))
-    (declare (type (alien (* char)) r))
-    (if (null-alien r)
-        (when (plusp (get-errno))
-          (syscall-error 'getenv))
-        (cast r c-string))))
+(declaim (ftype (function (t) (values (or simple-string null) &optional)) getenv))
+(setf (fdefinition 'getenv) #'sb-ext:posix-getenv)
+
 #-win32
 (progn
   (define-call "setenv" int minusp
@@ -984,7 +982,7 @@ not supported."
     ;; We don't want to call actual putenv: the string passed to putenv ends
     ;; up in environ, and we any string we allocate GC might move.
     ;;
-    ;; This makes our wrapper nonconformant if you squit hard enough, but
+    ;; This makes our wrapper nonconformant if you squint hard enough, but
     ;; users who care about that should really be calling putenv() directly in
     ;; order to be able to manage memory sanely.
     (let ((p (position #\= string))

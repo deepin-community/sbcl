@@ -17,7 +17,7 @@ Content-Transfer-Encoding: 8bit
  3 files changed, 7 insertions(+), 2 deletions(-)
 
 diff --git a/tests/elfcore.test.sh b/tests/elfcore.test.sh
-index 332a7b5..cfdd0d4 100755
+index 8fbf4f9..fef280f 100755
 --- a/tests/elfcore.test.sh
 +++ b/tests/elfcore.test.sh
 @@ -22,7 +22,7 @@ run_sbcl <<EOF
@@ -30,7 +30,7 @@ index 332a7b5..cfdd0d4 100755
      exit $EXIT_TEST_WIN
  fi
 diff --git a/tests/relocation.test.sh b/tests/relocation.test.sh
-index 48b0d55..91d276c 100755
+index e62d125..be87593 100755
 --- a/tests/relocation.test.sh
 +++ b/tests/relocation.test.sh
 @@ -7,7 +7,7 @@
@@ -43,12 +43,10 @@ index 48b0d55..91d276c 100755
      # shell tests don't have a way of exiting as "not applicable"
      exit $EXIT_TEST_WIN
 diff --git a/tests/run-sbcl.test.sh b/tests/run-sbcl.test.sh
-index 98995bf..13251fe 100644
+index b10191a..d6e6f12 100644
 --- a/tests/run-sbcl.test.sh
 +++ b/tests/run-sbcl.test.sh
-@@ -1,5 +1,10 @@
- set -e
- 
+@@ -1,3 +1,8 @@
 +if [ -n "${AUTOPKGTEST_TMP:-}" ]
 +then
 +    exit $EXIT_TEST_WIN
@@ -56,4 +54,4 @@ index 98995bf..13251fe 100644
 +
  . ./subr.sh
  
- # run-sbcl.sh's pathname munging turns out always to have been
+ run_sbcl --eval '(exit :code (or #+unix 0 2))'

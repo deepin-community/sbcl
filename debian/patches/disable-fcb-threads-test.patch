@@ -15,10 +15,10 @@ Bug: https://bugs.launchpad.net/sbcl/+bug/1907252
  1 file changed, 2 insertions(+), 1 deletion(-)
 
 diff --git a/tests/fcb-threads.impure.lisp b/tests/fcb-threads.impure.lisp
-index 195070b..e531835 100644
+index 7c1909c..dc29153 100644
 --- a/tests/fcb-threads.impure.lisp
 +++ b/tests/fcb-threads.impure.lisp
-@@ -140,7 +140,8 @@
+@@ -166,7 +166,8 @@
    (setq *print-greetings-and-salutations* nil))
  
  (with-test (:name :call-me-from-many-threads-and-gc

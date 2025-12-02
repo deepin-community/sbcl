@@ -1263,7 +1263,7 @@
                  ((bytes complex-double-reg))
                  ((search)))
         ((res descriptor-reg t :from :load))
-      (inst mov res nil-value)
+      (inst mov res null-tn)
 
       (inst lea byte-array (ea start byte-array*))
       (inst add end byte-array*)
@@ -1299,7 +1299,7 @@
             do (inst cmp byte-array end)
                (inst jmp :ge DONE)
                (inst cmp :byte element (ea byte-array))
-               (inst jmp :eq FOUND-SCALAR)
+               (inst jmp :e FOUND-SCALAR)
                (inst inc byte-array))
       (inst jmp DONE)
 
@@ -1326,7 +1326,7 @@
                  ((bytes int-avx2-reg))
                  ((search)))
         ((res descriptor-reg t :from :load))
-      (inst mov res nil-value)
+      (inst mov res null-tn)
 
       (inst lea byte-array (ea start byte-array*))
       (inst add end byte-array*)
@@ -1373,7 +1373,7 @@
             do (inst cmp byte-array end)
                (inst jmp :ge DONE)
                (inst cmp :byte element (ea byte-array))
-               (inst jmp :eq FOUND-SCALAR)
+               (inst jmp :e FOUND-SCALAR)
                (inst inc byte-array))
       (inst jmp DONE)
 
@@ -1401,7 +1401,7 @@
                  ((bytes complex-double-reg))
                  ((search)))
         ((res descriptor-reg t :from :load))
-      (inst mov res nil-value)
+      (inst mov res null-tn)
 
       (inst lea byte-array (ea end byte-array*))
       (inst add start byte-array*)
@@ -1438,7 +1438,7 @@
                (inst jmp :le DONE)
                (inst dec byte-array)
                (inst cmp :byte element (ea byte-array))
-               (inst jmp :eq FOUND-SCALAR))
+               (inst jmp :e FOUND-SCALAR))
       (inst jmp DONE)
 
       FOUND
@@ -1464,7 +1464,7 @@
                  ((bytes int-avx2-reg))
                  ((search)))
         ((res descriptor-reg t :from :load))
-      (inst mov res nil-value)
+      (inst mov res null-tn)
 
       (inst lea byte-array (ea end byte-array*))
       (inst add start byte-array*)
@@ -1512,7 +1512,7 @@
                (inst jmp :le DONE)
                (inst dec byte-array)
                (inst cmp :byte element (ea byte-array))
-               (inst jmp :eq FOUND-SCALAR))
+               (inst jmp :e FOUND-SCALAR))
       (inst jmp DONE)
 
       FOUND
@@ -1540,7 +1540,7 @@
                  ((bytes complex-double-reg))
                  ((search)))
         ((res descriptor-reg t :from :load))
-      (inst mov res nil-value)
+      (inst mov res null-tn)
       (inst shl end 1)
       (inst lea 32-bit-array (ea 32-bit-array* start 2))
 
@@ -1574,7 +1574,7 @@
             do (inst cmp 32-bit-array end)
                (inst jmp :ge DONE)
                (inst cmp :dword element (ea 32-bit-array))
-               (inst jmp :eq FOUND-SCALAR)
+               (inst jmp :e FOUND-SCALAR)
                (inst add 32-bit-array 4))
       (inst jmp DONE)
 
@@ -1602,7 +1602,7 @@
                  ((bytes int-avx2-reg))
                  ((search)))
         ((res descriptor-reg t :from :load))
-      (inst mov res nil-value)
+      (inst mov res null-tn)
       (inst shl end 1)
       (inst lea 32-bit-array (ea 32-bit-array* start 2))
 
@@ -1650,7 +1650,7 @@
             do (inst cmp 32-bit-array end)
                (inst jmp :ge DONE)
                (inst cmp :dword element (ea 32-bit-array))
-               (inst jmp :eq FOUND-SCALAR)
+               (inst jmp :e FOUND-SCALAR)
                (inst add 32-bit-array 4))
       (inst jmp DONE)
 
@@ -1678,7 +1678,7 @@
                  ((bytes complex-double-reg))
                  ((search)))
         ((res descriptor-reg t :from :load))
-      (inst mov res nil-value)
+      (inst mov res null-tn)
 
       (inst shl start 1)
       (inst lea 32-bit-array (ea 32-bit-array* end 2))
@@ -1713,7 +1713,7 @@
                (inst jmp :le DONE)
                (inst sub 32-bit-array 4)
                (inst cmp :byte element (ea 32-bit-array))
-               (inst jmp :eq FOUND-SCALAR))
+               (inst jmp :e FOUND-SCALAR))
       (inst jmp DONE)
 
       FOUND
@@ -1740,7 +1740,7 @@
                  ((bytes int-avx2-reg))
                  ((search)))
         ((res descriptor-reg t :from :load))
-      (inst mov res nil-value)
+      (inst mov res null-tn)
 
       (inst shl start 1)
       (inst lea 32-bit-array (ea 32-bit-array* end 2))
@@ -1789,7 +1789,7 @@
                (inst jmp :le DONE)
                (inst sub 32-bit-array 4)
                (inst cmp :byte element (ea 32-bit-array))
-               (inst jmp :eq FOUND-SCALAR))
+               (inst jmp :e FOUND-SCALAR))
       (inst jmp DONE)
 
       FOUND

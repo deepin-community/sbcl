@@ -15,16 +15,10 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdarg.h>
-#ifndef LISP_FEATURE_WIN32
-#include <sched.h>
-#endif
 #include <signal.h>
 #include <stddef.h>
 #include <errno.h>
 #include <sys/types.h>
-#ifndef LISP_FEATURE_WIN32
-#include <sys/wait.h>
-#endif
 #include "runtime.h"
 #include "validate.h"
 #include "thread.h"
@@ -108,6 +102,8 @@ const char* gc_phase_names[GC_NPHASES] = {
     ignore_value(mutex_acquire(&all_threads_lock)); \
     RUN_BODY_ONCE(all_threads_lock, ignore_value(mutex_release(&all_threads_lock)))
 
+extern void map_gc_page();
+extern void unmap_gc_page();
 #if !defined(LISP_FEATURE_WIN32)
 /* win32-os.c covers these, but there is no unixlike-os.c, so the normal
  * definition goes here.  Fixme: (Why) don't these work for Windows?
@@ -291,7 +287,7 @@ thread_blocks_gc(struct thread *thread)
 static inline bool
 set_thread_csp_access(struct thread* th, bool writable)
 {
-    os_protect((char*)th - (THREAD_HEADER_SLOTS*N_WORD_BYTES) - THREAD_CSP_PAGE_SIZE,
+    os_protect((char*)th - THREAD_CSP_PAGE_SIZE,
                THREAD_CSP_PAGE_SIZE,
                writable? (OS_VM_PROT_READ|OS_VM_PROT_WRITE)
                : (OS_VM_PROT_READ));
@@ -464,7 +460,6 @@ thread_register_gc_trigger()
     }
 }
 
-#ifdef LISP_FEATURE_SB_SAFEPOINT
 static inline int
 thread_may_thrupt(os_context_t *ctx)
 {
@@ -563,7 +558,6 @@ check_pending_thruptions(os_context_t *ctx)
 
     return 1;
 }
-#endif
 
 int
 on_stack_p(struct thread *th, void *esp)
@@ -573,26 +567,12 @@ on_stack_p(struct thread *th, void *esp)
         < (void *)th->control_stack_end;
 }
 
-#ifndef LISP_FEATURE_WIN32
-/* (Technically, we still allocate an altstack even on Windows.  Since
- * Windows has a contiguous stack with an automatic guard page of
- * user-configurable size instead of an alternative stack though, the
- * SBCL-allocated altstack doesn't actually apply and won't be used.) */
-int
-on_altstack_p(struct thread *th, void *esp)
-{
-    void *start = (char *)th+dynamic_values_bytes;
-    void *end = (char *)start + 32*SIGSTKSZ;
-    return start <= esp && esp < end;
-}
-#endif
-
-void
-assert_on_stack(struct thread *th, void *esp)
+void assert_on_stack(struct thread *th, void *esp)
 {
     if (on_stack_p(th, esp))
         return;
-#ifndef LISP_FEATURE_WIN32
+#ifdef LISP_FEATURE_UNIX
+    extern int on_altstack_p(struct thread *th, void *esp);
     if (on_altstack_p(th, esp))
         lose("thread %p: esp on altstack: %p", th, esp);
 #endif
@@ -720,9 +700,7 @@ void thread_in_lisp_raised(os_context_t *ctxptr)
      * SUB-GC.  Phase is either GC_QUIET or GC_NONE. */
     if (check_gc_and_thruptions) {
         check_pending_gc();
-#ifdef LISP_FEATURE_SB_SAFEPOINT
         while(check_pending_thruptions(ctxptr));
-#endif
     }
 }
 
@@ -778,11 +756,9 @@ void thread_in_safety_transition(os_context_t *ctxptr)
             }
         }
     }
-#ifdef LISP_FEATURE_SB_SAFEPOINT
     if (was_in_alien) {
         while(check_pending_thruptions(ctxptr));
     }
-#endif
 }
 
 #ifdef LISP_FEATURE_WIN32
@@ -806,9 +782,7 @@ void thread_interrupted(os_context_t *ctxptr)
         }
     }
     check_pending_gc();
-#ifdef LISP_FEATURE_SB_SAFEPOINT
     while(check_pending_thruptions(ctxptr));
-#endif
 }
 #endif
 
@@ -998,6 +972,8 @@ static void wake_thread_impl(struct thread_instance *lispthread)
 void wake_thread(struct thread_instance* lispthread)
 {
 #ifdef LISP_FEATURE_WIN32
+#define sb_pthr_kill(t,sig) \
+ __sync_fetch_and_or(&thread_extra_data(t)->pending_signal_set, 1<<sig)
     /* META: why is this comment about safepoint builds mentioning
      * gc_stop_the_world() ? Never the twain shall meet. */
 
@@ -1040,9 +1016,8 @@ void* os_get_csp(struct thread* th)
 }
 
 
-#ifndef LISP_FEATURE_WIN32
+#ifdef LISP_FEATURE_UNIX
 
-# ifdef LISP_FEATURE_SB_SAFEPOINT
 /* This is basically what 'low_level_maybe_now_maybe_later' was (which doesn't exist),
  * but with a different name, and different way of deciding to defer the signal */
 void thruption_handler(__attribute__((unused)) int signal,
@@ -1067,7 +1042,6 @@ void thruption_handler(__attribute__((unused)) int signal,
     thread_in_lisp_raised(ctx);
     csp_around_foreign_call(self) = (intptr_t) transition_sp;
 }
-# endif
 
 #ifdef LISP_FEATURE_C_STACK_IS_CONTROL_STACK
 /* Trap trampolines are in target-assem.S so that they pick up the
@@ -1096,7 +1070,7 @@ handle_safepoint_violation(os_context_t *ctx, os_vm_address_t fault_address)
         return 1;
     }
 
-    if ((1+THREAD_HEADER_SLOTS)+(lispobj*)fault_address == (lispobj*)self) {
+    if (1+(lispobj*)fault_address == (lispobj*)self) {
 #ifdef LISP_FEATURE_C_STACK_IS_CONTROL_STACK
         arrange_return_to_c_function(ctx, handle_csp_safepoint_violation, 0);
 #else
@@ -1109,7 +1083,7 @@ handle_safepoint_violation(os_context_t *ctx, os_vm_address_t fault_address)
     /* not a safepoint */
     return 0;
 }
-#endif /* LISP_FEATURE_WIN32 */
+#endif /* LISP_FEATURE_UNIX */
 
 void
 vodxprint_fun(const char *fmt, va_list args)

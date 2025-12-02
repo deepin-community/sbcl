@@ -210,3 +210,27 @@
       (funcall x 10)))
   (defun component-xep-references.4 ()
     (component-xep-references-mi 1)))
+
+(declaim (ftype (function (&key (:a fixnum)) t) compiled-ftype-test-key)
+         (ftype (function (&optional fixnum) t) compiled-ftype-test-opt))
+
+(defun compiled-ftype-test-key (&key a)
+  a)
+(defun compiled-ftype-test-opt (&optional (a nil))
+  a)
+
+(with-test (:name :ftype-optional)
+  (assert (type-specifiers-equal
+           (caddr
+            (sb-kernel:%simple-fun-type #'compiled-ftype-test-key))
+           '(values (or null fixnum) &optional)))
+  (assert (type-specifiers-equal
+           (caddr
+            (sb-kernel:%simple-fun-type #'compiled-ftype-test-opt))
+           '(values (or null fixnum) &optional))))
+
+(defun ltv-constants ()
+  (load-time-value (char-code #\a)))
+
+(with-test (:name :ltv-constants)
+  (assert (not (ctu:find-code-constants #'ltv-constants))))

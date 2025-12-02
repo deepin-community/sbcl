@@ -28,27 +28,31 @@
                            (vector '(aref in-object index))
                            (sequence '(elt in-object index))))))))
 
-  (def list-to-vector* (make-sequence type length) aref list t)
+  (def list-to-vector (make-sequence type length) aref list t)
 
-  (def vector-to-vector* (make-sequence type length) aref vector t)
+  (def vector-to-vector (make-sequence type length) aref vector t)
 
-  (def sequence-to-vector* (make-sequence type length) aref sequence))
+  (def sequence-to-vector (make-sequence type length) aref sequence))
 
-(defun vector-to-list* (object)
-  (declare (type vector object))
-  (dx-let ((result (list nil)))
-    (let ((splice result))
-      (do-vector-data (elt object (cdr result))
-        (let ((cell (list elt)))
-          (setf (cdr splice) cell splice cell))))))
+(defun vector-to-list (object)
+  (let (result)
+    (with-array-data ((object object)
+                      (start)
+                      (end) :check-fill-pointer t)
+      (cond-dispatch (simple-vector-p object)
+        (loop for i from (1- end) downto start
+              do (setf result (cons (aref object i) result)))))
+    result))
 
 (defun sequence-to-list (sequence)
   (declare (type sequence sequence))
-  (dx-let ((result (list nil)))
-    (let ((splice result))
-      (sb-sequence:dosequence (elt sequence (cdr result))
-        (let ((cell (list elt)))
-          (setf (cdr splice) cell splice cell))))))
+  (let* ((result (unaligned-dx-cons nil))
+         (splice result))
+    (declare (dynamic-extent result)
+             (sb-c::no-debug result splice))
+    (sb-sequence:dosequence (elt sequence (cdr result))
+      (let ((cell (list elt)))
+        (setf (cdr splice) cell splice cell)))))
 
 ;;; These are used both by the full DEFUN function and by various
 ;;; optimization transforms in the constant-OUTPUT-TYPE-SPEC case.
@@ -98,13 +102,13 @@
 (defun coerce-to-list (object)
   (seq-dispatch object
                 object
-                (vector-to-list* object)
+                (vector-to-list object)
                 (sequence-to-list object)))
 
 (defun coerce-to-vector (object output-type-spec)
   (etypecase object
-    (list (list-to-vector* object output-type-spec))
-    (vector (vector-to-vector* object output-type-spec))))
+    (list (list-to-vector object output-type-spec))
+    (vector (vector-to-vector object output-type-spec))))
 
 ;;; old working version
 (defun coerce (object output-type-spec)
@@ -190,7 +194,7 @@
          (if (vectorp object)
              (cond
                ((type= type (specifier-type 'list))
-                (vector-to-list* object))
+                (vector-to-list object))
                ((type= type (specifier-type 'null))
                 (if (= (length object) 0)
                     'nil
@@ -205,7 +209,7 @@
                           (sequence-type-length-mismatch-error type length))
                         (unless (>= length min)
                           (sequence-type-length-mismatch-error type length)))
-                    (vector-to-list* object))))
+                    (vector-to-list object))))
                (t (sequence-type-too-hairy (type-specifier type))))
              (if (sequencep object)
                  (cond
@@ -234,9 +238,9 @@
          (typecase object
            ;; FOO-TO-VECTOR* go through MAKE-SEQUENCE, so length
            ;; errors are caught there. -- CSR, 2002-10-18
-           (list (list-to-vector* object output-type-spec))
-           (vector (vector-to-vector* object output-type-spec))
-           (sequence (sequence-to-vector* object output-type-spec))
+           (list (list-to-vector object output-type-spec))
+           (vector (vector-to-vector object output-type-spec))
+           (sequence (sequence-to-vector object output-type-spec))
            (t
             (coerce-error))))
         ((csubtypep type (specifier-type 'sequence))

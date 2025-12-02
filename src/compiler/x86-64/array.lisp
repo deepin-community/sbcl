@@ -61,7 +61,7 @@
 
 ;;;; allocator for the array header
 
-(define-vop (make-array-header)
+(define-allocator (make-array-header)
   (:translate make-array-header)
   (:policy :fast-safe)
   (:args (type :scs (any-reg))
@@ -70,9 +70,7 @@
   (:temporary (:sc any-reg :to :eval) bytes)
   (:temporary (:sc any-reg :to :result) header)
   (:temporary (:sc unsigned-reg) temp)
-  #+gs-seg (:temporary (:sc unsigned-reg :offset 15) thread-tn)
   (:results (result :scs (descriptor-reg) :from :eval))
-  (:node-var node)
   (:generator 13
     (inst lea :dword bytes
           (ea (+ (* array-dimensions-offset n-word-bytes) lowtag-mask)
@@ -84,9 +82,9 @@
     (inst shl :dword header array-rank-position)
     (inst or  :dword header type)
     (inst shr :dword header n-fixnum-tag-bits)
-    (instrument-alloc nil bytes node temp thread-tn)
-    (pseudo-atomic (:thread-tn thread-tn)
-     (allocation type bytes 0 result node temp thread-tn)
+    (instrument-alloc nil bytes temp)
+    (allocating ()
+     (allocation type bytes 0 result temp)
      (storew header result 0 0)
      (inst or :byte result other-pointer-lowtag))))
 
@@ -102,7 +100,7 @@
 (symbol-macrolet ((rank-disp
                     (- (/ array-rank-position n-byte-bits) other-pointer-lowtag)))
 (define-vop ()
-  (:translate %array-rank)
+  (:translate array-rank)
   (:policy :fast-safe)
   (:args (x :scs (descriptor-reg)))
   (:results (res :scs (unsigned-reg)))
@@ -112,7 +110,7 @@
     (inst inc :byte res)))
 
 (define-vop ()
-  (:translate %array-rank=)
+  (:translate array-rank=)
   (:policy :fast-safe)
   (:args (array :scs (descriptor-reg)))
   (:info rank)
@@ -556,7 +554,7 @@
               (:constant (integer 0 #x3ffffffff)) (:constant (integer 0 0)))
   (:info index addend)
   (:ignore addend)
-  (:conditional :eq)
+  (:conditional :e)
   (:generator 3
     (multiple-value-bind (byte-index bit) (floor index 8)
       (inst test :byte (ea (+ byte-index
@@ -785,7 +783,7 @@
 
 (define-vop (data-vector-set-with-offset/simple-array-single-float-c dvset)
   (:args (object :scs (descriptor-reg))
-         (value :scs (single-reg)))
+         (value :scs (single-reg fp-single-zero fp-single-immediate)))
   (:info index addend)
   (:arg-types simple-array-single-float (:constant low-index)
               (:constant (constant-displacement other-pointer-lowtag
@@ -793,7 +791,10 @@
               single-float)
   (:generator 4
    (unpoison-element object (+ index addend))
-   (inst movss (float-ref-ea object index addend 4) value)))
+    (if (sc-is value fp-single-zero fp-single-immediate)
+        (inst mov :dword (float-ref-ea object index addend 4)
+              (single-float-bits (tn-value value)))
+        (inst movss (float-ref-ea object index addend 4) value))))
 
 (define-vop (data-vector-ref-with-offset/simple-array-double-float dvref)
   (:args (object :scs (descriptor-reg))
@@ -833,15 +834,17 @@
 
 (define-vop (data-vector-set-with-offset/simple-array-double-float-c dvset)
   (:args (object :scs (descriptor-reg))
-         (value :scs (double-reg)))
+         (value :scs (double-reg fp-double-zero)))
   (:info index addend)
   (:arg-types simple-array-double-float (:constant low-index)
               (:constant (constant-displacement other-pointer-lowtag
                                                 8 vector-data-offset))
               double-float)
   (:generator 19
-   (unpoison-element object (+ index addend))
-   (inst movsd (float-ref-ea object index addend 8) value)))
+    (unpoison-element object (+ index addend))
+    (if (sc-is value fp-double-zero)
+        (inst mov :qword (float-ref-ea object index addend 8) 0)
+        (inst movsd (float-ref-ea object index addend 8) value))))
 
 ;;; complex float variants
 

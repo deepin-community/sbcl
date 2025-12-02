@@ -53,7 +53,7 @@
   (any-reg) positive-fixnum sb-kernel:%set-array-dimension)
 
 (define-vop ()
-  (:translate %array-rank)
+  (:translate array-rank)
   (:policy :fast-safe)
   (:args (x :scs (descriptor-reg)))
   (:results (res :scs (unsigned-reg)))
@@ -64,7 +64,7 @@
     (inst add res res 1)))
 
 (define-vop ()
-  (:translate %array-rank=)
+  (:translate array-rank=)
   (:policy :fast-safe)
   (:args (array :scs (descriptor-reg)))
   (:temporary (:scs (unsigned-reg)) x)
@@ -106,7 +106,7 @@
                  (sb-c::combination-p bound-use)
                  (eq (sb-c::combination-fun-source-name bound-use nil) 'sb-c::vector-length))
         (let ((ref2 (sb-c::principal-lvar-ref (car (sb-c::combination-args bound-use)))))
-          (and ref
+          (and ref2
                (eq (sb-c::ref-leaf ref)
                    (sb-c::ref-leaf ref2))))))))
 

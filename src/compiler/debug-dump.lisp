@@ -156,6 +156,7 @@
     (do-live-tns (tn live block)
       (let ((leaf (tn-leaf tn)))
         (when (and (lambda-var-p leaf)
+                   (not (lambda-var-no-debug leaf))
                    (or (not (member (tn-kind tn)
                                     '(:environment :debug-environment)))
                        (leaf-visible-to-debugger-p leaf node))
@@ -324,10 +325,12 @@
 ;;; Dump out the number of locations and the locations for Block.
 (defun dump-block-locations (block locations tlf-num var-locs)
   (declare (type cblock block) (list locations))
-  (unless (and locations
-               (eq (location-info-kind (first locations))
-                   :non-local-entry))
+  (if (and locations
+           (eq (location-info-kind (first locations))
+               :non-local-entry))
+      (write-var-integer (length locations) *byte-buffer*)
       (let ((2block (block-info block)))
+        (write-var-integer (+ (length locations) 1) *byte-buffer*)
         (dump-1-location (block-start-node block)
                          2block :block-start tlf-num
                          (ir2-block-%label 2block)
@@ -338,8 +341,37 @@
     (dump-location-from-info loc tlf-num var-locs))
   (values))
 
+;;; Dump the successors of Block, being careful not to fly into space
+;;; on weird successors.
+(defun dump-block-successors (block env)
+  (declare (type cblock block) (type environment env))
+  (let* ((tail (component-tail (block-component block)))
+         (succ (block-succ block))
+         (valid-succ
+          (if (and succ
+                   (or (eq (car succ) tail)
+                       (not (eq (block-environment (car succ)) env))))
+              ()
+              succ))
+         (byte-buffer *byte-buffer*))
+    (write-var-integer (ash (length valid-succ) compiled-debug-block-nsucc-shift)
+                       byte-buffer)
+    (let ((base (block-number
+                 (node-block
+                  (lambda-bind (environment-lambda env))))))
+      (dolist (b valid-succ)
+        (write-var-integer
+         (the index (- (block-number b) base))
+         byte-buffer))))
+  (values))
+
 ;;; Return a vector and an integer (or null) suitable for use as the
-;;; BLOCKS and TLF-NUMBER in FUN's DEBUG-FUN.
+;;; BLOCKS and TLF-NUMBER in FUN's DEBUG-FUN. This requires two
+;;; passes to compute:
+;;; -- Scan all blocks, dumping the header and successors followed
+;;;    by all the non-elsewhere locations.
+;;; -- Dump the elsewhere block header and all the elsewhere
+;;;    locations (if any.)
 (defun compute-debug-blocks (fun var-locs)
   (declare (type clambda fun) (type hash-table var-locs))
   (let ((*previous-location* 0)
@@ -347,30 +379,35 @@
         *previous-form-number*
         (tlf-num (find-tlf-number fun))
         (env (lambda-environment fun))
-        (byte-buffer *byte-buffer*)
-        prev-block
-        locations
-        elsewhere-locations)
+        (prev-locs nil)
+        (prev-block nil)
+        (byte-buffer *byte-buffer*))
     (setf (fill-pointer byte-buffer) 0)
-    (do-environment-ir2-blocks (2block env)
-      (let ((block (ir2-block-block 2block)))
-        (when (eq (block-info block) 2block)
-          (when prev-block
-            (dump-block-locations prev-block (nreverse (shiftf locations nil))
-                                  tlf-num var-locs))
-          (setf prev-block block)))
-      (dolist (loc (ir2-block-locations 2block))
-        (if (label-elsewhere-p (location-info-label loc)
-                               (location-info-kind loc))
-            (push loc elsewhere-locations)
-            (push loc locations))))
+    (collect ((elsewhere))
+      (do-environment-ir2-blocks (2block env)
+        (let ((block (ir2-block-block 2block)))
+          (when (eq (block-info block) 2block)
+            (when prev-block
+              (dump-block-locations prev-block prev-locs tlf-num var-locs))
+            (setf prev-block block  prev-locs ())
+            (dump-block-successors block env)))
 
-    (dump-block-locations prev-block (nreverse locations)
-                          tlf-num var-locs)
+        (collect ((here prev-locs))
+          (dolist (loc (ir2-block-locations 2block))
+            (if (label-elsewhere-p (location-info-label loc)
+                                   (location-info-kind loc))
+                (elsewhere loc)
+                (here loc)))
+          (setq prev-locs (here))))
 
-    (when elsewhere-locations
-      (dolist (loc (nreverse elsewhere-locations))
-        (dump-location-from-info loc tlf-num var-locs)))
+      (dump-block-locations prev-block prev-locs tlf-num var-locs)
+
+      (when (elsewhere)
+        (vector-push-extend compiled-debug-block-elsewhere-p byte-buffer)
+        (write-var-integer (length (elsewhere)) byte-buffer)
+        (dolist (loc (elsewhere))
+          (dump-location-from-info loc tlf-num var-locs))))
+
     (values (coerce byte-buffer '(simple-array (unsigned-byte 8) (*))) tlf-num)))
 
 ;;; Return DEBUG-SOURCE structure containing information derived from
@@ -429,22 +466,46 @@
 ;;; we don't care how it looks, but can recover the intended specialization.
 (defun coerce-to-smallest-eltype (seq)
   (declare (type sequence seq))
+  ;; Silence "Clause CHARACTER is shadowed by BASE-CHAR" depending on +/-unicode of host+target
+  #+host-quirks-sbcl (declare (host-sb-ext:muffle-conditions style-warning))
   (let ((max-positive 0)
         (max-negative 0)
-        (length 0))
-    (flet ((frob (x)
-             (typecase x
-               ((integer 0)
-                (when (>= x max-positive)
-                  (setf max-positive x)))
-               ((integer * -1)
-                (let ((abs (- x)))
-                  (when (>= abs max-negative)
-                    (setf max-negative abs))))
-               (t
-                (return-from coerce-to-smallest-eltype
-                  (logically-readonlyize
-                   (coerce seq 'simple-vector)))))))
+        (length 0)
+        (character t))
+    (labels ((t-vector ()
+               (return-from coerce-to-smallest-eltype
+                 (logically-readonlyize
+                  (coerce seq 'simple-vector))))
+             (frob (x)
+               (typecase x
+                 ((integer 0)
+                  (when character
+                    (unless (eq character t)
+                      (t-vector))
+                    (setf character nil))
+                  (when (>= x max-positive)
+                    (setf max-positive x)))
+                 ((integer * -1)
+                  (when character
+                    (unless (eq character t)
+                      (t-vector))
+                    (setf character nil))
+                  (setf character nil)
+                  (let ((abs (- x)))
+                    (when (>= abs max-negative)
+                      (setf max-negative abs))))
+                 #+sb-unicode
+                 (base-char
+                  (unless character
+                    (t-vector))
+                  (when (eq character t)
+                    (setf character 'base-char)))
+                 (character
+                  (unless character
+                    (t-vector))
+                  (setf character 'character))
+                 (t
+                  (t-vector)))))
       (if (listp seq)
           (dolist (i seq)
             (incf length)     ; so not to traverse again to compute it
@@ -456,9 +517,10 @@
           (logically-readonlyize
            (coerce seq
                    `(simple-array
-                     ,(smallest-element-type (max max-positive
-                                                  (1- max-negative))
-                                             (plusp max-negative))
+                     ,(or character
+                          (smallest-element-type (max max-positive
+                                                      (1- max-negative))
+                                                 (plusp max-negative)))
                      1)))))))
 
 (defun compact-vector (sequence)
@@ -966,63 +1028,66 @@
 ;;; called after assembly so that source map information is available.
 (defun debug-info-for-component (component)
   (declare (type component component))
-  (let* ((dfuns nil)
-         (simple-fun-headers
-          ;; Compute all simple-fun metadata and store into a simple-vector
-          (let* ((entries (ir2-component-entries (component-info component)))
-                 (nfuns (length entries))
-                 (i (* sb-vm:code-slots-per-simple-fun nfuns))
-                 (v (make-array i)))
-            (dolist (e entries v)
-              ;; Process in reverse order of ENTRIES.
-              (decf i sb-vm:code-slots-per-simple-fun)
-              (setf (svref v (+ i sb-vm:simple-fun-name-slot)) (entry-info-name e)
-                    (svref v (+ i sb-vm:simple-fun-arglist-slot)) (entry-info-arguments e)
-                    (svref v (+ i sb-vm:simple-fun-source-slot)) (entry-info-form/doc e)
-                    (svref v (+ i sb-vm:simple-fun-info-slot)) (entry-info-type/xref e)))))
-         (var-locs (make-hash-table :test 'eq))
-         (*byte-buffer* (make-array 10
-                                    :element-type '(unsigned-byte 8)
-                                    :fill-pointer 0
-                                    :adjustable t))
-         (*contexts* (make-array 10
-                                 :fill-pointer 0
-                                 :adjustable t))
-         (lambdas (sort (copy-list (component-lambdas component))
-                        #'<
-                        :key (lambda (lambda)
-                               (label-position (block-label (lambda-block lambda))))))
-         (name (loop for lambda in lambdas
-                     for entry = (leaf-info lambda)
-                     when entry
-                     return
-                     (entry-info-name entry)))
-         (*debug-component-name* name))
-    (declare (special *debug-component-name*))
-    (dolist (lambda lambdas)
-      (unless (empty-fun-p lambda)
-        (clrhash var-locs)
-        (push (cons (label-position (block-label (lambda-block lambda)))
-                    (compute-1-debug-fun lambda var-locs))
-              dfuns)))
-    (let ((map (compute-packed-debug-funs (nreverse dfuns)))
-          (contexts (compact-vector *contexts*)))
-      #+sb-xc-host
-      (!make-compiled-debug-info name *package* map contexts simple-fun-headers)
-      #-sb-xc-host
-      (let ((di (%make-instance (+ (sb-kernel::type-dd-length compiled-debug-info)
-                                   (length simple-fun-headers)))))
-        (setf (%instance-layout di) #.(find-layout 'compiled-debug-info)
-              ;; The fixed slots except for SOURCE are declared readonly
-              (%instance-ref di (get-dsd-index compiled-debug-info name)) name
-              (%instance-ref di (get-dsd-index compiled-debug-info source)) nil
-              (%instance-ref di (get-dsd-index compiled-debug-info package)) *package*
-              (%instance-ref di (get-dsd-index compiled-debug-info fun-map)) map
-              (%instance-ref di (get-dsd-index compiled-debug-info contexts)) contexts)
-        (let ((i (get-dsd-index compiled-debug-info rest)))
-          (dovector (x simple-fun-headers di)
-            (setf (%instance-ref di i) x)
-            (incf i)))))))
+  (flet ((lambda-position (lambda)
+           (let ((2block (block-info (lambda-block lambda))))
+             (label-position (or (ir2-block-%trampoline-label 2block)
+                                 (ir2-block-%label 2block))))))
+   (let* ((dfuns nil)
+          (simple-fun-headers
+            ;; Compute all simple-fun metadata and store into a simple-vector
+            (let* ((entries (ir2-component-entries (component-info component)))
+                   (nfuns (length entries))
+                   (i (* sb-vm:code-slots-per-simple-fun nfuns))
+                   (v (make-array i)))
+              (dolist (e entries v)
+                ;; Process in reverse order of ENTRIES.
+                (decf i sb-vm:code-slots-per-simple-fun)
+                (setf (svref v (+ i sb-vm:simple-fun-name-slot)) (entry-info-name e)
+                      (svref v (+ i sb-vm:simple-fun-arglist-slot)) (entry-info-arguments e)
+                      (svref v (+ i sb-vm:simple-fun-source-slot)) (entry-info-form/doc e)
+                      (svref v (+ i sb-vm:simple-fun-info-slot)) (entry-info-type/xref e)))))
+          (var-locs (make-hash-table :test 'eq))
+          (*byte-buffer* (make-array 10
+                                     :element-type '(unsigned-byte 8)
+                                     :fill-pointer 0
+                                     :adjustable t))
+          (*contexts* (make-array 10
+                                  :fill-pointer 0
+                                  :adjustable t))
+          (lambdas (sort (copy-list (component-lambdas component))
+                         #'<
+                         :key #'lambda-position))
+          (name (loop for lambda in lambdas
+                      for entry = (leaf-info lambda)
+                      when entry
+                      return
+                      (entry-info-name entry)))
+          (*debug-component-name* name))
+     (declare (special *debug-component-name*))
+     (dolist (lambda lambdas)
+       (unless (empty-fun-p lambda)
+         (clrhash var-locs)
+         (push (cons (lambda-position lambda)
+                     (compute-1-debug-fun lambda var-locs))
+               dfuns)))
+     (let ((map (compute-packed-debug-funs (nreverse dfuns)))
+           (contexts (compact-vector *contexts*)))
+       #+sb-xc-host
+       (!make-compiled-debug-info name *package* map contexts simple-fun-headers)
+       #-sb-xc-host
+       (let ((di (%make-instance (+ (sb-kernel::type-dd-length compiled-debug-info)
+                                    (length simple-fun-headers)))))
+         (setf (%instance-layout di) #.(find-layout 'compiled-debug-info)
+               ;; The fixed slots except for SOURCE are declared readonly
+               (%instance-ref di (get-dsd-index compiled-debug-info name)) name
+               (%instance-ref di (get-dsd-index compiled-debug-info source)) nil
+               (%instance-ref di (get-dsd-index compiled-debug-info package)) *package*
+               (%instance-ref di (get-dsd-index compiled-debug-info fun-map)) map
+               (%instance-ref di (get-dsd-index compiled-debug-info contexts)) contexts)
+         (let ((i (get-dsd-index compiled-debug-info rest)))
+           (dovector (x simple-fun-headers di)
+             (setf (%instance-ref di i) x)
+             (incf i))))))))
 
 ;;; Write BITS out to BYTE-BUFFER in backend byte order. The length of
 ;;; BITS must be evenly divisible by eight.

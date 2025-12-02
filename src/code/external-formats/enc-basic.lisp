@@ -415,132 +415,135 @@
                   (let ((name (make-od-name ',base-name accessor)))
                     `(progn
                        ;;(declaim (inline ,name))
-                       (let ((lexically-max
-                              (string->utf8 (string (code-char ,(1- char-code-limit)))
-                                            0 1 0 nil)))
-                         (declare (type (simple-array (unsigned-byte 8) (#+sb-unicode 4 #-sb-unicode 2)) lexically-max))
-                         (defun ,name (array pos end replacement)
-                           (declare (optimize speed #.*safety-0*)
-                                    (type ,type array)
-                                    (type array-range pos end))
-                           ;; returns the number of bytes consumed and nil if it's a
-                           ;; valid character or the number of bytes consumed and a
-                           ;; replacement string if it's not.
-                           (let ((initial-byte (,accessor array pos))
-                                 (reject-reason nil)
-                                 (reject-position pos)
-                                 (remaining-bytes (- end pos)))
-                             (declare (type array-range reject-position remaining-bytes))
-                             (labels ((valid-utf8-starter-byte-p (b)
-                                        (declare (type (unsigned-byte 8) b))
-                                        (let ((ok (cond
-                                                    ((zerop (logand b #b10000000)) 1)
-                                                    ((and (= (logand b #b11100000) #b11000000)
-                                                          (>= b #xc2)) 2)
-                                                    ((= (logand b #b11110000) #b11100000) 3)
-                                                    ((and (= (logand b #b11111000) #b11110000)
-                                                          (<= b #xf4)) 4)
-                                                    (t nil))))
-                                          (unless ok
-                                            (setf reject-reason 'invalid-utf8-starter-byte))
-                                          ok))
-                                      (enough-bytes-left-p (x)
-                                        (let ((ok (> end (+ pos (1- x)))))
-                                          (unless ok
-                                            (setf reject-reason 'end-of-input-in-character))
-                                          ok))
-                                      (valid-secondary-p (x)
-                                        (let* ((idx (the array-range (+ pos x)))
-                                               (b (,accessor array idx))
-                                               (ok (= (logand b #b11000000) #b10000000)))
-                                          (when (and ok (= x 1))
-                                            (setf ok
-                                                  (case initial-byte
-                                                    (#xe0 (>= b #xa0))
-                                                    (#xed (< b #xa0))
-                                                    (#xf0 (>= b #x90))
-                                                    (#xf4 (< b #x90))
-                                                    (t t))))
-                                          (unless ok
-                                            (setf reject-reason 'invalid-utf8-continuation-byte)
-                                            (setf reject-position idx))
-                                          ok))
-                                      (preliminary-ok-for-length (maybe-len len)
-                                        (and (eql maybe-len len)
-                                             ;; Has to be done in this order so that
-                                             ;; certain broken sequences (e.g., the
-                                             ;; two-byte sequence `"initial (length 3)"
-                                             ;; "non-continuation"' -- `#xef #x32')
-                                             ;; signal only part of that sequence as
-                                             ;; erroneous.
-                                             (loop for i from 1 below (min len remaining-bytes)
-                                                   always (valid-secondary-p i))
-                                             (enough-bytes-left-p len)))
-                                      (character-below-char-code-limit-p ()
-                                        ;; This is only called on a four-byte sequence
-                                        ;; (two in non-unicode builds) to ensure we
-                                        ;; don't go over SBCL's character limts.
-                                        (let ((ok (cond ((< (aref lexically-max 0) (,accessor array pos))
-                                                         nil)
-                                                        ((> (aref lexically-max 0) (,accessor array pos))
-                                                         t)
-                                                        ((< (aref lexically-max 1) (,accessor array (+ pos 1)))
-                                                         nil)
-                                                        #+sb-unicode
-                                                        ((> (aref lexically-max 1) (,accessor array (+ pos 1)))
-                                                         t)
-                                                        #+sb-unicode
-                                                        ((< (aref lexically-max 2) (,accessor array (+ pos 2)))
-                                                         nil)
-                                                        #+sb-unicode
-                                                        ((> (aref lexically-max 2) (,accessor array (+ pos 2)))
-                                                         t)
-                                                        #+sb-unicode
-                                                        ((< (aref lexically-max 3) (,accessor array (+ pos 3)))
-                                                         nil)
-                                                        (t t))))
-                                          (unless ok
-                                            (setf reject-reason 'character-out-of-range))
-                                          ok)))
-                               (declare (inline valid-utf8-starter-byte-p
-                                                enough-bytes-left-p
-                                                valid-secondary-p
-                                                preliminary-ok-for-length))
-                               (let ((maybe-len (valid-utf8-starter-byte-p initial-byte)))
-                                 (cond
-                                   ,@,(when crlfp
-                                        ``(((= initial-byte 13)
-                                            (values
-                                             (if (and (> remaining-bytes 1)
-                                                      (= (,accessor array (+ pos 1)) 10))
-                                                 2
-                                                 1)
-                                             nil))))
-                                   ((eql maybe-len 1)
-                                    (values 1 nil))
-                                   ((and (preliminary-ok-for-length maybe-len 2)
-                                         #-sb-unicode (character-below-char-code-limit-p))
-                                    (values 2 nil))
-                                   ((and (preliminary-ok-for-length maybe-len 3)
-                                         #-sb-unicode (not (setf reject-reason 'character-out-of-range)))
-                                    (values 3 nil))
-                                   ((and (preliminary-ok-for-length maybe-len 4)
-                                         #-sb-unicode (not (setf reject-reason 'character-out-of-range))
-                                         (character-below-char-code-limit-p))
-                                    (values 4 nil))
-                                   (t
-                                    (let* ((bad-end
-                                            (ecase reject-reason
-                                              (invalid-utf8-starter-byte (1+ pos))
-                                              (end-of-input-in-character end)
-                                              (invalid-utf8-continuation-byte reject-position)
-                                              (character-out-of-range (+ pos maybe-len))))
-                                           (bad-len (- bad-end pos)))
-                                      (declare (type array-range bad-end bad-len))
-                                      (let ((replacement (decoding-error array pos bad-end
-                                                                         ,,(if newline ``'(:utf-8 :newline ,,newline) '':utf-8)
-                                                                         replacement reject-reason reject-position)))
-                                        (values bad-len replacement)))))))))))))
+                       (defun ,name (array pos end replacement)
+                         (declare (optimize speed #.*safety-0*)
+                                  (type ,type array)
+                                  (type array-range pos end))
+                         ;; returns the number of bytes consumed and nil if it's a
+                         ;; valid character or the number of bytes consumed and a
+                         ;; replacement string if it's not.
+                         (let ((initial-byte (,accessor array pos))
+                               (reject-reason nil)
+                               (reject-position pos)
+                               (remaining-bytes (- end pos))
+                               (lexically-max
+                                 (load-time-value
+                                  (string->utf8 (string (code-char ,(1- char-code-limit)))
+                                                0 1 0 nil))))
+                           (declare (type (simple-array (unsigned-byte 8)
+                                                        (#+sb-unicode 4 #-sb-unicode 2))
+                                          lexically-max))
+                           (declare (type array-range reject-position remaining-bytes))
+                           (labels ((valid-utf8-starter-byte-p (b)
+                                      (declare (type (unsigned-byte 8) b))
+                                      (let ((ok (cond
+                                                  ((zerop (logand b #b10000000)) 1)
+                                                  ((and (= (logand b #b11100000) #b11000000)
+                                                        (>= b #xc2)) 2)
+                                                  ((= (logand b #b11110000) #b11100000) 3)
+                                                  ((and (= (logand b #b11111000) #b11110000)
+                                                        (<= b #xf4)) 4)
+                                                  (t nil))))
+                                        (unless ok
+                                          (setf reject-reason 'invalid-utf8-starter-byte))
+                                        ok))
+                                    (enough-bytes-left-p (x)
+                                      (let ((ok (> end (+ pos (1- x)))))
+                                        (unless ok
+                                          (setf reject-reason 'end-of-input-in-character))
+                                        ok))
+                                    (valid-secondary-p (x)
+                                      (let* ((idx (the array-range (+ pos x)))
+                                             (b (,accessor array idx))
+                                             (ok (= (logand b #b11000000) #b10000000)))
+                                        (when (and ok (= x 1))
+                                          (setf ok
+                                                (case initial-byte
+                                                  (#xe0 (>= b #xa0))
+                                                  (#xed (< b #xa0))
+                                                  (#xf0 (>= b #x90))
+                                                  (#xf4 (< b #x90))
+                                                  (t t))))
+                                        (unless ok
+                                          (setf reject-reason 'invalid-utf8-continuation-byte)
+                                          (setf reject-position idx))
+                                        ok))
+                                    (preliminary-ok-for-length (maybe-len len)
+                                      (and (eql maybe-len len)
+                                           ;; Has to be done in this order so that
+                                           ;; certain broken sequences (e.g., the
+                                           ;; two-byte sequence `"initial (length 3)"
+                                           ;; "non-continuation"' -- `#xef #x32')
+                                           ;; signal only part of that sequence as
+                                           ;; erroneous.
+                                           (loop for i from 1 below (min len remaining-bytes)
+                                                 always (valid-secondary-p i))
+                                           (enough-bytes-left-p len)))
+                                    (character-below-char-code-limit-p ()
+                                      ;; This is only called on a four-byte sequence
+                                      ;; (two in non-unicode builds) to ensure we
+                                      ;; don't go over SBCL's character limts.
+                                      (let ((ok (cond ((< (aref lexically-max 0) (,accessor array pos))
+                                                       nil)
+                                                      ((> (aref lexically-max 0) (,accessor array pos))
+                                                       t)
+                                                      ((< (aref lexically-max 1) (,accessor array (+ pos 1)))
+                                                       nil)
+                                                      #+sb-unicode
+                                                      ((> (aref lexically-max 1) (,accessor array (+ pos 1)))
+                                                       t)
+                                                      #+sb-unicode
+                                                      ((< (aref lexically-max 2) (,accessor array (+ pos 2)))
+                                                       nil)
+                                                      #+sb-unicode
+                                                      ((> (aref lexically-max 2) (,accessor array (+ pos 2)))
+                                                       t)
+                                                      #+sb-unicode
+                                                      ((< (aref lexically-max 3) (,accessor array (+ pos 3)))
+                                                       nil)
+                                                      (t t))))
+                                        (unless ok
+                                          (setf reject-reason 'character-out-of-range))
+                                        ok)))
+                             (declare (inline valid-utf8-starter-byte-p
+                                              enough-bytes-left-p
+                                              valid-secondary-p
+                                              preliminary-ok-for-length))
+                             (let ((maybe-len (valid-utf8-starter-byte-p initial-byte)))
+                               (cond
+                                 ,@,(when crlfp
+                                      ``(((= initial-byte 13)
+                                          (values
+                                           (if (and (> remaining-bytes 1)
+                                                    (= (,accessor array (+ pos 1)) 10))
+                                               2
+                                               1)
+                                           nil))))
+                                 ((eql maybe-len 1)
+                                  (values 1 nil))
+                                 ((and (preliminary-ok-for-length maybe-len 2)
+                                       #-sb-unicode (character-below-char-code-limit-p))
+                                  (values 2 nil))
+                                 ((and (preliminary-ok-for-length maybe-len 3)
+                                       #-sb-unicode (not (setf reject-reason 'character-out-of-range)))
+                                  (values 3 nil))
+                                 ((and (preliminary-ok-for-length maybe-len 4)
+                                       #-sb-unicode (not (setf reject-reason 'character-out-of-range))
+                                       (character-below-char-code-limit-p))
+                                  (values 4 nil))
+                                 (t
+                                  (let* ((bad-end
+                                           (ecase reject-reason
+                                             (invalid-utf8-starter-byte (1+ pos))
+                                             (end-of-input-in-character end)
+                                             (invalid-utf8-continuation-byte reject-position)
+                                             (character-out-of-range (+ pos maybe-len))))
+                                         (bad-len (- bad-end pos)))
+                                    (declare (type array-range bad-end bad-len))
+                                    (let ((replacement (decoding-error array pos bad-end
+                                                                       ,,(if newline ``'(:utf-8 :newline ,,newline) '':utf-8)
+                                                                       replacement reject-reason reject-position)))
+                                      (values bad-len replacement))))))))))))
                 (instantiate-octets-definition ,definer-name))))
   (def nil nil define-bytes-per-utf8-character bytes-per-utf8-character)
   (def nil :cr define-bytes-per-utf8-character/clr bytes-per-utf8-character/cr)
@@ -916,82 +919,69 @@
           (return index))))))
 
 ;;; Bypass the character buffer, the caller must ensure that it's empty
-(defun fd-stream-read-sequence/utf-8-to-string (stream string start end &aux (index start))
-  (declare (type fd-stream stream)
-           (type index start end index)
-           (type (simple-array character (*)) string))
-  (block outer
-    (loop
-     (do ((instead (fd-stream-instead stream)))
-         ((= (fill-pointer instead) 0)
-          (setf (fd-stream-listen stream) nil))
-       (setf (aref string index) (vector-pop instead))
-       (incf index)
-       (when (= index end)
-         (when (= (fill-pointer instead) 0)
-           (setf (fd-stream-listen stream) nil))
-         (return index)))
-     #+(and sb-unicode 64-bit little-endian)
-     (setf index
-           (sb-vm::simd-copy-utf8-to-character-string index end string (fd-stream-ibuf stream)))
-     (let* ((ibuf (fd-stream-ibuf stream))
-            (head (buffer-head ibuf))
-            (tail (buffer-tail ibuf))
-            (sap (buffer-sap ibuf))
-            incomplete)
-       (declare (type index head tail))
-       (flet ((decode-break (reason)
-                (setf (buffer-head ibuf) head)
-                (when (stream-decoding-error-and-handle stream reason 1)
-                  (return-from outer index))
-                (return)))
-         (utf8-char-loop))
-       (when (= index end)
-         (setf (buffer-head ibuf) head)
-         (return index))
-       (unless (catch 'eof-input-catcher (refill-input-buffer stream))
-         (when (or (not incomplete)
-                   (stream-decoding-error-and-handle stream (- tail head) 1))
-           (return index)))))))
-
-#+sb-unicode
-(defun fd-stream-read-sequence/utf-8-to-base-string (stream string start end &aux (index start))
-  (declare (type fd-stream stream)
-           (type index start end index)
-           (type simple-base-string string))
-  (block outer
-    (loop
-     (do ((instead (fd-stream-instead stream)))
-         ((= (fill-pointer instead) 0)
-          (setf (fd-stream-listen stream) nil))
-       (setf (aref string index) (vector-pop instead))
-       (incf index)
-       (when (= index end)
-         (when (= (fill-pointer instead) 0)
-           (setf (fd-stream-listen stream) nil))
-         (return index)))
-     #+(and sb-unicode 64-bit little-endian)
-     (setf index
-           (sb-vm::simd-copy-utf8-to-base-string index end string (fd-stream-ibuf stream)))
-     (let* ((ibuf (fd-stream-ibuf stream))
-            (head (buffer-head ibuf))
-            (tail (buffer-tail ibuf))
-            (sap (buffer-sap ibuf))
-            incomplete)
-       (declare (type index head tail))
-       (flet ((decode-break (reason)
-                (setf (buffer-head ibuf) head)
-                (when (stream-decoding-error-and-handle stream reason 1)
-                  (return-from outer index))
-                (return)))
-         (utf8-char-loop))
-       (when (= index end)
-         (setf (buffer-head ibuf) head)
-         (return index))
-       (unless (catch 'eof-input-catcher (refill-input-buffer stream))
-         (when (or (not incomplete)
-                   (stream-decoding-error-and-handle stream (- tail head) 1))
-           (return index)))))))
+(macrolet ((def (name string-type simd-op newline-variant)
+             #-(and sb-unicode 64-bit little-endian)
+             (declare (ignore simd-op))
+             `(defun ,name (stream string start end
+                            &aux (index start) ,@(when (eql newline-variant :crlf) '(eof)))
+                (declare (type fd-stream stream)
+                         (type index start end index)
+                         (type ,string-type string))
+                (tagbody
+                 loop
+                   (do ((instead (fd-stream-instead stream)))
+                       ((= (fill-pointer instead) 0)
+                        (setf (fd-stream-listen stream) nil))
+                     (setf (aref string index) (vector-pop instead))
+                     (incf index)
+                     (when (= index end)
+                       (when (= (fill-pointer instead) 0)
+                         (setf (fd-stream-listen stream) nil))
+                       (return index)))
+                   #+(and sb-unicode 64-bit little-endian)
+                   (setf index (,simd-op index end string (fd-stream-ibuf stream)))
+                   (let* ((ibuf (fd-stream-ibuf stream))
+                          (head (buffer-head ibuf))
+                          (tail (buffer-tail ibuf))
+                          (sap (buffer-sap ibuf))
+                          ,@(when (eql newline-variant :crlf) '(requested-refill))
+                          incomplete)
+                     (declare (type index head tail))
+                     (flet ((decode-break (reason)
+                              (setf (buffer-head ibuf) head)
+                              (if (stream-decoding-error-and-handle stream reason 1)
+                                  (return-from ,name index)
+                                  (go loop))))
+                       (utf8-char-loop :crlf ,(eql newline-variant :crlf)))
+                     (when (= index end)
+                       (setf (buffer-head ibuf) head)
+                       (return-from ,name index))
+                     (unless (catch 'eof-input-catcher (refill-input-buffer stream))
+                       (,@(if (eql newline-variant :crlf)
+                              '(if requested-refill (setf eof t))
+                              '(progn))
+                        (when (or (not incomplete)
+                                  (stream-decoding-error-and-handle stream (- tail head) 1))
+                          (return-from ,name index)))))
+                   (go loop)))))
+  (def fd-stream-read-sequence/utf-8-to-string
+      (simple-array character (*))
+    sb-vm::simd-copy-utf8-to-character-string
+    :lf)
+  #+sb-unicode
+  (def fd-stream-read-sequence/utf-8-to-base-string
+    simple-base-string
+    sb-vm::simd-copy-utf8-to-base-string
+    :lf)
+  (def fd-stream-read-sequence/utf-8-crlf-to-character-string
+      (simple-array character (*))
+    sb-vm::simd-copy-utf8-crlf-to-character-string
+    :crlf)
+  #+sb-unicode
+  (def fd-stream-read-sequence/utf-8-crlf-to-base-string
+    simple-base-string
+    sb-vm::simd-copy-utf8-crlf-to-base-string
+    :crlf))
 
 #+(and sb-unicode 64-bit little-endian
        (not (or arm64 x86-64)))
@@ -1037,8 +1027,6 @@
         (end (or end (length string)))
         (last-newline -1))
     (declare (type index start end))
-    (when (fd-stream-synchronize-output stream)
-      (synchronize-stream-output stream))
     (unless (<= 0 start end (length string))
       (sequence-bounding-indices-bad-error string start end))
     (do ()
@@ -1398,92 +1386,3 @@
       (setf (buffer-head ibuf) head)
       (truly-the index (values (truncate string-offset 4))))))
 
-(defun fd-stream-read-sequence/utf-8-crlf-to-character-string (stream string start end)
-  (declare (type fd-stream stream)
-           (type index start end)
-           (type (simple-array character (*)) string))
-  (let (eof
-        (index start))
-    (declare (index index))
-    (block outer
-      (loop
-       (do ((instead (fd-stream-instead stream)))
-           ((= (fill-pointer instead) 0)
-            (setf (fd-stream-listen stream) nil))
-         (setf (aref string index) (vector-pop instead))
-         (incf index)
-         (when (= index end)
-           (when (= (fill-pointer instead) 0)
-             (setf (fd-stream-listen stream) nil))
-           (return index)))
-       #+(and sb-unicode 64-bit little-endian)
-       (setf index
-             (sb-vm::simd-copy-utf8-crlf-to-character-string index end string (fd-stream-ibuf stream)))
-       (let* ((ibuf (fd-stream-ibuf stream))
-              (head (buffer-head ibuf))
-              (tail (buffer-tail ibuf))
-              (sap (buffer-sap ibuf))
-              requested-refill
-              incomplete)
-         (declare (type index head tail))
-         (flet ((decode-break (reason)
-                  (setf (buffer-head ibuf) head)
-                  (when (stream-decoding-error-and-handle stream reason 1)
-                    (return-from outer index))
-                  (return)))
-           (utf8-char-loop :crlf t))
-         (when (or (= end index)
-                   eof)
-           (setf (buffer-head ibuf) head)
-           (return index))
-         (unless (catch 'eof-input-catcher (refill-input-buffer stream))
-           (if requested-refill
-               (setf eof t)
-               (when (or (not incomplete)
-                         (stream-decoding-error-and-handle stream (- tail head) 1))
-                 (return index)))))))))
-
-(defun fd-stream-read-sequence/utf-8-crlf-to-base-string (stream string start end)
-  (declare (type fd-stream stream)
-           (type index start end)
-           (type simple-base-string string))
-  (let (eof
-        (index start))
-    (declare (index index))
-    (block outer
-      (loop
-       (do ((instead (fd-stream-instead stream)))
-           ((= (fill-pointer instead) 0)
-            (setf (fd-stream-listen stream) nil))
-         (setf (aref string index) (vector-pop instead))
-         (incf index)
-         (when (= index end)
-           (when (= (fill-pointer instead) 0)
-             (setf (fd-stream-listen stream) nil))
-           (return index)))
-       #+(and sb-unicode 64-bit little-endian)
-       (setf index
-             (sb-vm::simd-copy-utf8-crlf-to-base-string index end string (fd-stream-ibuf stream)))
-       (let* ((ibuf (fd-stream-ibuf stream))
-              (head (buffer-head ibuf))
-              (tail (buffer-tail ibuf))
-              (sap (buffer-sap ibuf))
-              requested-refill
-              incomplete)
-         (declare (type index head tail))
-         (flet ((decode-break (reason)
-                  (setf (buffer-head ibuf) head)
-                  (when (stream-decoding-error-and-handle stream reason 1)
-                    (return-from outer index))
-                  (return)))
-           (utf8-char-loop :crlf t))
-         (when (or (= end index)
-                   eof)
-           (setf (buffer-head ibuf) head)
-           (return index))
-         (unless (catch 'eof-input-catcher (refill-input-buffer stream))
-           (if requested-refill
-               (setf eof t)
-               (when (or (not incomplete)
-                         (stream-decoding-error-and-handle stream (- tail head) 1))
-                 (return index)))))))))

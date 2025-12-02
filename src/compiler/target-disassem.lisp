@@ -1333,18 +1333,24 @@
 (defun print-notes-and-newline (stream dstate)
   (declare (type stream stream)
            (type disassem-state dstate))
-  (with-print-restrictions
-    (dolist (note (dstate-notes dstate))
-      (format stream "~Vt " *disassem-note-column*)
-      (pprint-logical-block (stream nil :per-line-prefix "; ")
-      (etypecase note
-        (string
-         (write-string note stream))
-        (function
-         (funcall note stream))))
-      (terpri stream))
-    (fresh-line stream)
-    (setf (dstate-notes dstate) nil)))
+  (flet ((print-note (note)
+           (format stream "~Vt " *disassem-note-column*)
+           (pprint-logical-block (stream nil :per-line-prefix "; ")
+             (etypecase note
+               (string
+                (write-string note stream))
+               (function
+                (funcall note stream))))
+           (terpri stream)))
+    (let ((notes (dstate-notes dstate)))
+      (when notes
+        (with-print-restrictions
+            (if (listp notes)
+                (dolist (note (dstate-notes dstate))
+                  (print-note note))
+                (print-note notes)))
+        (setf (dstate-notes dstate) nil))))
+  (fresh-line stream))
 
 (defun prin1-short (thing stream)
   (with-print-restrictions
@@ -1397,11 +1403,13 @@
 
 ;;; Logically or MASK into the set of instruction properties in DSTATE.
 (defun dstate-setprop (dstate mask)
+  (declare (fixnum mask))
   (setf (dstate-inst-properties dstate) (logior mask (dstate-inst-properties dstate))))
 
 ;;; Return non-NIL if any bit in MASK
 ;;; is in the set of instruction properties in DSTATE.
 (defun dstate-getprop (dstate mask)
+  (declare (fixnum mask))
   (logtest mask (dstate-inst-properties dstate)))
 
 (defun add-fun-header-hooks (segment)
@@ -1973,7 +1981,8 @@
      (lambda (chunk inst)
        (declare (type dchunk chunk) (type instruction inst))
        (awhen (inst-printer inst)
-         (funcall it chunk inst stream dstate)))
+         (funcall it chunk inst stream dstate)
+         (setf (dstate-previous-chunk dstate) chunk)))
      segment
      dstate
      stream)))
@@ -2330,7 +2339,11 @@
 (defun note (note dstate)
   (declare (type (or string function) note)
            (type disassem-state dstate))
-  (setf (dstate-notes dstate) (nconc (dstate-notes dstate) (list note))))
+  (let ((notes (dstate-notes dstate)))
+    (setf (dstate-notes dstate) (typecase notes
+                                  (null note)
+                                  (cons (nconc notes (list note)))
+                                  (t (list notes note))))))
 
 (defun prin1-quoted-short (thing stream)
   (if (self-evaluating-p thing)
@@ -2576,10 +2589,13 @@
 (defun get-random-tn-name (sc+offset)
   (let ((sc (sb-c:sc+offset-scn sc+offset))
         (offset (sb-c:sc+offset-offset sc+offset)))
-    (if (= sc sb-vm:immediate-sc-number)
-        (princ-to-string offset)
-        (sb-c:location-print-name
-         (sb-c:make-random-tn (svref sb-c:*backend-sc-numbers* sc) offset)))))
+    (cond ((= sc sb-vm:immediate-sc-number)
+           (princ-to-string offset))
+          ((= sc sb-vm::negative-immediate-sc-number)
+           (princ-to-string (- offset)))
+          (t
+           (sb-c:location-print-name
+            (sb-c:make-random-tn (svref sb-c:*backend-sc-numbers* sc) offset))))))
 
 ;;; When called from an error break instruction's :DISASSEM-CONTROL (or
 ;;; :DISASSEM-PRINTER) function, will correctly deal with printing the

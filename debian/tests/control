@@ -1,3 +1,3 @@
 Test-Command: cd tests && env TEST_SBCL_HOME=/usr/lib/sbcl TEST_SBCL_RUNTIME=/usr/bin/sbcl TEST_SBCL_CORE=/usr/lib/sbcl/sbcl.core ASDF_OUTPUT_TRANSLATIONS="/:${AUTOPKGTEST_TMP}" C_INCLUDE_PATH=/usr/share/sbcl-source/src/runtime/ ./run-tests.sh
-Depends: sbcl, sbcl-source, gcc, libc6-dev | libc-dev, ed, strace
+Depends: sbcl, sbcl-source, gcc, libc6-dev | libc-dev, ed, strace, procps
 Restrictions: allow-stderr

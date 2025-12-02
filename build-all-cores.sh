@@ -34,7 +34,7 @@
   '(("arm"    ("arm" :little-endian :largefile))
     ("arm64"  ("arm64" :little-endian :sb-thread)
               ("arm64-darwin" :darwin :bsd :unix :mach-o :little-endian :sb-thread :darwin-jit)
-              ("arm64-reloc"  :little-endian :sb-thread :relocatable-static-space)
+              ("arm64-reloc"  :little-endian :sb-thread :relocatable-static-space :immobile-space)
               ("arm64-immobile-space" :little-endian :sb-thread :immobile-space))
     ("mips"   ("mips" :largefile :little-endian))
     ("ppc"    ("ppc" :big-endian)
@@ -53,7 +53,7 @@
               ("x86-64-darwin" :darwin :bsd :unix :mach-o :little-endian :avx2 :gencgc
                                :sb-simd-pack :sb-simd-pack-256)
               ("x86-64-imm" :little-endian :avx2 :gencgc :sb-simd-pack :sb-simd-pack-256
-                            :immobile-space)
+                            :immobile-space (not :sb-unicode))
               ("x86-64-permgen" :little-endian :avx2 :gencgc :sb-simd-pack :sb-simd-pack-256
                                 :permgen))))
 
@@ -74,13 +74,16 @@
            (setq start (1+ end))))))))
 
 (defun add-os-features (arch features)
-  (if (intersection '(:unix :win32) features)
-      features
-      (let* ((arch-symbol (sb-int:keywordicate (string-upcase arch)))
-             (os-features (case arch-symbol
-                            ((:x86 :x86-64) '(:win32 :sb-thread :sb-safepoint))
-                            (t '(:unix :linux :elf)))))
-        (append os-features features))))
+  (cond ((find :unix features)
+         (append features '(:os-provides-clock-gettime)))
+        ((find :win32 features)
+         features)
+        (t
+         (let* ((arch-symbol (sb-int:keywordicate (string-upcase arch)))
+                (os-features (case arch-symbol
+                               ((:x86 :x86-64) '(:win32 :sb-thread :sb-safepoint))
+                               (t '(:unix :linux :elf :os-provides-clock-gettime)))))
+           (append os-features features)))))
 
 ;;; TODO: dependencies for each target based on build-order.lisp-expr
 (let

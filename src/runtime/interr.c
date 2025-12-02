@@ -35,7 +35,6 @@
 #include "gc.h"
 
 /* the way that we shut down the system on a fatal error */
-void lisp_backtrace(int frames);
 extern void ldb_monitor(void);
 
 static void
@@ -47,7 +46,7 @@ default_lossage_handler(void)
         // This may not be exactly the right condition for determining
         // whether it might be possible to backtrace, but at least it prevents
         // lose() from itself losing early in startup.
-        if (get_sb_vm_thread()) lisp_backtrace(100);
+        if (get_sb_vm_thread()) print_lisp_backtrace(100, stderr);
     }
     exit(1);
 }
@@ -60,7 +59,7 @@ configurable_lossage_handler()
 
     if (dyndebug_config.dyndebug_backtrace_when_lost) {
         fprintf(stderr, "lose: backtrace follows as requested\n");
-        lisp_backtrace(100);
+        print_lisp_backtrace(100, stderr);
     }
 
     if (dyndebug_config.dyndebug_sleep_when_lost) {
@@ -148,32 +147,6 @@ lose(char *fmt, ...)
     call_lossage_handler();
 #endif
 }
-
-#if 0
-/// thread printf. This was used to produce the 2-column output
-/// at the bottom of "src/code/final". The main thread'd os_kernel_tid
-/// must be assigned a constant in main_thread_trampoline().
-void tprintf(char *fmt, ...)
-{
-    va_list ap;
-    char buf[200];
-    char *ptr;
-    const char spaces[] = "                                           ";
-    struct thread*th = get_sb_vm_thread();
-    buf[0] = ';'; buf[1] = ' ';
-    ptr = buf+2;
-    if (th->os_kernel_tid == 'A') {
-        strcpy(ptr, spaces);
-        ptr += (sizeof spaces)-1;
-    }
-    va_start(ap, fmt);
-    int n = vsprintf(ptr, fmt, ap);
-    va_end(ap);
-    ptr += n;
-    *ptr++ = '\n';
-    write(2, buf, ptr-buf);
-}
-#endif
 
 int lose_on_corruption_p = 0; // DO NOT CHANGE THIS TO 'bool'. (Naughty users think it's 4 bytes)
 

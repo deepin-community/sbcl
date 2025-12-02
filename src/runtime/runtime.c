@@ -41,13 +41,13 @@
 #include <limits.h>
 
 #include <time.h>
+#include <sys/time.h> // for gettimeofday
 
 #ifndef LISP_FEATURE_WIN32
 #include <signal.h>
 #endif
 
 #include "runtime.h"
-#include "vars.h"
 #include "globals.h"
 #include "os.h"
 #include "interr.h"
@@ -456,31 +456,39 @@ parse_argv(struct memsize_options memsize_options,
         dynamic_space_size = memsize_options.dynamic_space_size;
         thread_control_stack_size = memsize_options.thread_control_stack_size;
         dynamic_values_bytes = memsize_options.thread_tls_bytes;
-        int stop_parsing = 0; // have we seen '--'
-        int output_index = 1;
-
+        if (memsize_options.present_in_core == 2) {
+            int stop_parsing = 0; // have we seen '--'
+            int output_index = 1;
 #ifndef LISP_FEATURE_WIN32
-        sbcl_argv = checked_malloc((argc + 1) * sizeof(char *));
-        char **argv_source = argv;
+            sbcl_argv = checked_malloc((argc + 1) * sizeof(char *));
+            char **argv_source = argv;
 #else
-        int wargc;
-        wchar_t **argv_source;
-        argv_source = CommandLineToArgvW(GetCommandLineW(), &wargc);
-        sbcl_argv = checked_malloc((wargc + 1) * sizeof(wchar_t *));
+            int wargc;
+            wchar_t **argv_source;
+            argv_source = CommandLineToArgvW(GetCommandLineW(), &wargc);
+            sbcl_argv = checked_malloc((wargc + 1) * sizeof(wchar_t *));
 #endif
-        sbcl_argv[0] = argv_source[0];
+            sbcl_argv[0] = argv_source[0];
 
-        while (argi < argc) {
-            if (stop_parsing) // just copy it over
-                sbcl_argv[output_index++] = argv_source[argi++];
-            else if (!strcmp(argv[argi], "--")) // keep it, but parse nothing else
-                sbcl_argv[output_index++] = argv_source[argi++], stop_parsing = 1;
-            else if ((n_consumed = is_memsize_arg(argv, argi, argc, &merge_core_pages)))
-                argi += n_consumed; // eat it
-            else // default action - copy it
-                sbcl_argv[output_index++] = argv_source[argi++];
+            while (argi < argc) {
+                if (stop_parsing) // just copy it over
+                    sbcl_argv[output_index++] = argv_source[argi++];
+                else if (!strcmp(argv[argi], "--")) // keep it, but parse nothing else
+                    sbcl_argv[output_index++] = argv_source[argi++], stop_parsing = 1;
+                else if ((n_consumed = is_memsize_arg(argv, argi, argc, &merge_core_pages)))
+                    argi += n_consumed; // eat it
+                else // default action - copy it
+                    sbcl_argv[output_index++] = argv_source[argi++];
+            }
+            sbcl_argv[output_index] = 0;
+        } else {
+#ifndef LISP_FEATURE_WIN32
+            sbcl_argv = argv;
+#else
+            int wargc;
+            sbcl_argv = CommandLineToArgvW(GetCommandLineW(), &wargc);
+#endif
         }
-        sbcl_argv[output_index] = 0;
     } else {
         bool end_runtime_options = 0;
         /* Parse our any of the command-line options that we handle from C,
@@ -602,6 +610,8 @@ parse_argv(struct memsize_options memsize_options,
     return o;
 }
 
+void dyndebug_init(void);
+
 int
 initialize_lisp(int argc, char *argv[], char *envp[])
 {
@@ -610,12 +620,7 @@ initialize_lisp(int argc, char *argv[], char *envp[])
     struct lisp_exception_frame exception_frame;
 #endif
 #ifdef LISP_FEATURE_UNIX
-#ifdef LISP_FEATURE_AVOID_CLOCK_GETTIME
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    lisp_init_time.tv_sec = tv.tv_sec;
-    lisp_init_time.tv_nsec = tv.tv_usec * 1000;
-#else
+#ifdef LISP_FEATURE_OS_PROVIDES_CLOCK_GETTIME
     clock_gettime(
 #ifdef LISP_FEATURE_LINUX
         CLOCK_MONOTONIC_COARSE
@@ -623,6 +628,11 @@ initialize_lisp(int argc, char *argv[], char *envp[])
         CLOCK_MONOTONIC
 #endif
         , &lisp_init_time);
+#else
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    lisp_init_time.tv_sec = tv.tv_sec;
+    lisp_init_time.tv_nsec = tv.tv_usec * 1000;
 #endif
 #endif
 
@@ -635,6 +645,8 @@ initialize_lisp(int argc, char *argv[], char *envp[])
     lispobj initial_function;
     struct memsize_options memsize_options;
     memsize_options.present_in_core = 0;
+    extern void sb_query_os_page_size();
+    sb_query_os_page_size();
 
     bool have_hardwired_spaces = os_preinit(argv, envp);
 
@@ -695,7 +707,7 @@ initialize_lisp(int argc, char *argv[], char *envp[])
     // FIXME: if the 'have' flag is 0 and you've disabled disabling of ASLR
     // then we haven't done an exec(), nor unmapped the mappings that were obtained
     // already obtained (if any) so it is unhelpful to try again here.
-    allocate_lisp_dynamic_space(have_hardwired_spaces);
+    if (!have_hardwired_spaces) allocate_hardwired_spaces(1);
     gc_init();
 
     /* If no core file was specified, look for one. */
@@ -757,20 +769,13 @@ initialize_lisp(int argc, char *argv[], char *envp[])
     tzset();
 #endif
 
-    define_var("nil", NIL, 1);
-    define_var("t", LISP_T, 1);
-
     if (!options.disable_lossage_handler_p)
         enable_lossage_handler();
 
+    ensure_undefined_alien();
     os_link_runtime();
+
 #ifdef LISP_FEATURE_IMMOBILE_SPACE
-#ifdef CALLBACK_WRAPPER_TRAMPOLINE // not defined if #-sb-thread
-     // Assign the static lisp symbol's value the address of the C function
-    // of the same name. Needed when alien linkage table is relocatable.
-    extern void callback_wrapper_trampoline();
-    SYMBOL(CALLBACK_WRAPPER_TRAMPOLINE)->value = (lispobj)callback_wrapper_trampoline;
-#endif
     /* Delayed until after dynamic space has been mapped, fixups made,
      * and/or immobile-space linkage entries written,
      * since it was too soon earlier to handle write faults. */

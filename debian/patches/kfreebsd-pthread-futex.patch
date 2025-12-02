@@ -21,10 +21,10 @@ index 6fd4cdd..5bc5b6c 100644
 +  #OS_LIBS += -lthr
  endif
 diff --git a/src/runtime/thread.c b/src/runtime/thread.c
-index 3862ab4..a67d374 100644
+index 114a6a5..cae17fc 100644
 --- a/src/runtime/thread.c
 +++ b/src/runtime/thread.c
-@@ -789,7 +789,7 @@ static void attach_os_thread(init_thread_data *scribble)
+@@ -786,7 +786,7 @@ static void attach_os_thread(init_thread_data *scribble)
  # else
      pthread_attr_t attr;
      pthread_attr_init(&attr);

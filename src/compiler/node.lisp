@@ -650,8 +650,7 @@
   (delete-blocks nil :type list)
   ;; The default LOOP in the component.
   (outer-loop (missing-arg) :type cloop)
-  (max-block-number 0 :type fixnum)
-  (dominators-computed nil))
+  (renumber-p nil))
 
 (defprinter (component :identity t)
   name
@@ -700,7 +699,10 @@
   (mess-up nil :type (or node null))
   ;; a list of all the NLX-INFO structures whose NLX-INFO-CLEANUP is
   ;; this cleanup.
-  (nlx-info nil :type list))
+  (nlx-info nil :type list)
+  ;; Lexenv entries for the BLOCK special form, to be fixed up when
+  ;; deleting blocks to allow inlining to find it again.
+  (block nil))
 (defprinter (cleanup :identity t)
   kind
   mess-up
@@ -1438,11 +1440,12 @@
   explicit-value-cell
   ;; Do not propagate constraints for this var
   no-constraints
-  ;; Does it hold a constant that should't be destructively modified
+  ;; Does it hold a constant that shouldn't be destructively modified
   constant
   unused-initial-value
   ;; Instruct constraint propagation to do some work.
-  compute-same-refs)
+  compute-same-refs
+  no-debug)
 
 (defstruct (lambda-var
             (:include basic-var) (:copier nil)
@@ -1500,7 +1503,8 @@
   `(lambda-var-attributep (lambda-var-flags ,var) constant))
 (defmacro lambda-var-unused-initial-value (var)
   `(lambda-var-attributep (lambda-var-flags ,var) unused-initial-value))
-
+(defmacro lambda-var-no-debug (var)
+  `(lambda-var-attributep (lambda-var-flags ,var) no-debug))
 (defmacro lambda-var-compute-same-refs (var)
   `(lambda-var-attributep (lambda-var-flags ,var) compute-same-refs))
 
@@ -1789,7 +1793,11 @@
   (funs nil :type list)
   ;; The dynamic extent for this enclose if any of its functionals are
   ;; declared dynamic extent.
-  (dynamic-extent nil :type (or null cdynamic-extent)))
+  (dynamic-extent nil :type (or null cdynamic-extent))
+  ;; The union of all dynamic extents inferred by the compiler for
+  ;; this enclose's functionals. NULL when there is a declared dynamic
+  ;; extent.
+  (derived-dynamic-extents () :type list))
 (defprinter (enclose :identity t)
   funs)
 
@@ -1803,12 +1811,10 @@
                             (:copier nil))
   ;; the values explicitly declared with this dynamic extent.
   (values nil :type list)
-  ;; the cleanup for this extent. NULL indicates that this dynamic
-  ;; extent is over the environment and hence needs no cleanup code.
+  ;; the cleanup for this extent.
   (cleanup nil :type (or cleanup null))
   ;; some kind of info used by the back end
-  (info nil)
-  (preserve-info nil))
+  (info nil))
 
 (defprinter (cdynamic-extent :conc-name dynamic-extent-
                              :identity t)

@@ -67,6 +67,8 @@
     (or (gethash keys *phash-cache-file-contents*)
         (let ((start (get-internal-real-time))
               (answer (sb-c:make-perfect-hash-lambda keys)))
+          (declare (ignorable start))
+          #+nil
           (format *debug-io* "~&Computed perfect hash of ~D keys: ~F sec (~S)~%"
                   (length keys)
                   (/ (- (get-internal-real-time) start) internal-time-units-per-second)
@@ -887,11 +889,10 @@ disappears when accents are placed on top of it. and NIL otherwise"
     (setf result (nreverse result))
     (coerce result 'string)))
 
-(declaim (type function sb-unix::posix-getenv))
 (defun get-user-locale ()
   (let ((raw-locale
-         #+(or win32 unix) (or (sb-unix::posix-getenv "LC_ALL")
-                                (sb-unix::posix-getenv "LANG"))
+         #+(or win32 unix) (or (sb-ext:posix-getenv "LC_ALL")
+                               (sb-ext:posix-getenv "LANG"))
          #-(or win32 unix) nil))
     (when raw-locale
       (let ((lang-code (string-upcase
@@ -1086,6 +1087,7 @@ The result is not guaranteed to have the same length as the input."
 
 (macrolet ((def (name extendedp)
              `(defun ,name (function string)
+                (declare (dynamic-extent function))
                 (do* ((length (length string))
                       (start 0)
                       (end 1 (1+ end))
@@ -1098,7 +1100,6 @@ The result is not guaranteed to have the same length as the input."
                      ((>= end length)
                       (if (= end length) (progn (funcall function string start end) nil)))
                   (flet ((brk () (funcall function string start end) (setf start end)))
-                    (declare (dynamic-extent #'brk))
                     (shiftf char1 char2 (char string end))
                     (shiftf c1 c2 (grapheme-break-class char2))
                     (if (eql c2 :regional-indicator) (incf nri) (setf nri 0))

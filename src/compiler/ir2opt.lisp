@@ -76,11 +76,18 @@
                      (return-from move-value-target)))
          (second (vop-next first)))
     (when (and (memq (vop-name first) '(move sb-vm::double-move
-                                        sb-vm::single-move))
+                                        sb-vm::single-move
+                                        sb-vm::word-move
+                                        sb-vm::move-to-word/fixnum
+                                        sb-vm::character-move
+                                        sb-vm::move-from-character
+                                        sb-vm::move-to-character
+                                        sb-vm::sap-move))
                (or (not second)
                    (eq (vop-name second) 'branch)))
       (values (tn-ref-tn (vop-args first))
-              (tn-ref-tn (vop-results first))))))
+              (tn-ref-tn (vop-results first))
+              first))))
 
 ;; A conditional jump may be converted to a conditional move if
 ;; both branches move a value to the same TN and then continue
@@ -106,37 +113,40 @@
                  (eq (car succ-a) (car succ-b))
                  (singleton-p (block-pred a))
                  (singleton-p (block-pred b)))
-            (multiple-value-bind (value-a target)
+            (multiple-value-bind (value-a target move-a)
                 (move-value-target a2)
-              (multiple-value-bind (value-b targetp)
+              (multiple-value-bind (value-b targetp move-b)
                   (move-value-target b2)
                 (and value-a value-b (eq target targetp)
                      (values (block-label (car succ-a))
-                             target value-a value-b)))))
-           ;; A branch jumping over a move.
+                             target value-a value-b
+                             move-a move-b)))))
+           ;; ;; A branch jumping over a move.
            ((and (singleton-p succ-a)
                  (singleton-p (block-pred a))
                  (equal (car succ-a)
                         b))
-            (multiple-value-bind (value target)
+            (multiple-value-bind (value target move)
                 (move-value-target a2)
               (when value
                 (values (block-label b)
-                        target value target))))
+                        target value target move nil))))
            ((and (singleton-p succ-b)
                  (singleton-p (block-pred b))
                  (equal (car succ-b)
                         a))
-            (multiple-value-bind (value target)
+            (multiple-value-bind (value target move)
                 (move-value-target b2)
               (when value
                 (values (block-label a)
-                        target target value))))))))
+                        target target value nil move))))))))
 
 #-x86-64
-(defun sb-vm::computable-from-flags-p (res x y flags)
-  (declare (ignorable res x y flags))
-  nil)
+(progn
+  (declaim (inline sb-vm::computable-from-flags-p))
+  (defun sb-vm::computable-from-flags-p (res x y flags)
+    (declare (ignorable res x y flags))
+    nil))
 
 ;; To convert a branch to a conditional move:
 ;; 1. Convert both possible values to the chosen common representation
@@ -146,6 +156,7 @@
 ;; 5. Jump to the successor
 (defun convert-one-cmov (cmove-vop
                          value-if value-else
+                         move-if move-else
                          res flags
                          label vop node 2block
                          &aux (prev (vop-prev vop)))
@@ -178,11 +189,39 @@
                     (eq (tn-primitive-type x-tn)
                         (tn-primitive-type res)))
            (setf value-if x-tn))))
-     (emit-template node 2block (template-or-lose cmove-vop)
-                    (reference-tn-list (list value-if value-else)
-                                       nil)
-                    (reference-tn res t)
-                    (list flags))))
+     (flet ((coerce-tn (tn move)
+              (if (or (eq tn res)
+                      (eq (vop-name move) 'move)
+                      (sc-is tn sb-vm::immediate)
+                      (compatible-move-p res tn))
+                  tn
+                  (let ((intermediate-tn (make-representation-tn (tn-primitive-type res)
+                                                                 (sc-number (tn-sc res))
+                                                                 (tn-type tn))))
+                    (multiple-value-bind (node block before)
+                        (cond #+arm64
+                              ((member (vop-name move) '(sb-vm::move-to-word/fixnum
+                                                         sb-vm::move-from-character
+                                                         sb-vm::move-to-character))
+                               ;; Doesn't affect the flags, can be
+                               ;; issued after the test, potentially
+                               ;; reusing a register.
+                               (values node 2block nil))
+                              (t
+                               (values (vop-node prev) (vop-block prev) prev)))
+                      (emit-and-insert-vop node
+                                           block
+                                           (vop-info move)
+                                           (reference-tn tn nil)
+                                           (reference-tn intermediate-tn t)
+                                           before))
+                    intermediate-tn))))
+       (emit-template node 2block (template-or-lose cmove-vop)
+                      (reference-tn-list (list (coerce-tn value-if move-if)
+                                               (coerce-tn value-else move-else))
+                                         nil)
+                      (reference-tn res t)
+                      (list flags)))))
 
   (vop branch node 2block label)
   (update-block-succ 2block (list label)))
@@ -195,16 +234,19 @@
          (a    (first succ))
          (b    (second succ)))
     (destructuring-bind (jump-target not-p flags) (vop-codegen-info vop)
-      (multiple-value-bind (label target value-a value-b)
+      (multiple-value-bind (label target value-a value-b move-a move-b)
           (cmovp jump-target a b)
         (unless label
           (return-from maybe-convert-one-cmov))
         (multiple-value-bind (cmove-vop) (convert-conditional-move-p target)
           (when cmove-vop
             (when not-p
-              (rotatef value-a value-b))
+              (rotatef value-a value-b)
+              (rotatef move-a move-b))
             (convert-one-cmov cmove-vop
-                              value-a value-b target
+                              value-a value-b
+                              move-a move-b
+                              target
                               flags
                               label vop node (vop-block vop))
             t))))))
@@ -264,17 +306,34 @@
         (when (jump-falls-through-p 2block)
           (delete-vop (ir2-block-last-vop 2block)))))))
 
+(defun compatible-move-p (tn1 tn2)
+  (let ((sc1 (tn-sc tn1))
+        (sc2 (tn-sc tn2)))
+    (or (eq sc1 sc2)
+        (flet ((try (csc1 csc2)
+                 (cond ((eq sc1 csc1)
+                        (eq sc2 csc2))
+                       ((eq sc1 csc2)
+                        (eq sc2 csc1)))))
+          (or (try (load-time-value (sc-or-lose 'sb-vm::any-reg))
+                   (load-time-value (sc-or-lose 'sb-vm::descriptor-reg)))
+              (try (load-time-value (sc-or-lose 'sb-vm::signed-reg))
+                   (load-time-value (sc-or-lose 'sb-vm::unsigned-reg))))))))
+
 (defun delete-no-op-vops (component)
   (do-ir2-blocks (block component)
     (do ((vop (ir2-block-start-vop block) (vop-next vop)))
         ((null vop))
       (let ((args (vop-args vop))
             (results (vop-results vop)))
-       (case (vop-name vop)
-         ((move sb-vm::sap-move)
+        (when (vop-info-move-vop-p (vop-info vop))
           (let ((x (tn-ref-tn args))
                 (y (tn-ref-tn results)))
-            (when (location= x y)
+            (when (and (location= x y)
+                       (compatible-move-p x y)
+                       (not (and (eq (vop-info-move-vop-p (vop-info vop)) :move-arg)
+                                 ;; MOVE-ARG moves stack args into a different frame
+                                 (eq (sb-kind (sc-sb (tn-sc x))) :unbounded))))
               (delete-vop vop)
               ;; Deleting the copy may make it look like that register
               ;; is not used anywhere else and some optimizations,
@@ -291,7 +350,7 @@
                 (when x-reads
                   (reference-tn y nil))
                 (when x-writes
-                  (reference-tn y t)))))))))))
+                  (reference-tn y t))))))))))
 
 ;;; Unchain BRANCHes that jump to a BRANCH.
 ;;; Remove BRANCHes that are jumped over by BRANCH-IF
@@ -475,29 +534,32 @@
   (maybe-convert-one-cmov branch-if)
   nil)
 
-(defun next-start-vop (block)
-  (loop thereis (ir2-block-start-vop block)
-        while (and (= (length (ir2block-predecessors block)) 1)
-                   (setf block (ir2-block-next block)))))
-
-(defun branch-destination (branch &optional (true t))
-  (unless (typep (vop-codegen-info branch) '(cons t (cons t)))
-    (let ((next (vop-next branch)))
-      (if (and next
-               (eq (vop-name next) 'branch-if))
-          (setf branch next)
-          (return-from branch-destination))))
-  (destructuring-bind (label not-p &rest rest) (vop-codegen-info branch)
-    (declare (ignore rest))
-    (if (eq not-p true)
-        (if (eq branch (ir2-block-last-vop (vop-block branch)))
-            (next-start-vop (ir2-block-next (vop-block branch)))
-            (let ((next (next-vop branch)))
-              (and (eq (vop-name next) 'branch)
-                   (next-start-vop (gethash (car (vop-codegen-info next)) *2block-info*)))))
-        (let ((dest (gethash label *2block-info*)))
-          (when dest
-            (next-start-vop dest))))))
+(defun branch-destination (branch &optional (true t) blockp)
+  (flet ((next-start-vop (block)
+           (if blockp
+               block
+               (loop thereis (ir2-block-start-vop block)
+                     while (and (= (length (ir2block-predecessors block)) 1)
+                                (setf block (ir2-block-next block)))))))
+   (let (branch-if)
+     (unless (typep (vop-codegen-info branch) '(cons t (cons t)))
+       (let ((next (vop-next branch)))
+         (if (and next
+                  (eq (vop-name next) 'branch-if))
+             (setf branch (setf branch-if next))
+             (return-from branch-destination))))
+     (destructuring-bind (label not-p &rest rest) (vop-codegen-info branch)
+       (declare (ignore rest))
+       (values (if (eq not-p true)
+                   (if (eq branch (ir2-block-last-vop (vop-block branch)))
+                       (next-start-vop (ir2-block-next (vop-block branch)))
+                       (let ((next (next-vop branch)))
+                         (and (eq (vop-name next) 'branch)
+                              (next-start-vop (gethash (car (vop-codegen-info next)) *2block-info*)))))
+                   (let ((dest (gethash label *2block-info*)))
+                     (when dest
+                       (next-start-vop dest))))
+               branch-if)))))
 
 ;;; Replace (BOUNDP X) + (BRANCH-IF) + {(SYMBOL-VALUE X) | anything}
 ;;; by (FAST-SYMBOL-VALUE X) + (UNBOUND-MARKER-P) + BRANCH-IF
@@ -537,7 +599,8 @@
                  ;; then we're fine to combine.
                  (or (constant-tn-p sym)
                      (not (tn-writes sym))
-                     (not (tn-ref-next (tn-writes sym))))
+                     (not (or (eq (tn-vertex sym) :alias)
+                              (tn-ref-next (tn-writes sym)))))
                  ;; Elide the SYMBOL-VALUE only if there is exactly one way to get there.
                  ;; Technically we could split the IR2 block and peel off the SYMBOL-VALUE,
                  ;; and if coming from the BRANCH-IF, jump to the block that contained
@@ -794,12 +857,16 @@
                     (unless (tn-reads tn)
                       (do ((ref (tn-writes tn) (tn-ref-next ref)))
                           ((null ref))
-                        (aver (eq (vop-name (tn-ref-vop ref))
-                                  'current-stack-pointer))
+                        (aver (memq (vop-name (tn-ref-vop ref))
+                                    '(current-stack-pointer move)))
                         (delete-vop (tn-ref-vop ref)))))
                   (return))
                  (t
                   (return)))))
+
+(defoptimizer (vop-optimize current-stack-pointer) (vop)
+  (unless (tn-reads (tn-ref-tn (vop-results vop)))
+    (delete-vop vop)))
 
 ;;; Load the WIDETAG once for a series of type tests.
 (when-vop-existsp (:named sb-vm::load-other-pointer-widetag)
@@ -817,7 +884,8 @@
                                (setf zero-extend t)))
                       (eq (tn-ref-tn (vop-args vop)) value)))
                (chain (vop &optional (collect t))
-                 (let ((next (branch-destination vop nil)))
+                 (let ((next (branch-destination vop nil))
+                       not-p-chained)
                    (cond ((and next
                                (cond ((eq (vop-name vop) 'symbolp)
                                       (and (not null)
@@ -828,17 +896,24 @@
                                      (t t)))
                           (when collect
                             (push vop vops))
+                          (setf not-p-chained t)
                           (cond ((good-vop-p next)
                                  (chain next))
                                 ((not stop)
                                  (setf stop (vop-block next)))))
                          ((not stop)
-                          (setf stop (vop-block vop)))))
-                 (let ((true (branch-destination vop)))
-                   (when (and true
-                              (good-vop-p true))
-                     (push true vops)
-                     (chain true nil))))
+                          (unless (setf stop (if vops
+                                                 (vop-block vop)
+                                                 ;; can't fall back to the first vop
+                                                 (setf stop (branch-destination vop nil t))))
+                            (return-from chain))))
+                   (let ((true (branch-destination vop)))
+                     (when (and true
+                                (good-vop-p true))
+                       (unless not-p-chained
+                         (push vop vops))
+                       (push true vops)
+                       (chain true nil)))))
                (ir2-block-label (block)
                  (or (ir2-block-%label block)
                      (setf (ir2-block-%label block) (gen-label)))))
@@ -893,7 +968,10 @@
                                                (reference-tn widetag nil)
                                                nil
                                                vop
-                                               (list (first info) (second info) tags))))
+                                               (list (first info) (second info) tags
+                                                     ;; It would fetch TN-REF-TYPE for
+                                                     ;; some further optimizations.
+                                                     (vop-args vop)))))
                     (delete-vop vop)))))))
     nil)
 
@@ -912,21 +990,29 @@
                       (eq (vop-name vop) 'structure-typep)
                       (eq (tn-ref-tn (vop-args vop)) value)))
                (chain (vop &optional (collect t))
-                 (let ((next (branch-destination vop nil)))
+                 (let ((next (branch-destination vop nil))
+                       not-p-chained)
                    (cond (next
                           (when collect
                             (push vop vops))
+                          (setf not-p-chained t)
                           (cond ((good-vop-p next)
                                  (chain next))
                                 ((not stop)
                                  (setf stop (vop-block next)))))
                          ((not stop)
-                          (setf stop (vop-block vop)))))
-                 (let ((true (branch-destination vop)))
-                   (when (and true
-                              (good-vop-p true))
-                     (push true vops)
-                     (chain true nil))))
+                          (unless (setf stop (if vops
+                                                 (vop-block vop)
+                                                 ;; can't fall back to the first vop
+                                                 (setf stop (branch-destination vop nil t))))
+                            (return-from chain))))
+                   (let ((true (branch-destination vop)))
+                     (when (and true
+                                (good-vop-p true))
+                       (unless not-p-chained
+                         (push vop vops))
+                       (push true vops)
+                       (chain true nil)))))
                (ir2-block-label (block)
                  (or (ir2-block-%label block)
                      (setf (ir2-block-%label block) (gen-label)))))
@@ -988,13 +1074,16 @@
          (not (and single-reader
                    (tn-ref-next reads)))
          (not (and single-writer
-                   (tn-ref-next writes)))
+                   (or
+                    (eq (tn-vertex tn) :alias)
+                    (tn-ref-next writes))))
          (tn-ref-vop reads))))
 
 (defun tn-single-writer-p (tn)
   (let ((writes (tn-writes tn)))
     (and writes
-         (not (tn-ref-next writes)))))
+         (not (tn-ref-next writes))
+         (neq (tn-vertex tn) :alias))))
 
 (defoptimizer (vop-optimize sb-vm::move-from-word/fixnum)
     (vop)
@@ -1078,56 +1167,72 @@
       (or (ir2-block-%label next)
           (setf (ir2-block-%label next) (gen-label))))))
 
-(when-vop-existsp (:named sb-vm::signed-byte-64-p-move-to-word)
-  (flet ((opt (vop new-vop &optional not-vop)
-           (let ((dest (branch-destination vop))
-                 (vop2 (branch-destination vop nil)))
+(labels ((make-mov-vop (tn vop)
+           ;; Ensure that the result won't go to a stack tn
+           (let ((new-tn (make-restricted-tn (tn-primitive-type tn)
+                                             (sc-number (tn-sc tn)) (tn-type tn))))
+             (emit-and-insert-vop (vop-node vop) (vop-block vop)
+                                  (template-or-lose 'sb-vm::word-move)
+                                  (reference-tn new-tn nil)
+                                  (reference-tn tn t)
+                                  vop)
+             new-tn))
+         (opt (vop new-vop &optional not-vop)
+           (multiple-value-bind (dest branch-if) (branch-destination vop)
              (vop-bind (in) () vop
                (when (and dest
                           (singleton-p (ir2block-predecessors (vop-block dest)))
                           (eq (vop-name dest) 'sb-vm::move-to-word/integer))
-                 (vop-bind (in2) () dest
+                 (vop-bind (in2) (out2) dest
                    (when (eq in in2)
-                     (cond ((and vop2
-                                 (eq (vop-name vop2) not-vop)
-                                 (singleton-p (ir2block-predecessors (vop-block dest)))
-                                 (let ((dest2 (branch-destination vop2)))
-                                   (when (and dest2
-                                              (singleton-p (ir2block-predecessors (vop-block dest2)))
-                                              (eq (vop-name dest2) 'sb-vm::move-to-word/integer))
-                                     (vop-bind (in21) () vop2
-                                       (vop-bind (in22) () dest2
-                                         (when (and (eq in21 in)
-                                                    (eq in22 in))
-                                           (emit-and-insert-vop
-                                            (vop-node vop) (vop-block vop)
-                                            (template-or-lose 'sb-vm::un/signed-byte-64-p-move-to-word)
-                                            (reference-tn-refs (vop-args vop) nil)
-                                            (reference-tn-ref-list (list (vop-results dest)
-                                                                         (vop-results dest2))
-                                                                   t)
-                                            vop
-                                            (append (vop-codegen-info vop)
-                                                    (vop-codegen-info vop2)
-                                                    (list (vop-label (branch-destination vop2 nil)))))
-                                           (delete-vop vop)
-                                           (delete-vop vop2)
-                                           (delete-vop dest)
-                                           (delete-vop dest2)
-                                           t)))))))
+                     (cond ((and (vop-existsp :named sb-vm::un/signed-byte-64-p-move-to-word)
+                                 (let ((vop2 (branch-destination vop nil)))
+                                   (and vop2
+                                        (eq (vop-name vop2) not-vop)
+                                        (singleton-p (ir2block-predecessors (vop-block dest)))
+                                        (let ((dest2 (branch-destination vop2)))
+                                          (when (and dest2
+                                                     (singleton-p (ir2block-predecessors (vop-block dest2)))
+                                                     (eq (vop-name dest2) 'sb-vm::move-to-word/integer))
+                                            (vop-bind (in21) () vop2
+                                              (vop-bind (in22) (out22) dest2
+                                                (when (and (eq in21 in)
+                                                           (eq in22 in))
+                                                  (let ((dest-tn1 (make-mov-vop out2 dest))
+                                                        (dest-tn2 (make-mov-vop out22 dest2)))
+                                                    (emit-and-insert-vop
+                                                     (vop-node vop) (vop-block vop)
+                                                     (template-or-lose 'sb-vm::un/signed-byte-64-p-move-to-word)
+                                                     (reference-tn-refs (vop-args vop) nil)
+                                                     (reference-tn-list (list dest-tn1 dest-tn2) t)
+                                                     vop
+                                                     (append (vop-codegen-info vop)
+                                                             (vop-codegen-info vop2)
+                                                             (list (vop-label (branch-destination vop2 nil))))))
+                                                  (delete-vop vop)
+                                                  (delete-vop vop2)
+                                                  (delete-vop dest)
+                                                  (delete-vop dest2)
+                                                  t)))))))))
                            (t
-                            (emit-and-insert-vop
-                             (vop-node vop) (vop-block vop)
-                             (template-or-lose new-vop)
-                             (reference-tn-refs (vop-args vop) nil)
-                             (reference-tn-refs (vop-results dest) t)
-                             vop (vop-codegen-info vop))
-                            (delete-vop vop)
-                            (delete-vop dest))))))))
+                            (let ((dest-tn (make-mov-vop out2 dest)))
+                              (emit-and-insert-vop
+                               (vop-node vop) (vop-block vop)
+                               (template-or-lose new-vop)
+                               (reference-tn-refs (vop-args vop) nil)
+                               (reference-tn dest-tn t)
+                               vop (vop-codegen-info (or branch-if vop)))
+                              (delete-vop vop)
+                              (when branch-if
+                                (delete-vop branch-if))
+                              (delete-vop dest)))))))))
            nil))
+
+  (when-vop-existsp (:named sb-vm::signed-byte-64-p-move-to-word)
     (defoptimizer (vop-optimize signed-byte-64-p select-representations) (vop)
       (opt vop 'sb-vm::signed-byte-64-p-move-to-word
-           'unsigned-byte-64-p))
+           'unsigned-byte-64-p)))
+  (when-vop-existsp (:named sb-vm::unsigned-byte-64-p-move-to-word)
     (defoptimizer (vop-optimize unsigned-byte-64-p select-representations) (vop)
       (opt vop 'sb-vm::unsigned-byte-64-p-move-to-word))))
 
@@ -1181,7 +1286,10 @@
 (defun very-temporary-p (tn)
   (let ((writes (tn-writes tn))
         (reads (tn-reads tn)))
-    (and writes reads (not (tn-ref-next writes)) (not (tn-ref-next reads)))))
+    (and writes reads
+         (not (tn-ref-next reads))
+         (neq (tn-vertex tn) :alias)
+         (not (tn-ref-next writes)))))
 
 (defun next-vop-is (vop names)
   (let ((next (next-vop vop)))
@@ -1419,19 +1527,22 @@
                                      (compatible-scs-p (tn-sc tn) sc))
                            return tn)))
             (let ((barrier (vop-info-gc-barrier info)))
-              (when barrier
-                (destructuring-bind (object value &optional allocator) barrier
-                 (let* ((tn (tn-ref-tn (sb-vm::vop-nth-arg object vop)))
-                        (register (register-p tn)))
-                   (if (and (not (and register
-                                      (memq (tn-offset tn) 2block-gc-barriers)))
-                            (sb-vm::require-gengc-barrier-p tn
-                                                            (sb-vm::vop-nth-arg value vop)
-                                                            (and allocator
-                                                                 (nth allocator (vop-codegen-info vop)))))
-                       (when register
-                         (push (tn-offset tn) 2block-gc-barriers))
-                       (nsubst nil barrier (vop-codegen-info vop)))))))
+              (if barrier
+                  (destructuring-bind (object value &optional allocator) barrier
+                    (let* ((tn (tn-ref-tn (sb-vm::vop-nth-arg object vop)))
+                           (register (register-p tn)))
+                      (if (and
+                           (not (and register
+                                     (memq (tn-offset tn) 2block-gc-barriers)))
+                           (sb-vm::require-gengc-barrier-p tn
+                                                           (sb-vm::vop-nth-arg value vop)
+                                                           (and allocator
+                                                                (nth allocator (vop-codegen-info vop)))))
+                          (when register
+                            (push (tn-offset tn) 2block-gc-barriers))
+                          (nsubst nil barrier (vop-codegen-info vop)))))
+                  ;; FIXME: can't straddle an allocation sequences
+                  (setf 2block-gc-barriers nil)))
             (case (vop-name vop)
               ((move sb-vm::move-arg)
                (let* ((args (vop-args vop))
@@ -1515,7 +1626,9 @@
        ;; Give the optimizers a second opportunity to alter newly inserted vops
        ;; by looking for patterns that have a shorter expression as a single vop.
        (run-vop-optimizers component stage t)
-       (delete-unused-ir2-blocks component))
+       (delete-unused-ir2-blocks component)
+       #+arm64
+       (choose-zero-tn (ir2-component-constant-tns (component-info component))))
       (t
        (when (and *compiler-trace-output*
                   (member :pre-ir2-optimize *compile-trace-targets*))

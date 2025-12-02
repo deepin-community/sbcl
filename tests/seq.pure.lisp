@@ -949,3 +949,81 @@
   (assert (not (ctu:ir1-named-calls `(lambda (a)
                                        (declare ((array t) a))
                                        (the sequence a))))))
+
+(with-test (:name :find-test-not-type)
+  (assert-type
+   (lambda (s j)
+     (find j s :key #'car :test-not #'char=))
+   list)
+  (assert-type
+   (lambda (s j)
+     (find j s :test-not #'char=))
+   (or character null)))
+
+(with-test (:name :zerop-length)
+  (assert (null
+           (ctu:ir1-named-calls
+            `(lambda (sequence)
+               (declare ((or vector list) sequence))
+               (zerop (length sequence))))))
+  (assert (null
+           (ctu:ir1-named-calls
+            `(lambda (sequence)
+               (declare ((or vector list) sequence))
+               (plusp (length sequence)))))))
+
+(with-test (:name :cons-length)
+  (assert-type
+   (lambda (x)
+     (min (length (the cons x)) 10))
+   (integer 1 10))
+  (assert-type
+   (lambda (x)
+     (min (length (the (or cons (simple-string 5)) x)) 10))
+   (integer 1 10))
+  (assert-type
+   (lambda (x)
+     (length (the (or null (simple-string 10)) x)))
+   (or (integer 0 0) (integer 10 10))))
+
+(with-test (:name :replace-vector-list)
+  (checked-compile-and-assert
+      ()
+      `(lambda (l)
+         (let ((v (copy-seq #(1 2))))
+           (replace v (the list l))
+           v))
+    (('(a)) #(a 2) :test #'equalp)))
+
+(with-test (:name :coerce-to-list-type)
+  (assert-type
+   (lambda (x)
+     (declare ((simple-string 10) x))
+     (coerce x 'list))
+   cons)
+  (assert-type
+   (lambda (x)
+     (declare (optimize speed)
+              ((simple-string 10) x))
+     (coerce x 'list))
+   cons))
+
+(with-test (:name :position-if-nil)
+  (assert-type
+   (lambda (f)
+     (position-if f nil))
+   null)
+  (assert-type
+   (lambda (f)
+     (declare (optimize speed))
+     (position-if f nil))
+   null)
+  (assert-type
+   (lambda (f)
+     (find-if f nil))
+   null)
+  (assert-type
+   (lambda (f)
+     (declare (optimize speed))
+     (find-if f nil))
+   null))

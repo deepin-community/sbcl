@@ -326,7 +326,7 @@
     (:no . 1)
     (:b . 2) (:nae . 2) (:c . 2)
     (:ae . 3) (:nb . 3) (:nc . 3)
-    (:eq . 4) (:e . 4) (:z . 4)
+    (:e . 4) (:z . 4)
     (:ne . 5) (:nz . 5)
     (:be . 6) (:na . 6)
     (:a . 7) (:nbe . 7)
@@ -884,7 +884,7 @@
 ;;;; the effective-address (ea) structure
 (defstruct (ea (:constructor %ea (segment disp base index scale))
                (:copier nil))
-  (segment nil :type (member :cs :gs) :read-only t)
+  (segment nil :type (member :cs :fs :gs) :read-only t)
   (base nil :type (or tn null) :read-only t)
   (index nil :type (or tn null) :read-only t)
   (scale 1 :type (member 1 2 4 8) :read-only t)
@@ -942,7 +942,7 @@
   (let ((seg :cs) disp)
     (let ((first (car args)))
       (case first
-        (:gs (setq seg first) (pop args))
+        ((:fs :gs) (setq seg first) (pop args))
         (:cs (pop args))))
     (let ((first (car args)))
       ;; Rather than checking explicitly for all the things that are legal to be
@@ -1280,6 +1280,8 @@
            (type (member :byte :word :dword :qword :do-not-set) operand-size))
   ;; Legacy prefixes are order-insensitive, but let's approximately match the
   ;; output of the system assembler for consistency's sake.
+  (when (and (ea-p thing) (eq (ea-segment thing) :fs))
+    (emit-byte segment #x64))
   (when (and (ea-p thing) (eq (ea-segment thing) :gs))
     (emit-byte segment #x65))
   (when (eq operand-size :word)
@@ -1340,6 +1342,9 @@
 (define-instruction x66 (segment)
   (:printer x66 () nil :print-name nil))
 
+(define-instruction cs (segment)
+  (:printer byte ((op #x2e :prefilter (lambda (dstate value) (declare (ignore value dstate)))))
+            nil :print-name nil))
 (define-instruction fs (segment)
   (:printer byte ((op #x64 :prefilter (lambda (dstate value)
                                         (declare (ignore value))
@@ -1839,13 +1844,13 @@
            (emit-byte segment (opcode+size-bit #xF6 size))
            (emit-ea segment src subcode))))
   (define-instruction mul (segment &prefix prefix src)
-    (:printer accum-reg/mem ((op '(#b1111011 #b100))))
+    (:printer reg/mem ((op '(#b1111011 #b100))))
     (:emitter (emit* segment #b100 prefix src)))
   (define-instruction div (segment &prefix prefix src)
-    (:printer accum-reg/mem ((op '(#b1111011 #b110))))
+    (:printer reg/mem ((op '(#b1111011 #b110))))
     (:emitter (emit* segment #b110 prefix src)))
   (define-instruction idiv (segment &prefix prefix src)
-    (:printer accum-reg/mem ((op '(#b1111011 #b111))))
+    (:printer reg/mem ((op '(#b1111011 #b111))))
     (:emitter (emit* segment #b111 prefix src))))
 
 (define-instruction bswap (segment &prefix prefix dst)
@@ -3363,22 +3368,24 @@
                                 collect (prog1 (ldb (byte 8 0) val)
                                           (setf val (ash val -8))))))))))
 
-;;; Return an address which when _dereferenced_ will return ADDR
+#+sb-xc-host (declaim (ftype function sb-fasl::asm-routine-vector-elt-addr))
+;;; Return an address which when added to NULL-TN and dereferenced will yield ADDR
 (defun sb-vm::asm-routine-indirect-address (addr)
-  (let ((i (sb-fasl::asm-routine-index-from-addr addr)))
-    (declare (ignorable i))
-    #-immobile-space (sap-int (sap+ (code-instructions sb-fasl:*assembler-routines*)
-                                    (ash i word-shift)))
-    ;; When asm routines are in relocatable text space, the vector of indirections
-    ;; is stored externally in static space. It's unfortunately overly complicated
-    ;; to get the address of that vector in genesis. But it doesn't matter.
-    #+immobile-space
-    (or
-     ;; Accounting for the jump-table-count as the first unboxed word in
-     ;; code-instructions, subtract 1 from I to get the correct vector element.
-     #-sb-xc-host (sap-int (sap+ (vector-sap sb-fasl::*asm-routine-vector*)
-                                 (ash (1- i) word-shift)))
-     (error "unreachable"))))
+  (let* ((i (the (mod 512) ; arb
+                 (sb-fasl::asm-routine-index-from-addr addr)))
+         (addr
+          #-immobile-space
+          (sap-int (sap+ (code-instructions sb-fasl:*assembler-routines*) (ash i word-shift)))
+          ;; When asm routines are in relocatable text space, the vector of indirections
+          ;; is stored externally in static space.
+          #+immobile-space
+          (progn
+           ;; Accounting for the jump-table-count as the first unboxed word in
+           ;; code-instructions, subtract 1 from I to get the correct vector element.
+           #+sb-xc-host (sb-fasl::asm-routine-vector-elt-addr (1- i))
+           #-sb-xc-host (sap-int (sap+ (vector-sap sb-fasl::*asm-routine-vector*)
+                                       (ash (1- i) word-shift))))))
+    (- addr sb-vm:nil-value)))
 
 ;;; This gets called by LOAD to resolve newly positioned objects
 ;;; with things (like code instructions) that have to refer to them.
@@ -3387,34 +3394,60 @@
     (#-sb-xc-host (sb-vm::lisp-linkage-space-addr
                    (sb-alien:extern-alien "linkage_space" sb-alien:unsigned)))
 (defun fixup-code-object (code offset value kind flavor
-                          &aux (sap (code-instructions code)))
+                          &aux (sap (code-instructions code))
+                               (addend (if (eq kind :absolute)
+                                           (signed-sap-ref-64 sap offset)
+                                           (signed-sap-ref-32 sap offset))))
   (declare (type index offset))
+  ;; Depending on flavor, a nonzero value stored at the fixup location is not an optional
+  ;; addend- instead it's an opaque enumerated value further specifying a fixup behavior.
+  (case flavor
+    (:linkage-cell (setf addend 0))
+    ((:foreign :foreign-dataref)
+     (let ((disp (* value alien-linkage-table-entry-size)))
+       (setf value
+            (ecase kind
+              (:abs32
+               #+immobile-space disp
+               #-immobile-space
+               (let ((nil-based-disp
+                      (- disp (+ sb-vm::nil-value-offset sb-vm:alien-linkage-space-size))))
+                 (if (eql addend sb-vm::+nil-indirect+) (+ nil-based-disp 8) nil-based-disp)))
+              (:rel32 ; subkind is meaningless - this is a PC-relative fixup.
+               ;; must be ASM codeblob if #-immobile-space
+               (sb-vm::alien-linkage-table-entry-address value)))
+            addend 0))))
   ;; Preprocess the value based on FLAVOR and the implicit addend at the
   ;; fixup location.  The addend will be zero for most <KIND,FLAVOR> pairs.
   (setq value
         (+ (case flavor
              (:card-table-index-mask ; the VALUE is nbits, so convert it to a mask
               (aver (zerop (sap-ref-32 sap offset))) ; enforce zero addend
-              (1- (ash 1 value)))
+              ;; The AND inst uses a 32-bit reg, so the upper 32 bits get cleared, making this the
+              ;; sole place where an imm32 is treated as unsigned. To use 2^32 cards though, the
+              ;; heap would have to be 4TiB for gencgc or 1TiB for pmrgc. Not possible.
+              (setf (sap-ref-32 sap offset) (1- (ash 1 value)))
+              (return-from fixup-code-object))
              (:linkage-cell
               (let ((index (ash value word-shift)))
+                #-immobile-space
                 (ecase kind
-                  #+immobile-space (:rel32 (+ sb-vm::lisp-linkage-space-addr index))
+                  (:abs32 ; implicitly has a base reg of NULL-TN
+                   (+ (- sb-vm::alien-linkage-space-size)
+                      (- (ash 1 (+ sb-vm::n-linkage-index-bits sb-vm:word-shift)))
+                      (- sb-vm::nil-value-offset)
+                      index)))
+                #+immobile-space
+                (ecase kind
+                  (:rel32 (+ sb-vm::lisp-linkage-space-addr index))
                   (:abs32 index))))
              (:assembly-routine
               (if (eq kind :*abs32) (sb-vm::asm-routine-indirect-address value) value))
-             ((:alien-code-linkage-index :alien-data-linkage-index)
-              (* value alien-linkage-table-entry-size))
-             (:layout-id ; layout IDs are signed quantities on x86-64
-              (setf (signed-sap-ref-32 sap offset) value)
-              (return-from fixup-code-object))
              (t value))
-           (if (eq kind :absolute)
-               (signed-sap-ref-64 sap offset)
-               (signed-sap-ref-32 sap offset))))
+           addend))
   (ecase kind
-    ((:abs32 :*abs32) ; 32 unsigned bits
-     (setf (sap-ref-32 sap offset) value))
+    ((:abs32 :*abs32) ; 32 signed bits
+     (setf (signed-sap-ref-32 sap offset) value))
     (:rel32
      ;; Replace word with the difference between VALUE and current pc.
      ;; JMP/CALL are relative to the next instruction,
@@ -3445,7 +3478,7 @@
             #+(or permgen immobile-space)
             ((and (eq (fixup-note-kind note) :abs32)
                   (memq flavor ; these all point to fixedobj space
-                        '(:layout :immobile-symbol :symbol-value)))
+                        '(:layout :immobile-symbol)))
              (push offset abs32-fixups))))))
 
 ;;; Coverage support
@@ -3525,7 +3558,7 @@
       (delete-stmt stmt)
       next)))
 
-;;; In "{AND,OR,...} reg, src ; TEST reg, reg ; {JMP,SET} {:z,:nz,:s,:ns}"
+;;; In {AND,OR,...} reg, src ; TEST reg, reg ; {JMP,SET,CMOV} {:z,:nz,:s,:ns,...}
 ;;; the TEST is unnecessary since ALU operations set the Z and S flags.
 ;;; Per the processor manual, TEST clears OF and CF, so presumably
 ;;; there is not a branch-if on either of those flags.
@@ -3544,13 +3577,43 @@
                (not (and (memq (stmt-mnemonic stmt) '(sar shl shr))
                          (memq (car (last (stmt-operands stmt)))
                                '(:cl 0))))
-               (memq (stmt-mnemonic next-next) '(jmp set))
-               ;; TODO: figure out when it would be correct to omit TEST for the carry flag
-               (case (car (stmt-operands next-next))
-                 ((:s :ns)
-                  (eq size2 size1))
-                 ((:ne :e :nz :z)
-                  (or (eq size2 size1) (and (eq size1 :dword) (eq size2 :qword))))))
+               (let ((flag (cond ((memq (stmt-mnemonic next-next) '(jmp set))
+                                  (car (stmt-operands next-next)))
+                                 (t
+                                  (loop for next = next-next then (stmt-next next)
+                                        while next
+                                        do (case (stmt-mnemonic next)
+                                             ((mov lea))
+                                             (cmov
+                                              (return (second (stmt-operands next))))
+                                             (t
+                                              (return))))))))
+                (or (and (memq (stmt-mnemonic stmt) '(and xor or)) ;; the same flags are set
+                         (or (eq size2 size1)
+                             (and (memq flag '(:ne :e :nz :z))
+                                  (eq size1 :dword)
+                                  (eq size2 :qword))))
+                    (case flag
+                      ;; TODO: figure out when it would be correct to omit TEST for the carry flag
+                      ((:s :ns)
+                       (eq size2 size1))
+                      ((:ne :e :nz :z)
+                       (or (eq size2 size1) (and (eq size1 :dword) (eq size2 :qword))))
+                      ((:ge :g :le :l
+                        :nl :nle :ng :nge)
+                       (and (eq size2 size1)
+                            ;; Assume there's no overflow for signed arithmetic
+                            (memq (vop-name (sb-assem::stmt-vop stmt))
+                                  '(sb-vm::fast--/fixnum=>fixnum
+                                    sb-vm::fast-+/fixnum=>fixnum
+                                    sb-vm::fast--/signed=>signed
+                                    sb-vm::fast-+/signed=>signed
+                                    sb-vm::fast---c/fixnum=>fixnum
+                                    sb-vm::fast-+-c/fixnum=>fixnum
+                                    sb-vm::fast---c/signed=>signed
+                                    sb-vm::fast-+-c/signed=>signed
+                                    sb-vm::fast-negate/fixnum
+                                    sb-vm::fast-negate/signed))))))))
       (delete-stmt next)
       next-next)))
 
@@ -3652,7 +3715,7 @@
            :not-taken)
           ;; I manually examined a sampling of calls to this function
           ;; and did not notice other opportunities to return non-NIL
-          ((conditions :a :eq) :not-taken) ; above to equal
+          ((conditions :a :e) :not-taken) ; above to equal
           ((conditions :a :ne) :taken) ; above to not-equal
           (t nil))))
 

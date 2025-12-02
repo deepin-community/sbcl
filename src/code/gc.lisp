@@ -132,6 +132,8 @@ run in any thread.")
   #-64-bit 0)
 
 (defun sub-gc (gen)
+  ;; Can't instrument GC-EPOCH cons in a foreign thead with no *CURRENT-THREAD* yet
+  (declare (optimize (sb-c::instrument-consing 0)))
   (cond (*gc-inhibit*
          (setf *gc-pending* t)
          nil)
@@ -298,7 +300,7 @@ used to specify the oldest generation guaranteed to be collected."
 
 (define-alien-routine scrub-control-stack void)
 
-(defglobal sb-unicode::*name->char-buffers* nil)
+(define-load-time-global sb-unicode::*name->char-buffers* nil)
 (defun unsafe-clear-roots (gen)
   (declare (ignorable gen))
   ;; KLUDGE: Do things in an attempt to get rid of extra roots. Unsafe
@@ -310,6 +312,7 @@ used to specify the oldest generation guaranteed to be collected."
   (scrub-power-cache)
   (setf sb-unicode::*name->char-buffers* nil)
   (setf sb-c::*phash-lambda-cache* nil)
+  (setf sb-impl::*read-line-buffers* nil)
   ;; Clear caches depending on the generation being collected.
   (cond ((eql 0 gen)
          ;; Drop strings because the hash is address-based, but there
@@ -340,13 +343,6 @@ Note: currently changes to this value are lost when saving core."
     (when (< val current)
       (decf (extern-alien "auto_gc_trigger" os-vm-size-t) (- current val))))
   (setf (extern-alien "bytes_consed_between_gcs" os-vm-size-t) val))
-
-(declaim (inline maybe-handle-pending-gc))
-(defun maybe-handle-pending-gc ()
-  (when (and (not *gc-inhibit*)
-             (or #+sb-thread *stop-for-gc-pending*
-                 *gc-pending*))
-    (sb-unix::receive-pending-interrupt)))
 
 ;;;; GENCGC specifics
 ;;;;
@@ -541,8 +537,10 @@ Experimental: interface subject to change."
                     ((< sb-vm:text-space-start addr
                         (sap-int sb-vm:*text-space-free-pointer*))
                      :static)
-                    ((< sb-vm:static-space-start addr
-                        (sap-int sb-vm:*static-space-free-pointer*))
+                    ((or #+x86-64 (< (extern-alien "static_space_trailer_start" unsigned)
+                                     addr sb-vm::static-space-end)
+                         (< sb-vm:static-space-start addr
+                            (sap-int sb-vm:*static-space-free-pointer*)))
                      :static))))
 ;;; Return true if X is in any non-stack GC-managed space.
 ;;; (Non-stack implies not TLS nor binding stack)
@@ -554,10 +552,6 @@ Experimental: interface subject to change."
     (let ((addr (get-lisp-obj-address x)))
       (and (sb-vm:is-lisp-pointer addr)
            (cases)))))
-
-;;; Internal use only. FIXME: I think this duplicates code that exists
-;;; somewhere else which I could not find.
-(defun lisp-space-p (sap &aux (addr (sap-int sap))) (cases))
 ) ; end MACROLET
 
 (define-condition memory-fault-error (system-condition error) ()

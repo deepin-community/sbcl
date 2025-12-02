@@ -111,8 +111,6 @@ Low Address
 	ld 0, 16(sp) ; mtlr 0       /* Restore LR  */ ; \
 	lwz 0, 8(sp) ; mtcr 0       /* Restore CR */
 
-	.text
-
 #define BEGIN_PSEUDO_ATOMIC stb reg_NULL,THREAD_PSEUDO_ATOMIC_BITS_OFFSET(reg_THREAD)
 #define END_PSEUDO_ATOMIC \
 	stb reg_THREAD, THREAD_PSEUDO_ATOMIC_BITS_OFFSET(reg_THREAD) ; \
@@ -126,6 +124,7 @@ Low Address
 
 	GFUNCDEF(call_into_lisp)
 	C_FULL_PROLOG
+
 	/* NL0 - function, NL1 - frame pointer, NL2 - nargs. */
 	// Copy ABI TLS value of current_thread into lisp thread base
 	addis reg_THREAD,13,current_thread@tprel@ha
@@ -167,8 +166,8 @@ Low Address
 	ld reg_A2,16(reg_CFP)
 	ld reg_A3,24(reg_CFP)
 
-        /* load card table base */
-        ld reg_CARDTABLE, THREAD_CARD_TABLE_OFFSET(reg_THREAD)
+	/* load gc_card_mark */
+	ld reg_CARDTABLE, (-LIST_POINTER_LOWTAG-16)(reg_NULL)
 
 	/* Calculate LRA */
 	lis reg_LRA,lra@h
@@ -368,17 +367,6 @@ lra:
 	b fun_end_breakpoint_multiple_values
 	nop
 
-	/* Compute the correct value for reg_CODE based on the LRA.
-	This is a "simple" matter of subtracting a constant from
-	reg_LRA (where the LRA is stored by the return sequence) to
-	obtain a tagged pointer to the enclosing code component.
-	Code pointers have no tag, so we have have to subtract
-	OTHER_POINTER_LOWTAG as well as account for the number of
-	boxed words (see calculation for RETURN_PC_WIDETAG, above). */
-        /* KLUDGE: I have no idea why CODE_SIZE+4 is correct here,
-	let alone the general formula for keeping this maintenance-free */
-	addi reg_CODE, reg_LRA, (CODE_SIZE+4)*-N_WORD_BYTES-OTHER_POINTER_LOWTAG
-
 	/* Multiple values are stored relative to reg_OCFP, which we
 	set to be the current top-of-stack. */
 	mr reg_OCFP, reg_CSP
@@ -394,15 +382,7 @@ lra:
 	mr reg_A2, reg_NULL
 	mr reg_A3, reg_NULL
 
-	/* And branch to our trap. */
-	b fun_end_breakpoint_trap
-
 fun_end_breakpoint_multiple_values:
-	/* Compute the correct value for reg_CODE.  See the
-	explanation for the single-value case, above. */
-	// And of course this is even more magic since we seem to assume
-	// a certain code size. Wtf is this actually supposed to be????
-	addi reg_CODE, reg_LRA, -24
 
 	/* The actual magic trap. */
 fun_end_breakpoint_trap:

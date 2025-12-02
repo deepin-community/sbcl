@@ -24,9 +24,9 @@
   )
 ;; These each check their input sequence for type-correctness,
 ;; but not the output type specifier, because MAKE-SEQUENCE will do that.
-(defknown list-to-vector* (list type-specifier) vector (no-verify-arg-count))
-(defknown vector-to-vector* (vector type-specifier) vector (no-verify-arg-count))
-
+(defknown list-to-vector (list type-specifier) vector (no-verify-arg-count))
+(defknown vector-to-vector (vector type-specifier) vector (no-verify-arg-count))
+(defknown vector-to-list (vector) list (no-verify-arg-count))
 ;; FIXME: Is this really FOLDABLE? A counterexample seems to be:
 ;;  (LET ((S :S)) (VALUES (TYPE-OF S) (UNINTERN S 'KEYWORD) (TYPE-OF S) S))
 ;; Anyway, the TYPE-SPECIFIER type is more inclusive than the actual
@@ -245,6 +245,10 @@
   (number number) number
   (no-verify-arg-count))
 
+(defknown (*-by-fixnum-to-fixnum)
+  (number fixnum) fixnum
+  (no-verify-arg-count))
+
 (defknown sb-kernel::integer-/-integer
   (integer integer) rational
   (no-verify-arg-count unsafely-flushable))
@@ -279,7 +283,6 @@
 (defknown exp (number) irrational
   (movable foldable flushable recursive))
 
-
 (defknown expt (number number) number
   (movable foldable flushable recursive))
 
@@ -291,10 +294,31 @@
 
 (defknown log (number &optional real) irrational
   (movable foldable flushable recursive))
+
+(defknown log-double-float (double-float) (or double-float (complex double-float))
+  (movable foldable flushable fixed-args))
+(defknown log-single-float (single-float) (or single-float (complex single-float))
+  (movable foldable flushable fixed-args))
+
+(defknown sqrt-double-float (double-float) (or double-float (complex double-float))
+  (movable foldable flushable fixed-args))
+(defknown sqrt-single-float (single-float) (or single-float (complex single-float))
+  (movable foldable flushable fixed-args))
+
+(defknown log-double-float2 (double-float double-float) (or double-float (complex double-float))
+  (movable foldable flushable fixed-args))
+(defknown log-single-float2 (single-float single-float) (or single-float (complex single-float))
+  (movable foldable flushable fixed-args))
+
+(defknown expt-double-float (double-float double-float) (or double-float (complex double-float))
+  (movable foldable flushable fixed-args))
+(defknown expt-single-float (single-float single-float) (or single-float (complex single-float))
+  (movable foldable flushable fixed-args))
+
 (defknown sqrt (number) irrational
   (movable foldable flushable))
 (defknown isqrt (unsigned-byte) unsigned-byte
-  (movable foldable flushable recursive))
+  (movable foldable flushable))
 
 (defknown (abs phase signum) (number) number
   (movable foldable flushable))
@@ -307,15 +331,17 @@
 
 (defknown atan
   (number &optional real) irrational
-  (movable foldable unsafely-flushable recursive)
+  (movable foldable unsafely-flushable)
   :call-type-deriver #'atan-call-type-deriver)
 
-(defknown (tan sinh cosh tanh asinh)
-  (number) irrational (movable foldable flushable recursive))
-
-(defknown (asin acos acosh atanh)
-  (number) irrational
+(defknown (sinh cosh) (number) irrational
   (movable foldable flushable recursive))
+
+(defknown (tan tanh asinh) (number) irrational
+  (movable foldable flushable))
+
+(defknown (asin acos acosh atanh) (number) irrational
+  (movable foldable flushable))
 
 (defknown float (real &optional float) float
   (movable foldable flushable))
@@ -324,7 +350,7 @@
   (movable foldable flushable))
 
 (defknown (rationalize) (real) rational
-  (movable foldable flushable recursive))
+  (movable foldable flushable))
 
 (defknown numerator (rational) integer
   (movable foldable flushable))
@@ -332,16 +358,22 @@
 (defknown denominator (rational) (integer 1)
   (movable foldable flushable))
 
-(defknown (floor ceiling round)
+(defknown (floor ceiling)
   (real &optional real) (values integer real)
   (movable foldable flushable))
 
-(defknown truncate
+(defknown (truncate round)
   (real &optional real) (values integer real)
   (movable foldable flushable recursive))
 
-(defknown (sb-kernel::truncate1 sb-kernel::floor1 sb-kernel::ceiling1) (real real) integer
+(defknown (sb-kernel::floor1 sb-kernel::ceiling1) (real real) integer
+  (movable foldable flushable no-verify-arg-count))
+
+(defknown (sb-kernel::truncate1 sb-kernel::round1) (real real) integer
   (movable foldable flushable recursive no-verify-arg-count))
+
+(defknown (sb-kernel::ftruncate1 sb-kernel::ffloor1 sb-kernel::fceiling1 sb-kernel::fround1) (real real) float
+  (movable foldable flushable no-verify-arg-count))
 
 (defknown unary-truncate (real) (values integer real)
   (movable foldable flushable no-verify-arg-count))
@@ -353,8 +385,19 @@
 (defknown unary-truncate-double-float-to-bignum (double-float)
     (values (and integer #+64-bit bignum)
             (and double-float #+64-bit (eql 0d0)))
-   (foldable movable flushable fixed-args)
+   (foldable movable flushable fixed-args unboxed-return)
   :folder #'truncate)
+
+(defknown unary-truncate-single-float-to-bignum-div
+    (single-float single-float single-float) (values bignum single-float)
+    (foldable movable flushable fixed-args unboxed-return)
+  :folder (lambda (quot number div) (values (truncate quot) (- number (* quot div)))))
+
+(defknown unary-truncate-double-float-to-bignum-div
+    (double-float double-float double-float) (values (and integer #+64-bit bignum)
+                                                     double-float)
+   (foldable movable flushable fixed-args unboxed-return)
+  :folder (lambda (quot number div) (values (truncate quot) (- number (* quot div)))))
 
 (defknown %unary-truncate-single-float-to-bignum (single-float) bignum
    (foldable movable flushable fixed-args)
@@ -378,11 +421,14 @@
 (defknown %multiply-high (word word) word
     (movable foldable flushable))
 
-(defknown multiply-fixnums (fixnum fixnum) integer
-  (movable foldable flushable no-verify-arg-count))
-
 (defknown %signed-multiply-high (sb-vm:signed-word sb-vm:signed-word) sb-vm:signed-word
     (movable foldable flushable))
+
+(defknown rotate-right-word (word (mod #.sb-vm:n-word-bits)) word
+    (movable foldable flushable always-translatable))
+
+(defknown multiply-fixnums (fixnum fixnum) integer
+  (movable foldable flushable no-verify-arg-count))
 
 (defknown (mod rem) (real real) real
     (movable foldable flushable))
@@ -454,6 +500,10 @@
 (defknown %ash/right ((or word sb-vm:signed-word) (mod #.sb-vm:n-word-bits))
   (or word sb-vm:signed-word)
   (movable foldable flushable always-translatable))
+
+(defknown ash-right (integer (mod #.sb-vm:n-word-bits))
+  integer
+  (movable foldable flushable no-verify-arg-count))
 
 (defknown (logcount integer-length) (integer) bit-index
   (movable foldable flushable))
@@ -549,17 +599,17 @@
 (defknown subseq ((read-only proper-sequence) index &optional sequence-end) consed-sequence
   (flushable foldable-read-only))
 
-(defknown vector-subseq* ((read-only vector) index sequence-end) (simple-array * (*))
+(defknown vector-subseq ((read-only vector) index sequence-end) (simple-array * (*))
   (flushable foldable-read-only no-verify-arg-count))
 
-(defknown list-subseq* ((read-only list) index sequence-end) list
+(defknown list-subseq ((read-only list) index sequence-end) list
   (flushable foldable-read-only no-verify-arg-count))
 
 (defknown copy-seq ((read-only proper-sequence)) consed-sequence
   (flushable foldable-read-only)
   :derive-type (sequence-result-nth-arg 0 :preserve-dimensions t))
 
-(defknown list-copy-seq* ((read-only proper-list)) list
+(defknown list-copy-seq ((read-only proper-list)) list
   (flushable foldable-read-only)
   :derive-type (sequence-result-nth-arg 0 :preserve-dimensions t))
 
@@ -575,6 +625,8 @@
 (defknown (list-reverse-into-vector list-reverse-into-vector-cddr)
     (proper-list) simple-vector
   (flushable no-verify-arg-count))
+(defknown sb-impl::vector-nreverse (vector) vector (important-result no-verify-arg-count)
+  :result-arg 0)
 
 (defknown make-sequence (type-specifier index
                                         &key
@@ -584,7 +636,7 @@
   :derive-type (creation-result-type-specifier-nth-arg 0))
 
 (defknown concatenate (type-specifier &rest (read-only proper-sequence)) consed-sequence
-  (foldable-read-only)
+  (foldable-read-only mv-deriver)
   :derive-type (creation-result-type-specifier-nth-arg 0))
 
 (defknown %concatenate-to-string (&rest (read-only sequence)) simple-string
@@ -611,14 +663,17 @@
     vector
   (flushable foldable-read-only no-verify-arg-count))
 
-(defknown (possibly-base-stringize possibly-base-stringize-to-heap) ((or null string)) (or null simple-string)
+(defknown (possibly-base-stringize possibly-base-stringize-to-heap) (string) simple-string
   (flushable no-verify-arg-count))
 
 (defknown map (type-specifier (function-designator ((nth-arg 2 :sequence t)
                                                     (rest-args :sequence t))
                                                    (nth-arg 0 :sequence-type t))
                               proper-sequence &rest proper-sequence)
-    consed-sequence (call foldable-read-only))
+    consed-sequence
+    (call foldable-read-only mv-deriver)
+  :derive-type (creation-result-type-specifier-nth-arg 0 t))
+
 (defknown %map (type-specifier function-designator &rest sequence) consed-sequence
   (call no-verify-arg-count foldable-read-only))
 (defknown %map-for-effect-arity-1 (function-designator sequence) null
@@ -633,7 +688,7 @@
                                          (nth-arg 0 :sequence t))
                     &rest proper-sequence)
   sequence
-  (call)
+  (call mv-deriver)
   :derive-type (sequence-result-nth-arg 0 :preserve-dimensions t
                                           :preserve-vector-type t))
 
@@ -686,7 +741,7 @@
 
 (defknown replace ((modifying sequence) (read-only proper-sequence) &rest t &key (:start1 index)
                    (:end1 sequence-end) (:start2 index) (:end2 sequence-end))
-  sequence ()
+  sequence (mv-deriver)
   :derive-type (sequence-result-nth-arg 0 :preserve-dimensions t
                                           :preserve-vector-type t)
   :result-arg 0)
@@ -700,7 +755,7 @@
      (:count sequence-count)
      (:key (function-designator ((nth-arg 1 :sequence t)))))
   consed-sequence
-  (flushable call)
+  (foldable flushable call mv-deriver)
   :derive-type (sequence-result-nth-arg 1))
 
 (defknown substitute
@@ -712,7 +767,7 @@
      (:count sequence-count)
      (:key (function-designator ((nth-arg 2 :sequence t)))))
   consed-sequence
-  (flushable call)
+  (foldable flushable call mv-deriver)
   :derive-type (sequence-result-nth-arg 2))
 
 (defknown (remove-if remove-if-not)
@@ -723,7 +778,7 @@
    (:end (inhibit-flushing sequence-end nil))
    (:key (function-designator ((nth-arg 1 :sequence t)))))
   consed-sequence
-  (flushable call)
+  (foldable flushable call mv-deriver)
   :derive-type (sequence-result-nth-arg 1))
 
 (defknown (substitute-if substitute-if-not)
@@ -734,7 +789,7 @@
      (:count sequence-count)
      (:key (function-designator ((nth-arg 2 :sequence t)))))
   consed-sequence
-  (flushable call)
+  (foldable flushable call mv-deriver)
   :derive-type (sequence-result-nth-arg 2))
 
 (defknown delete
@@ -745,7 +800,7 @@
      (:count sequence-count)
      (:key (function-designator ((nth-arg 1 :sequence t)))))
   sequence
-  (call important-result)
+  (call important-result mv-deriver)
   :derive-type (sequence-result-nth-arg 1))
 
 (defknown nsubstitute
@@ -756,7 +811,7 @@
      (:count sequence-count)
      (:key (function-designator ((nth-arg 2 :sequence t)))))
   sequence
-  (call)
+  (call mv-deriver)
   :derive-type (sequence-result-nth-arg 2))
 
 (defknown (delete-if delete-if-not)
@@ -765,7 +820,7 @@
    (:end sequence-end) (:count sequence-count)
    (:key (function-designator ((nth-arg 1 :sequence t)))))
   sequence
-  (call important-result)
+  (call important-result mv-deriver)
   :derive-type (sequence-result-nth-arg 1))
 
 (defknown (nsubstitute-if nsubstitute-if-not)
@@ -774,7 +829,7 @@
      (:end sequence-end) (:count sequence-count)
      (:key (function-designator ((nth-arg 2 :sequence t)))))
   sequence
-  (call)
+  (call mv-deriver)
   :derive-type (sequence-result-nth-arg 2))
 
 (defknown remove-duplicates
@@ -788,7 +843,7 @@
             (:from-end t)
             (:key (function-designator ((nth-arg 0 :sequence t)))))
   consed-sequence
-  (flushable call)
+  (foldable flushable call mv-deriver)
   :derive-type (sequence-result-nth-arg 0))
 
 (defknown delete-duplicates
@@ -802,7 +857,7 @@
    (:from-end t) (:end sequence-end)
    (:key (function-designator ((nth-arg 0 :sequence t)))))
   sequence
-  (call important-result)
+  (call important-result mv-deriver)
   :derive-type (sequence-result-nth-arg 0))
 
 (defknown find
@@ -942,12 +997,16 @@
                                           (:start index)
                                           (:end sequence-end))
   sequence
-  (recursive)
+  ()
   :derive-type #'result-type-first-arg)
 
 ;;;; from the "Manipulating List Structure" chapter:
-(defknown (car cdr first rest)
+(defknown (cdr rest)
   (list)
+  t
+  (foldable flushable))
+(defknown (car first)
+  ((read-only list))
   t
   (foldable flushable))
 
@@ -1202,7 +1261,7 @@
 (defknown hash-table-test (hash-table) function-designator (foldable flushable))
 (defknown (sxhash psxhash) (t) hash-code (foldable flushable))
 (defknown hash-table-equalp (hash-table hash-table) boolean (foldable flushable))
-(defknown sb-impl::install-hash-table-lock (hash-table) sb-thread:mutex ())
+(defknown sb-impl:install-hash-table-lock (hash-table) sb-thread:mutex ())
 (defknown sb-vm::quick-try-mutex (sb-thread:mutex) boolean)
 ;; To avoid emitting code to test for nil-function-returned
 (defknown (sb-impl::signal-corrupt-hash-table
@@ -1220,7 +1279,7 @@
                       (:fill-pointer (or index boolean))
                       (:displaced-to (or array null))
                       (:displaced-index-offset index))
-  array (flushable foldable-read-only))
+  array (flushable foldable-read-only mv-deriver))
 
 (defknown %make-array ((or index list)
                        (unsigned-byte #.sb-vm:n-widetag-bits)
@@ -1235,15 +1294,32 @@
                        (:displaced-index-offset index))
     array (flushable foldable-read-only no-verify-arg-count))
 
+(defknown sb-vm::%make-simple-array ((or index list)
+                                     (unsigned-byte #.sb-vm:n-widetag-bits)
+                                     (mod #.sb-vm:n-word-bits))
+    simple-array (flushable foldable-read-only no-verify-arg-count))
+
 (defknown sb-vm::array-underlying-widetag-and-shift (array)
     (values (integer 128 255) (integer 0 7))
     (flushable foldable))
 
 (defknown sb-vm::%vector-widetag-and-n-bits-shift (type-specifier)
     (values (integer 128 255) (integer 0 7))
-    (flushable foldable recursive))
+    (flushable foldable recursive no-verify-arg-count))
 
-(defknown sb-vm::initial-contents-error (t t) nil (no-verify-arg-count))
+(defknown sb-vm::%string-widetag-and-n-bits-shift (type-specifier)
+    (values (member #+sb-unicode #.sb-vm:simple-character-string-widetag
+                    #.sb-vm:simple-base-string-widetag)
+            (member #+sb-unicode 5
+                    3))
+    (flushable foldable no-verify-arg-count))
+
+(defknown (sb-vm::initial-contents-list-error sb-vm::initial-contents-error) (t t) nil (no-verify-arg-count))
+(defknown sb-vm::fill-vector-initial-contents (t t sequence) t (no-verify-arg-count)
+  :result-arg 1)
+(defknown (sb-vm::fill-vector-t-initial-contents) (t simple-vector sequence) simple-vector (no-verify-arg-count)
+  :result-arg 1)
+
 (defknown fill-data-vector (vector list sequence) vector (no-verify-arg-count)
   :result-arg 0)
 
@@ -1263,14 +1339,14 @@
 ;; second way shown above, we would have to bind INITIAL-CONTENTS,
 ;; to ensure its evaluation before the allocation,
 ;; causing difficulty if doing any futher macro-like processing.
-(defknown fill-array (sequence simple-array) (simple-array)
+(defknown fill-array (sequence array) (array)
   (flushable no-verify-arg-count)
   :derive-type #'result-type-last-arg
   :result-arg 1)
 
 (defknown vector (&rest t) simple-vector (flushable foldable-read-only))
 
-(defknown aref (array &rest index) t (foldable)
+(defknown aref (array &rest index) t (foldable mv-deriver)
   :call-type-deriver #'array-call-type-deriver)
 (defknown row-major-aref (array index) t (foldable)
   :call-type-deriver (lambda (call trusted)
@@ -1655,7 +1731,7 @@
 (defknown format ((or (member nil t) stream string)
                   (or string function) &rest t)
   (or string null)
-    ())
+    (mv-deriver))
 (defknown sb-format::format-error* (string list &rest t &key &allow-other-keys)
     nil)
 (defknown sb-format:format-error (string &rest t) nil)
@@ -1683,7 +1759,7 @@
                                    :directory :name
                                    :type :version))
   generalized-boolean
-  (recursive))
+  ())
 
 (defknown pathname-match-p (pathname-designator pathname-designator)
   generalized-boolean
@@ -1883,7 +1959,7 @@
 
 (defknown apropos      (string-designator &optional package-designator t) (values))
 (defknown apropos-list (string-designator &optional package-designator t) list
-  (flushable recursive))
+  (flushable))
 
 (defknown get-decoded-time ()
   (values (integer 0 59) (integer 0 59) (integer 0 23) (integer 1 31)
@@ -1937,7 +2013,7 @@
 
 (defknown symbol-global-value (symbol) t ()
   :derive-type #'symbol-value-derive-type)
-(defknown set-symbol-global-value (symbol t) t ()
+(defknown set-symbol-global-value ((and symbol (not null)) t) t ()
   :derive-type #'result-type-last-arg)
 
 (defknown get-bytes-consed () unsigned-byte (flushable))
@@ -1971,6 +2047,9 @@
 (defknown %rest-length (t t t) * (always-translatable))
 (defknown %rest-null (t t t t) * (always-translatable))
 (defknown %rest-true (t t t) * (always-translatable))
+(defknown %rest-list (t) * (always-translatable))
+(defknown %rest-listify (t t t) * (always-translatable))
+(defknown %rest-context (t) * (always-translatable))
 
 (defknown %unary-truncate/single-float (single-float) integer
    (movable foldable flushable no-verify-arg-count))
@@ -2021,7 +2100,8 @@
 (defknown %nip-values (t t &rest t) (values))
 (defknown %type-check-error (t t t) nil)
 (defknown %type-check-error/c (t t t) nil)
-
+(defknown sb-vm::op-not-type2-error (t t t) nil)
+(defknown sb-vm::op-not-type1-error (t t) nil)
 ;; %compile-time-type-error does not return, but due to the implementation
 ;; of FILTER-LVAR we cannot write it here.
 (defknown (%compile-time-type-error %compile-time-type-style-warn) (t t t t t t) *)
@@ -2079,7 +2159,7 @@
 (defknown %with-array-data/fp (array index (or index null))
   (values (simple-array * (*)) index index index)
   (foldable flushable no-verify-arg-count))
-(defknown %set-symbol-package (symbol t) t ())
+(defknown %set-symbol-package ((and symbol (not null)) (or package null)) t ())
 (defknown (%coerce-callable-to-fun %coerce-callable-for-call)
     (function-designator)
     function (flushable no-verify-arg-count))
@@ -2088,11 +2168,11 @@
 (defknown %find-position
     (t sequence t index sequence-end (function (t)) (function (t t)))
   (values t (or index null))
-  (flushable call no-verify-arg-count))
+  (flushable foldable call no-verify-arg-count))
 (defknown (%find-position-if %find-position-if-not)
   (function sequence t index sequence-end function)
   (values t (or index null))
-  (call no-verify-arg-count))
+  (foldable flushable call no-verify-arg-count))
 (defknown effective-find-position-test (function-designator function-designator)
   function
   (flushable foldable))
@@ -2185,7 +2265,6 @@
 (defknown (setf sbit) (bit (modifying (simple-array bit)) &rest index) bit ())
 (defknown %charset ((modifying string) index character) character ())
 (defknown %scharset ((modifying simple-string) index character) character ())
-(defknown %set-symbol-value (symbol t) t ())
 (defknown (setf symbol-function) (function symbol) function ())
 ;; Does this really need a type deriver? It's inline, and returns its 1st arg,
 ;; i.e. we know exactly what object it returns, which is more precise than
@@ -2376,11 +2455,17 @@
            overflow-ash)
   (integer integer t)
   integer
-  (movable always-translatable))
+  (always-translatable))
 
 (defknown overflow-negate
   (integer t)
   integer
-  (movable always-translatable))
+  (always-translatable))
 
 (defknown %coerce-to-policy (t) policy (flushable))
+(defknown (check-ds-list check-ds-list/&rest) (t index index t)
+    t
+    (movable foldable))
+(defknown check-ds-list/&key (t index index t t)
+    t
+    (movable foldable))

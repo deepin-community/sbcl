@@ -865,10 +865,6 @@
                  (array (unsigned-byte 7))
                  (array (unsigned-byte 3)))
 
-  (disunity-test (:array-type-union :disjoint-element-types :dont-unite)
-                 (array (integer 15 27))
-                 (array (integer 17 30)))
-
   (unity-test (:array-type-union :wild-element-type :unites)
               array
               (array (unsigned-byte 8))
@@ -1036,3 +1032,6 @@
     (assert (and (not answer) (not certain))))
   (multiple-value-bind (answer certain) (subtypep 'jn-even 'jn-odd)
     (assert (and (not answer) (not certain)))))
+
+(with-test (:name :member-type-stack-allocation)
+  (assert (typep 10 (opaque-identity `(member ,@(loop repeat 100000 for i by 2 collect i))))))

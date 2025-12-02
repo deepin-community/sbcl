@@ -12,9 +12,11 @@
 (in-package "SB-VM")
 
 (define-vop (reset-stack-pointer)
-  (:args (ptr :scs (any-reg)))
+  (:args (ptr :scs (any-reg descriptor-reg control-stack)))
   (:generator 1
-    (move csp-tn ptr)))
+    (if (sc-is ptr control-stack)
+        (load-stack-tn csp-tn ptr)
+        (move csp-tn ptr))))
 
 (define-vop (%%nip-values)
   (:args (last-nipped-ptr :scs (any-reg) :target dest)
@@ -119,6 +121,7 @@
   (:vop-var vop)
   (:node-var node)
   (:save-p :compute-only)
+  (:check-type t)
   (:generator 0
     (move list arg)
 

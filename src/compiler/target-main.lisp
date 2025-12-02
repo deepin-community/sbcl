@@ -24,7 +24,9 @@
           (component-kind component) :initial)
     (let* ((fun (let ((*allow-instrumenting* t))
                   (ir1-convert-lambdalike form
-                                          :source-name source-name)))
+                                          :source-name source-name
+                                          :ftype (and name
+                                                      (global-ftype name)))))
            ;; Convert the XEP using the policy of the real function. Otherwise
            ;; the wrong policy will be used for deciding whether to type-check
            ;; the parameters of the real function (via CONVERT-CALL /
@@ -471,7 +473,7 @@ not STYLE-WARNINGs occur during compilation, and NIL otherwise.
                 (line/col-from-charpos stream end-pos))
         (values nil nil))))
 
-(sb-ext:defglobal *background-tasks* nil)
+(define-load-time-global *background-tasks* nil)
 (defun default-compiler-worker (&aux compiled)
   (loop
     (let ((item (sb-ext:atomic-pop *background-tasks*)))

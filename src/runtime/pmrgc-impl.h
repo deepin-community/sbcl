@@ -9,10 +9,6 @@
  * files for more information.
  */
 
-#ifndef GENCGC_IS_PRECISE
-#error "GENCGC_IS_PRECISE must be #defined as 0 or 1"
-#endif
-
 /* Use AVX2 versions of code when we can, since blasting bytes faster
  * is always nice.
  * If used more widely, we should put these in runtime.h */
@@ -765,8 +761,8 @@ extern struct fixedobj_page *fixedobj_pages;
 #endif
 
 extern uword_t
-walk_generation(uword_t (*proc)(lispobj*,lispobj*,uword_t),
-                generation_index_t generation, uword_t extra);
+walk_generation(uword_t (*proc)(lispobj*,lispobj*,void*),
+                generation_index_t generation, void* extra);
 
 /* The minimum heap occupancy to force more aggressive collections above. */
 #define PANIC_THRESHOLD 0.9

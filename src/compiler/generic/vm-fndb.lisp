@@ -70,8 +70,10 @@
            function-with-layout-p
            non-null-symbol-p)
     (t) boolean (movable foldable flushable))
+
 (defknown unsigned-byte-x-p
-    (t (integer 1)) boolean (movable foldable flushable))
+    (t (integer #.(1+ sb-vm:n-word-bits)))
+    boolean (movable foldable flushable always-translatable))
 
 (defknown car-eq-if-listp (t t) boolean (movable foldable flushable))
 
@@ -95,6 +97,9 @@
   (float) boolean (movable foldable flushable))
 
 ;;;; miscellaneous "sub-primitives"
+
+(defknown descriptor-hash32 (t) #+64-bit (unsigned-byte 32) #-64-bit (unsigned-byte 29)
+          (flushable always-translatable))
 
 (defknown %sp-string-compare
   (simple-string simple-string index (or null index) index (or null index))
@@ -123,9 +128,6 @@
 ;;; not only symbols. The value is reliable only if the object is a symbol.
 (defknown hash-as-if-symbol-name (t) symbol-name-hash (flushable movable always-translatable))
 
-(defknown %set-symbol-hash (symbol hash-code)
-  t ())
-
 ;;; SYMBOL-PACKAGE-ID for #+compact-symbol demands a vop which avoids loading
 ;;; a raw bit value in a descriptor register (the SLOT vop returns a descriptor)
 (defknown symbol-package-id (symbol) (unsigned-byte 16))
@@ -141,7 +143,7 @@
   (always-translatable flushable)
   :result-arg 0)
 
-(defknown (vector-fill* vector-fill/t) (t t t t) vector
+(defknown (vector-fill vector-fill/t) (t t t t) vector
   (no-verify-arg-count)
   :result-arg 0)
 
@@ -189,10 +191,8 @@
   (flushable))
 (defknown %set-array-dimension (array index index) (values)
   ())
-(defknown %array-rank (array) %array-rank
-  (flushable))
 
-(defknown (%array-rank= widetag=) (t t) boolean
+(defknown (array-rank= widetag=) (t t) boolean
   (flushable))
 
 (defknown vector-data (array index) (values simple-array index)
@@ -200,8 +200,8 @@
 
 (defknown simple-array-header-of-rank-p (t %array-rank) boolean
   (flushable))
-(defknown sb-kernel::check-array-shape (simple-array list)
-  (simple-array)
+(defknown sb-kernel::check-array-shape (array list)
+  (array)
   (flushable no-verify-arg-count)
   :derive-type #'result-type-first-arg
   :result-arg 0)
@@ -235,6 +235,10 @@
 (defknown %instance-ref (instance index) t
   (flushable always-translatable))
 (defknown (%instance-ref-eq) (instance index t) boolean
+  (flushable always-translatable))
+;; This predicates sounds as though the argument restriction would be INSTANCE,
+;; but it's lenient because it can perform a lowtag test on one (but not both) args.
+(defknown (%instance-types=) (t t) boolean
   (flushable always-translatable))
 (defknown %instance-set (instance index t) (values) (always-translatable))
 (defknown update-object-layout (t) layout)
@@ -291,16 +295,18 @@
                            word index
                            ;; The number of words is later converted
                            ;; to bytes, make sure it fits.
-                           (and index
-                                (mod #.(- (expt 2
-                                                (- sb-vm:n-word-bits
-                                                   sb-vm:word-shift
-                                                   ;; all the allocation routines expect a signed word
-                                                   1))
-                                          ;; The size is double-word aligned, which is done by adding
-                                          ;; (1- (/ sb-vm:n-word-bits 2)) and then masking.
-                                          ;; Make sure addition doesn't overflow.
-                                          3))))
+                           #.(if (fixnump (ash array-dimension-limit 7))
+                                 `(and unsigned-byte fixnum)
+                                 `(and index
+                                       (mod ,(- (expt 2
+                                                      (- sb-vm:n-word-bits
+                                                         sb-vm:word-shift
+                                                         ;; all the allocation routines expect a signed word
+                                                         1))
+                                                ;; The size is double-word aligned, which is done by adding
+                                                ;; (1- (/ sb-vm:n-word-bits 2)) and then masking.
+                                                ;; Make sure addition doesn't overflow.
+                                                3)))))
     (simple-array * (*))
     (flushable movable))
 
@@ -732,11 +738,11 @@
 ;;; Checks for and adjusts fill-pointer for vector-pop/push and
 ;;; returns the underlying simple data vector.
 (defknown %data-vector-pop
-    (array)
+    (complex-vector)
     (values (simple-array * (*)) index))
 
 (defknown %data-vector-push
-    (array)
+    (complex-vector)
     (values (simple-array * (*)) (or null index)))
 
 (defknown restart-point (t) t ())
@@ -759,10 +765,10 @@
   (movable foldable unboxed-return))
 
 (defknown make-single-float ((signed-byte 32)) single-float
-  (movable flushable))
+  (movable flushable foldable))
 
 (defknown make-double-float ((signed-byte 32) (unsigned-byte 32)) double-float
-  (movable flushable))
+  (movable flushable foldable))
 
 (defknown single-float-bits (single-float) (signed-byte 32)
   (movable foldable flushable))
@@ -770,7 +776,7 @@
 #+64-bit
 (progn
 (defknown %make-double-float ((signed-byte 64)) double-float
-  (movable flushable))
+  (movable flushable foldable))
 (defknown double-float-bits (double-float) (signed-byte 64)
   (movable foldable flushable)))
 
@@ -780,12 +786,20 @@
 (defknown double-float-low-bits (double-float) (unsigned-byte 32)
   (movable foldable flushable))
 
-(defknown (%tan %sinh %asinh %atanh %log %logb %log10 %tan-quick)
+(defknown (%tan %sinh %asinh %atanh %log %logb %log10 %log1p %log2 %tan-quick)
           (double-float) double-float
+  (movable foldable flushable))
+
+(defknown (%tanf %sinhf %asinhf %atanhf %logf %log10f %log1pf %log2f)
+          (single-float) single-float
   (movable foldable flushable))
 
 (defknown (%sin %cos %tanh %sin-quick %cos-quick)
   (double-float) (double-float -1.0d0 1.0d0)
+  (movable foldable flushable))
+
+(defknown (%sinf %cosf %tanhf)
+  (single-float) (single-float -1.0f0 1.0f0)
   (movable foldable flushable))
 
 (defknown (%asin %atan)
@@ -794,17 +808,35 @@
                 #.(coerce (sb-xc:/ pi 2) 'double-float))
   (movable foldable flushable))
 
+(defknown (%asinf %atanf)
+  (single-float)
+  (single-float  #.(coerce (sb-xc:- (sb-xc:/ pi 2)) 'single-float)
+                 #.(coerce (sb-xc:/ pi 2) 'single-float))
+  (movable foldable flushable))
+
 (defknown (%acos)
   (double-float) (double-float 0.0d0 #.(coerce pi 'double-float))
   (movable foldable flushable))
+
+(defknown (%acosf)
+    (single-float) (single-float 0.0f0 #.(coerce pi 'single-float))
+    (movable foldable flushable))
 
 (defknown (%cosh)
   (double-float) (double-float 1.0d0)
   (movable foldable flushable))
 
+(defknown (%coshf)
+  (single-float) (single-float 1.0f0)
+  (movable foldable flushable))
+
 (defknown (%acosh %exp %sqrt)
   (double-float) (double-float 0.0d0)
   (movable foldable flushable))
+
+(defknown (%acoshf %expf %sqrtf)
+    (single-float) (single-float 0.0f0)
+    (movable foldable flushable))
 
 (defknown %expm1
   (double-float) (double-float -1d0)
@@ -814,9 +846,17 @@
   (double-float double-float) (double-float 0d0)
   (movable foldable flushable))
 
+(defknown (%hypotf)
+    (single-float single-float) (single-float 0f0)
+    (movable foldable flushable))
+
 (defknown (%pow)
   (double-float double-float) double-float
   (movable foldable flushable))
+
+(defknown (%powf)
+    (single-float single-float) single-float
+    (movable foldable flushable))
 
 (defknown (%atan2)
   (double-float double-float)
@@ -824,16 +864,18 @@
                 #.(coerce pi 'double-float))
   (movable foldable flushable))
 
+(defknown (%atan2f)
+    (single-float single-float)
+    (single-float #.(coerce (sb-xc:- pi) 'single-float)
+                  #.(coerce pi 'single-float))
+    (movable foldable flushable))
+
 (defknown (%scalb)
   (double-float double-float) double-float
   (movable foldable flushable))
 
 (defknown (%scalbn)
   (double-float (signed-byte 32)) double-float
-  (movable foldable flushable))
-
-(defknown (%log1p %log2)
-  (double-float) double-float
   (movable foldable flushable))
 
 (defknown (%unary-truncate %unary-round) (real) integer

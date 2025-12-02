@@ -103,14 +103,18 @@
 (declaim (sb-ext:freeze-type loop-collector))
 
 (sb-xc:defmacro with-loop-list-collection-head
-    ((collector head-var tail-var &optional user-head-var) &body body)
-  (let ((l (and user-head-var (list (list user-head-var nil)))))
-    `(let* ((,head-var ,(if (loop for how in (loop-collector-history collector)
-                                  always (eq how 'list))
+    ((collector head-var tail-var &optional user-head-var) &body body &environment env)
+  (let ((l (and user-head-var (list (list user-head-var nil))))
+        (debug (sb-c:policy env (= debug 3))))
+    `(let* ((,head-var ,(if (and (not debug)
+                                 (loop for how in (loop-collector-history collector)
+                                       always (eq how 'list)))
                             `(unaligned-dx-cons nil)
                             `(list nil)))
             (,tail-var ,head-var) ,@l)
        (declare (dynamic-extent ,head-var)
+                ,@(unless debug
+                    `((sb-c::no-debug ,head-var ,tail-var))) ;; half-conses are bad for the debugger
                 ,@(and user-head-var `((list ,user-head-var))))
        ,@body)))
 
@@ -1453,6 +1457,15 @@ code to be loaded.
                        (loop-for-across var `(list-reverse-into-vector-cddr ,(second val)) data-type))
                       ((not stepper)
                        (loop-for-across var `(list-reverse-into-vector ,(second val)) data-type))))))
+        ((and (typep val '(cons (eql sort) (cons (cons (eql copy-list) (cons t null)) cons)))
+              (not (sb-c::fun-lexically-notinline-p 'copy-list
+                                                    (macro-environment *loop*)))
+              (let ((stepper (and (loop-tequal (car (source-code *loop*)) :by)
+                                  (source-code *loop*))))
+                (cond ((not stepper)
+                       (destructuring-bind (sort (copy-list list) &rest args) val
+                         (declare (ignore sort copy-list))
+                         (loop-for-across var `(sort (coerce (the list ,list) 'vector) ,@args) data-type)))))))
         (t
          (multiple-value-bind (list constantp list-value)
              (loop-constant-fold-if-possible val)

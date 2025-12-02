@@ -103,8 +103,7 @@ LDB_OBJS = $(filter-out main.o interr.o runtime.o monitor.o thread.o safepoint.o
 ldb: $(LIBSBCL)
 	$(CC) -g $(CPPFLAGS) $(CFLAGS) -DSTANDALONE_LDB -c -o standalone-monitor.o monitor.c
 	$(CC) -g $(CPPFLAGS) $(CFLAGS) -DSTANDALONE_LDB -c -o standalone-interr.o interr.c
-	$(CC) -g $(CPPFLAGS) $(CFLAGS) -DSTANDALONE_LDB -c -o standalone-thread.o thread.c
-	$(CC) $(LINKFLAGS) -o ldb standalone-monitor.o standalone-interr.o standalone-thread.o \
+	$(CC) $(LINKFLAGS) -o ldb standalone-monitor.o standalone-interr.o \
 		$(LDB_OBJS) $(LIBS)
 
 $(TARGET): $(LIBSBCL)
@@ -139,7 +138,7 @@ libsbcl.so: $(PIC_OBJS)
 %.pic.o: %.c
 	$(CC) -fPIC -c $(CPPFLAGS) $(filter-out -fno-pie,$(CFLAGS)) $< -o $@
 %.pic.o: %.S # (-fPIC doesn't affect hand-written assembly source)
-	$(CC) -c $(CPPFLAGS) $(CFLAGS) $< -o $@
+	$(CC) -c $(CPPFLAGS) $(CFLAGS) $< -o $@ -DLIBSBCL
 
 SHRINKWRAP_DEPS = ../../output/sbcl.core ../../tools-for-build/elftool.lisp
 shrinkwrap-sbcl.s shrinkwrap-sbcl-core.o: $(SHRINKWRAP_DEPS)

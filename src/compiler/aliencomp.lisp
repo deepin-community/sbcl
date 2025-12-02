@@ -473,7 +473,8 @@
     ;; Optimize multiple alien-saps through a variable
     (cond ((block nil
              (map-refs
-              (lambda (dest)
+              (lambda (dest lvar)
+                (declare (ignore lvar))
                 (cond ((combination-is dest '(alien-sap))
                        (pushnew dest alien-saps :test #'eq))
                       ((combination-is dest '(eq)))
@@ -483,9 +484,7 @@
               :leaf-set (lambda () (return))
               :multiple-uses (lambda () (return)))
              alien-saps)
-           (setf (node-derived-type node)
-                 (values-specifier-type '(values system-area-pointer &optional)))
-           (erase-lvar-type (node-lvar node))
+           (erase-node-type node (values-specifier-type '(values system-area-pointer &optional)))
            (loop for alien-sap in alien-saps
                  do
                  (transform-call alien-sap

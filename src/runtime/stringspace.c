@@ -16,6 +16,7 @@
 #include "genesis/static-symbols.h"
 #include "genesis/symbol.h"
 #include "genesis/vector.h"
+#include "genesis/sap.h"
 #include "globals.h"
 #include "validate.h"
 #include <stdio.h>
@@ -97,7 +98,7 @@ static int readonly_unboxed_obj_p(lispobj* obj)
 #endif
     case BIGNUM_WIDETAG: case DOUBLE_FLOAT_WIDETAG:
     case COMPLEX_SINGLE_FLOAT_WIDETAG: case COMPLEX_DOUBLE_FLOAT_WIDETAG:
-    case SAP_WIDETAG: case SIMPLE_ARRAY_NIL_WIDETAG:
+    case SIMPLE_ARRAY_NIL_WIDETAG:
 #ifdef SIMD_PACK_WIDETAG
     case SIMD_PACK_WIDETAG:
 #endif
@@ -107,6 +108,11 @@ static int readonly_unboxed_obj_p(lispobj* obj)
         return 1;
     case RATIO_WIDETAG: case COMPLEX_RATIONAL_WIDETAG:
         return fixnump(obj[1]) && fixnump(obj[2]);
+    case SAP_WIDETAG:
+#if defined LISP_FEATURE_X86_64
+        if (((uint32_t*)obj)[1]) return 0; // high half of header != 0 ==> adjustable
+#endif
+        return 1;
     }
     if ((widetag > SIMPLE_VECTOR_WIDETAG && widetag < COMPLEX_BASE_STRING_WIDETAG)) {
         if (!vector_len((struct vector*)obj)) return 1; // length 0 vectors can't be stored into
@@ -119,9 +125,12 @@ static int readonly_unboxed_obj_p(lispobj* obj)
         if (!length) return 1; // length 0 vectors can't be stored into
         if (*obj & (VECTOR_SHAREABLE|VECTOR_SHAREABLE_NONSTD)<<ARRAY_FLAGS_POSITION) {
             // If every element is non-pointer, then it can go in readonly space
+            /* TODO: I'd like to allow vectors containing symbols into R/O space,
+             * but they might have to be adjusted upon heap relocation.
+             * The general benefit should outweigh the possible cost. */
             sword_t i;
             for (i=0; i<length; ++i)
-                if (v->data[i] != NIL && is_lisp_pointer(v->data[i])) return 0;
+                if (is_lisp_pointer(v->data[i])) return 0;
             return 1;
         }
     }
@@ -151,9 +160,9 @@ struct pair {
     uword_t data;
 };
 
-static uword_t walk_range_wrapper(lispobj* where, lispobj* limit, uword_t arg)
+static uword_t walk_range_wrapper(lispobj* where, lispobj* limit, void* arg)
 {
-    struct pair* pair = (void*)arg;
+    struct pair* pair = arg;
     walk_range(where, limit, pair->func, pair->data);
     return 0;
 }
@@ -161,7 +170,10 @@ static uword_t walk_range_wrapper(lispobj* where, lispobj* limit, uword_t arg)
 /* Call 'fun' on every object in every space, passing it object and 'arg' */
 static void walk_all_gc_spaces(void (*fun)(lispobj*,uword_t), uword_t arg)
 {
-    walk_range((lispobj*)NIL_SYMBOL_SLOTS_START, (lispobj*)NIL_SYMBOL_SLOTS_END, fun, arg);
+#ifdef T_SYMBOL_SLOTS_START
+    walk_range(T_SYMBOL_SLOTS_START, T_SYMBOL_SLOTS_END, fun, arg);
+#endif
+    walk_range(NIL_SYMBOL_SLOTS_START, NIL_SYMBOL_SLOTS_END, fun, arg);
     walk_range((lispobj*)STATIC_SPACE_OBJECTS_START, static_space_free_pointer, fun, arg);
     if (PERMGEN_SPACE_START)
         walk_range((lispobj*)PERMGEN_SPACE_START, permgen_space_free_pointer, fun, arg);
@@ -171,7 +183,7 @@ static void walk_all_gc_spaces(void (*fun)(lispobj*,uword_t), uword_t arg)
     if (TEXT_SPACE_START)
         walk_range((lispobj*)TEXT_SPACE_START, text_space_highwatermark, fun, arg);
     struct pair pair = {fun, arg};
-    walk_generation(walk_range_wrapper, -1, (uword_t)&pair);
+    walk_generation(walk_range_wrapper, -1, &pair);
 }
 
 static lispobj readonlyize(lispobj* obj)
@@ -307,6 +319,14 @@ static void undo_rospace_ptrs(lispobj* obj, uword_t arg) {
     visit_pointer_words(obj, follow_shadow_fp, arg);
 }
 
+static void nuke_fd_stream_buffer(lispobj* where, uword_t nullsap)
+{
+    if (widetag_of(where) != INSTANCE_WIDETAG) return;
+    lispobj layout = instance_layout(where);
+    if (layout && layout_depth2_id(LAYOUT(layout)) == FD_STREAM_BUFFER_LAYOUT_ID)
+        ((struct instance*)where)->slots[INSTANCE_DATA_START] = nullsap;
+}
+
 void move_rospace_to_dynamic(__attribute__((unused)) int print)
 {
 #ifdef LISP_FEATURE_IMMOBILE_SPACE
@@ -324,16 +344,27 @@ void move_rospace_to_dynamic(__attribute__((unused)) int print)
     sword_t nwords;
     for ( ; where < read_only_space_free_pointer ; where += nwords, shadow_cursor += nwords ) {
         nwords = headerobj_size(where);
-        lispobj *new = gc_general_alloc(unboxed_region, nwords*N_WORD_BYTES, PAGE_TYPE_BOXED);
+        lispobj *new = gc_general_alloc(unboxed_region, nwords*N_WORD_BYTES, PAGE_TYPE_UNBOXED);
         SET_ALLOCATED_BIT(new);
         memcpy(new, where, nwords*N_WORD_BYTES);
         *shadow_cursor = make_lispobj(new, OTHER_POINTER_LOWTAG);
     }
-    ensure_region_closed(unboxed_region, PAGE_TYPE_BOXED);
+    // Make a SAP pointing to null which will become the buffer sap of any fd-stream
+    // that did not become garbage in the final GC passes prior to image dump.
+    struct sap* nullsap = gc_general_alloc(unboxed_region, SAP_SIZE*N_WORD_BYTES, PAGE_TYPE_UNBOXED);
+    SET_ALLOCATED_BIT(nullsap);
+    nullsap->header = (1 << N_WIDETAG_BITS) | SAP_WIDETAG;
+    nullsap->pointer = 0;
+    ensure_region_closed(unboxed_region, PAGE_TYPE_UNBOXED);
     os_deallocate((void*)READ_ONLY_SPACE_START, READ_ONLY_SPACE_END - READ_ONLY_SPACE_START);
     walk_all_gc_spaces(undo_rospace_ptrs, (uword_t)shadow_base);
     // Set it empty
     read_only_space_free_pointer = (lispobj*)READ_ONLY_SPACE_START;
+    // Once more visit dynamic space clobbering file stream buffer SAPs
+    if (save_lisp_gc_iteration == 1) {
+        struct pair pair = {nuke_fd_stream_buffer, (uword_t)nullsap};
+        walk_generation(walk_range_wrapper, -1, (void*)&pair);
+    }
 }
 
 /* This kludge is only for the hide-packages test after it invokes move_rospace_to_dynamic().

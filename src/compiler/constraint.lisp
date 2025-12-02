@@ -769,15 +769,17 @@
                           ((typep %typep %instance-typep)
                            (let ((type (second args)))
                              (when (constant-lvar-p type)
-                               (let ((val (lvar-value type)))
-                                 (add 'typep
-                                      (ok-lvar-lambda-var (first args) constraints)
-                                      (if (ctype-p val)
-                                          val
-                                          (let ((*compiler-error-context* node))
-                                           (specifier-type val)))
-                                      nil
-                                      (first args))))))
+                               (let* ((val (lvar-value type))
+                                      (ctype (if (ctype-p val)
+                                                 val
+                                                 (careful-specifier-type val))))
+                                 (when (and ctype
+                                            (type-for-constraints-p ctype))
+                                   (add 'typep
+                                        (ok-lvar-lambda-var (first args) constraints)
+                                        ctype
+                                        nil
+                                        (first args)))))))
                           ((eq eql)
                            (let* ((arg1 (first args))
                                   (var1 (ok-lvar-lambda-var arg1 constraints))
@@ -855,6 +857,13 @@
        (eq (numeric-type-class x) 'integer)
        (eq (numeric-type-complexp x) :real)))
 
+(defun ratio-type-p (x)
+  (declare (type ctype x))
+  (and (numeric-type-p x)
+       (eq (numeric-type-class x) 'rational)
+       (eq (numeric-type-complexp x) :real)
+       (csubtypep x (specifier-type 'ratio))))
+
 ;;; Given that an inequality holds on values of type X and Y, return a
 ;;; new type for X. If GREATER is true, then X was greater than Y,
 ;;; otherwise less. If OR-EQUAL is true, then the inequality was
@@ -920,14 +929,16 @@
                     (sb-xc:> (type-bound-number ref) (type-bound-number x))))))
     (let* ((x-bound (bound x))
            (y-bound (exclude (bound y)))
-           (new-bound (cond ((not x-bound)
-                             y-bound)
-                            ((not y-bound)
-                             x-bound)
-                            ((tighter-p y-bound x-bound)
-                             y-bound)
-                            (t
-                             x-bound))))
+           (new-bound (coerce-for-bound
+                       (cond ((not x-bound)
+                              y-bound)
+                             ((not y-bound)
+                              x-bound)
+                             ((tighter-p y-bound x-bound)
+                              y-bound)
+                             (t
+                              x-bound))
+                       (numeric-type-format x))))
       (if greater
           (modified-numeric-type x :low new-bound)
           (modified-numeric-type x :high new-bound)))))
@@ -1025,15 +1036,12 @@
         (not-xset     nil)
         (not-numeric nil)
         not-characters
-        (not-fpz     '())
         set)
     (flet ((note-not (x)
-             (if (fp-zero-p x)
-                 (push x not-fpz)
-                 (when (or constrain-symbols (null x) (not (symbolp x)))
-                   (when (null not-xset)
-                     (setf not-xset (alloc-xset)))
-                   (add-to-xset x not-xset))))
+             (when (or constrain-symbols (null x) (not (symbolp x)))
+               (when (null not-xset)
+                 (setf not-xset (alloc-xset)))
+               (add-to-xset x not-xset)))
            (intersect-result (other-type)
              (setf type (type-intersection type other-type))))
       (declare (inline intersect-result))
@@ -1058,6 +1066,8 @@
                       (when (and ref
                                  (constant-p other))
                         (change-ref-leaf ref other)
+                        (when (eq (node-derived-type ref) *empty-type*)
+                          (pushnew ref *blocks-to-terminate*))
                         (return-from type-from-constraints))
                       (intersect-result other-type))
                      ((constant-p other)
@@ -1088,11 +1098,9 @@
            (change-ref-leaf ref (find-constant t)))
           (t
            (let* ((not-union not-type)
-                  (not-union (if (and (null not-xset) (null not-fpz))
-                               not-union
-                               (let ((excluded (make-member-type
-                                                (or not-xset (alloc-xset)) not-fpz)))
-                                 (type-union not-union excluded))))
+                  (not-union (if not-xset
+                                 (type-union not-union (make-member-type not-xset))
+                                 not-union))
                   (numeric (when not-numeric
                              (contiguous-numeric-set-type not-numeric)))
                   (not-union (if numeric
@@ -1223,6 +1231,23 @@
             (when reoptimize
               (reoptimize-lvar (node-lvar ref)))))))))
 
+(defun delete-redundant-set (set in)
+  (let ((var (set-var set)))
+    (when (and (lambda-var-p var)
+               (lambda-var-eq-constraints var))
+      (let* ((value (set-value set))
+             (ref (principal-lvar-use value)))
+        (when (and (ref-p ref)
+                   (eq (ref-leaf ref) var))
+          (let ((constraint (gethash (node-lvar ref)
+                                     (lambda-var-eq-constraints var))))
+            (when (and constraint
+                       (conset-member constraint in))
+              (setf (lambda-var-sets var)
+                    (delq1 set (lambda-var-sets var)))
+              (delete-filter set (node-lvar set) value)
+              t)))))))
+
 ;;;; Flow analysis
 
 (defun maybe-add-eql-var-lvar-constraint (ref gen)
@@ -1255,15 +1280,23 @@
        (let ((fun (bind-lambda node)))
          (functional-kind-case fun
            (let
-            (loop with call = (lvar-dest (node-lvar (first (lambda-refs fun))))
-                  for var in (lambda-vars fun)
-                  and val in (combination-args call)
-                  when (and val (lambda-var-constraints var))
-                  do (let ((type (lvar-type val)))
-                       (when (type-for-constraints-p type)
-                         (conset-add-constraint gen 'typep var type nil)))
-                     (maybe-add-eql-var-var-constraint var val gen)
-                     (add-var-result-constraints var val gen)))
+               (loop with call = (lvar-dest (node-lvar (first (lambda-refs fun))))
+                     for var in (lambda-vars fun)
+                     and val in (combination-args call)
+                     when (and val (lambda-var-constraints var))
+                     do (let ((type (lvar-type val)))
+                          (when (type-for-constraints-p type)
+                            (conset-add-constraint gen 'typep var type nil)))
+                        (maybe-add-eql-var-var-constraint var val gen)
+                        (add-var-result-constraints var val gen)))
+           ((nil optional)
+            (loop for var in (lambda-vars fun)
+                  for type = (leaf-defined-type var)
+                  do
+                  (when (and (lambda-var-constraints var)
+                             (type-for-constraints-p type)
+                             (not (lambda-var-arg-info var)))
+                    (conset-add-constraint gen 'typep var type nil))))
            (mv-let
             (add-mv-let-result-constraints (lvar-dest (node-lvar (first (lambda-refs fun)))) fun gen)))))
       (ref
@@ -1281,31 +1314,33 @@
            (conset-add-constraint-to-eql gen 'typep var atype nil))
          (constraint-propagate-back lvar 'typep atype gen gen nil)))
       (cset
-       (binding* ((var (set-var node))
-                  (nil (lambda-var-p var) :exit-if-null)
-                  (nil (lambda-var-constraints var) :exit-if-null))
-         (when (policy node (or (and (= speed 3) (> speed compilation-speed))
-                                (> debug 1)))
-           (let ((type (lambda-var-type var)))
+       (unless (and preprocess-refs-p
+                    (delete-redundant-set node gen))
+         (binding* ((var (set-var node))
+                    (nil (lambda-var-p var) :exit-if-null)
+                    (nil (lambda-var-constraints var) :exit-if-null))
+           (when (policy node (or (and (= speed 3) (> speed compilation-speed))
+                                  (> debug 1)))
+             (let ((type (lambda-var-type var)))
+               (when (type-for-constraints-p type)
+                 (do-eql-vars (other (var gen))
+                   (unless (eql other var)
+                     (conset-add-constraint gen 'typep other type nil))))))
+
+           (let ((new (add-set-constraints var (set-value node) gen)))
+             (conset-clear-lambda-var gen var)
+             (when new
+               (conset-union gen new)))
+
+           (let ((type (single-value-type (node-derived-type node))))
              (when (type-for-constraints-p type)
-               (do-eql-vars (other (var gen))
-                 (unless (eql other var)
-                   (conset-add-constraint gen 'typep other type nil))))))
-
-         (let ((new (add-set-constraints var (set-value node) gen)))
-           (conset-clear-lambda-var gen var)
-           (when new
-             (conset-union gen new)))
-
-         (let ((type (single-value-type (node-derived-type node))))
-           (when (type-for-constraints-p type)
-             (conset-add-constraint gen 'typep var type nil)))
-         (unless (policy node (> compilation-speed speed))
-           (maybe-add-eql-var-var-constraint var (set-value node) gen))
-         (add-eq-constraint var (set-value node) gen)
-         (conset-add-constraint gen 'set var var nil)
-         (when (node-lvar node)
-           (conset-add-lvar-lambda-var-eql gen (node-lvar node) var))))
+               (conset-add-constraint gen 'typep var type nil)))
+           (unless (policy node (> compilation-speed speed))
+             (maybe-add-eql-var-var-constraint var (set-value node) gen))
+           (add-eq-constraint var (set-value node) gen)
+           (conset-add-constraint gen 'set var var nil)
+           (when (node-lvar node)
+             (conset-add-lvar-lambda-var-eql gen (node-lvar node) var)))))
       (combination
        (case (combination-kind node)
          (:known
