@@ -347,14 +347,13 @@
   (let ((source (scratch-file-name "tmp")) fasl)
     (with-open-file (f source :direction :output
                        :if-does-not-exist :create :if-exists :supersede)
-      (write-string "(defun a () (sb-unix:unix-exit))" f)
+      (write-string "(defun a () (sb-unix:unix-exit 0))" f)
       ;; a full warning even though the PLEASE-DONT- function is only :early
       (write-string "(defun b () (please-dont-use-this 1) (really-dont-do-it 2))" f)
       (write-string "(defun c () (you-cant-use-this 3))" f))
     ;; We expect four deprecation warnings from compiling the source
-    ;; (four uses of deprecated things) and three from loading it
-    ;; (loading three functions that contain uses of deprecated
-    ;; things).
+    ;; and four from loading it, as there are four uses of deprecated
+    ;; things)
     (unwind-protect
          (progn (setq fasl
                       (assert-signal
@@ -363,6 +362,6 @@
                            late-deprecation-warning
                            final-deprecation-warning)
                        4))
-                (assert-signal (load fasl) warning 3))
+                (assert-signal (load fasl) warning 4))
       (delete-file fasl)
       (delete-file source))))

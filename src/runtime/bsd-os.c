@@ -25,8 +25,7 @@
 #include <utime.h>
 #include <assert.h>
 #include <errno.h>
-#include "sbcl.h"
-#include "./signal.h"
+#include "genesis/sbcl.h"
 #include "os.h"
 #include "arch.h"
 #include "globals.h"
@@ -36,15 +35,39 @@
 #include "thread.h"
 #include "runtime.h"
 #include "genesis/static-symbols.h"
-#include "genesis/fdefn.h"
+#include "genesis/symbol.h"
 
 #include <sys/types.h>
 #include <signal.h>
 /* #include <sys/sysinfo.h> */
 #include "validate.h"
-#include "gc-internal.h"
+#include "gc.h"
+#include "sys_mmap.inc"
 
 
+
+#if defined __DragonFly__
+#include <sys/lwp.h>
+lwpid_t sb_GetTID() { return lwp_gettid(); }
+#elif defined __NetBSD__
+#include <lwp.h>
+int sb_GetTID() { return _lwp_self(); }
+#elif defined __FreeBSD__
+#include <sys/thr.h>
+int sb_GetTID()
+{
+    long id;
+    thr_self(&id);
+    // man thr_self(2) says: the thread identifier is an integer in the range
+    // from PID_MAX + 2 (100001) to INT_MAX. So casting to int is safe.
+    return (int)id;
+}
+#elif defined __OpenBSD__
+int sb_GetTID()
+{
+    return getthrid();
+}
+#endif
 
 #ifdef __NetBSD__
 #include <sys/resource.h>
@@ -81,12 +104,14 @@ static void dragonfly_init();
 #ifdef LISP_FEATURE_X86
 #include <machine/cpu.h>
 #endif
+#ifdef LISP_FEATURE_SB_FUTEX
+#include <sys/futex.h>
+#endif
 
 static void openbsd_init();
 #endif
 
-void
-os_init(char *argv[], char *envp[])
+void os_init()
 {
 #ifdef __NetBSD__
     netbsd_init();
@@ -118,23 +143,39 @@ os_context_sigmask_addr(os_context_t *context)
 }
 
 os_vm_address_t
-os_validate(int attributes, os_vm_address_t addr, os_vm_size_t len, int executable, int jit)
+os_alloc_gc_space(int space_id, int attributes, os_vm_address_t addr, os_vm_size_t len)
 {
+    int __attribute((unused))
+      executable = (space_id == READ_ONLY_CORE_SPACE_ID) ||
+                   (space_id == ALIEN_LINKAGE_TABLE_CORE_SPACE_ID) ||
+                   (space_id == STATIC_CODE_CORE_SPACE_ID),
+      jit = (space_id == STATIC_CODE_CORE_SPACE_ID) || (space_id == DYNAMIC_CORE_SPACE_ID)
+            ? 1 : (space_id == ALIEN_LINKAGE_TABLE_CORE_SPACE_ID) ? 2 : 0;
+
     int protection;
     int flags = 0;
 
+    // FIXME: This probaby needs to use MAP_TRYFIXED
     if (attributes & IS_GUARD_PAGE)
         protection = OS_VM_PROT_NONE;
     else
-#ifndef LISP_FEATURE_DARWIN_JIT
+#if defined(LISP_FEATURE_OPENBSD) && defined(MAP_STACK)
+    /* OpenBSD requires MAP_STACK for pages used as stack (and RW protection).
+     * Note that FreeBSD has a MAP_STACK with different behavior. */
+    if (space_id == THREAD_STRUCT_CORE_SPACE_ID) {
+        protection = OS_VM_PROT_READ | OS_VM_PROT_WRITE;
+        flags |= MAP_STACK;
+    } else {
         protection = OS_VM_PROT_ALL;
-#else
+    }
+
+#elif defined(LISP_FEATURE_DARWIN_JIT)
     if (jit) {
         if (jit == 2)
             protection = OS_VM_PROT_ALL;
         else
             protection = OS_VM_PROT_READ | OS_VM_PROT_WRITE;
-        flags = MAP_JIT;
+        flags |= MAP_JIT;
     }
     else if (executable) {
         protection = OS_VM_PROT_READ | OS_VM_PROT_EXECUTE;
@@ -142,12 +183,14 @@ os_validate(int attributes, os_vm_address_t addr, os_vm_size_t len, int executab
     else {
         protection = OS_VM_PROT_READ | OS_VM_PROT_WRITE;
     }
+
+#else
+        protection = OS_VM_PROT_ALL;
 #endif
 
     attributes &= ~IS_GUARD_PAGE;
 
 #ifndef LISP_FEATURE_DARWIN // Do not use MAP_FIXED, because the OS is sane.
-
     /* The *BSD family of OSes seem to ignore 'addr' when it is outside
      * of some range which I could not figure out.  Sometimes it seems like the
      * condition is that any address below 4GB can't be requested without MAP_FIXED,
@@ -175,16 +218,7 @@ os_validate(int attributes, os_vm_address_t addr, os_vm_size_t len, int executab
        Except for MAP_FIXED mappings, the system will never replace existing mappings. */
 
     // ALLOCATE_LOW seems never to get what we want
-    if (!(attributes & MOVABLE) || (attributes & ALLOCATE_LOW)) {
-        flags = MAP_FIXED;
-    }
-    if (attributes & IS_THREAD_STRUCT) {
-#if defined(LISP_FEATURE_OPENBSD) && defined(MAP_STACK)
-        /* OpenBSD requires MAP_STACK for pages used as stack.
-         * Note that FreeBSD has a MAP_STACK with different behavior. */
-        flags = MAP_STACK;
-#endif
-    }
+    if (!(attributes & MOVABLE) || (attributes & ALLOCATE_LOW)) flags |= MAP_FIXED;
 #endif
 
 #ifdef MAP_EXCL // not defined in OpenBSD, NetBSD, DragonFlyBSD
@@ -220,7 +254,7 @@ os_validate(int attributes, os_vm_address_t addr, os_vm_size_t len, int executab
 #endif
     {
         os_vm_address_t requested = addr;
-        addr = mmap(addr, len, protection, flags, -1, 0);
+        addr = sbcl_mmap(addr, len, protection, flags, -1, 0);
         if (requested && requested != addr && !(attributes & MOVABLE)) {
             return 0;
         }
@@ -240,31 +274,10 @@ os_validate(int attributes, os_vm_address_t addr, os_vm_size_t len, int executab
 
     return addr;
 }
-
-void
-os_invalidate(os_vm_address_t addr, os_vm_size_t len)
-{
-    if (munmap(addr, len) == -1)
-        perror("munmap");
-}
-
-void
-os_protect(os_vm_address_t address, os_vm_size_t length, os_vm_prot_t prot)
-{
-    if (mprotect(address, length, prot) == -1) {
-
-        perror("mprotect");
-#ifdef LISP_FEATURE_DARWIN_JIT
-        lose("%p %lu", address, length);
-#endif
-    }
-}
 
 /*
  * any OS-dependent special low-level handling for signals
  */
-
-#if defined LISP_FEATURE_GENCGC
 
 /*
  * The GENCGC needs to be hooked into whatever signal is raised for
@@ -277,45 +290,30 @@ memory_fault_handler(int signal, siginfo_t *siginfo, os_context_t *context)
     void *fault_addr = arch_get_bad_addr(signal, siginfo, context);
 
 #if defined(LISP_FEATURE_RESTORE_TLS_SEGMENT_REGISTER_FROM_CONTEXT)
-    FSHOW_SIGNAL((stderr, "/ TLS: restoring fs: %p in memory_fault_handler\n",
-                  *CONTEXT_ADDR_FROM_STEM(fs)));
     os_restore_tls_segment_register(context);
 #endif
-
-    FSHOW((stderr, "Memory fault at: %p, PC: %p\n", fault_addr, *os_context_pc_addr(context)));
 
 #ifdef LISP_FEATURE_SB_SAFEPOINT
     if (handle_safepoint_violation(context, fault_addr)) return;
 #endif
 
-    if (gencgc_handle_wp_violation(fault_addr)) return;
+#ifdef LISP_FEATURE_NONSTOP_FOREIGN_CALL
+    if (handle_foreign_call_trigger(context, fault_addr)) return;
+#endif
+
+#ifdef LISP_FEATURE_GENCGC
+    if (gencgc_handle_wp_violation(context, fault_addr)) return;
+#endif
 
     if (!handle_guard_page_triggered(context,fault_addr))
             lisp_memory_fault_error(context, fault_addr);
 }
 
-#if defined(LISP_FEATURE_MACH_EXCEPTION_HANDLER)
-void
-mach_error_memory_fault_handler(int signal, siginfo_t *siginfo,
-                                os_context_t *context) {
-    lose("Unhandled memory fault. Exiting.");
-}
-#endif
-
 void
 os_install_interrupt_handlers(void)
 {
-    SHOW("os_install_interrupt_handlers()/bsd-os/defined(GENCGC)");
     if (INSTALL_SIG_MEMORY_FAULT_HANDLER) {
-#if defined(LISP_FEATURE_MACH_EXCEPTION_HANDLER)
-    ll_install_handler(SIG_MEMORY_FAULT, mach_error_memory_fault_handler);
-#else
-    ll_install_handler(SIG_MEMORY_FAULT,
-#if defined(LISP_FEATURE_FREEBSD) && !defined(__GLIBC__)
-                                                 (__siginfohandler_t *)
-#endif
-                                                 memory_fault_handler);
-#endif
+    ll_install_handler(SIG_MEMORY_FAULT, memory_fault_handler);
 
 #ifdef LISP_FEATURE_DARWIN
     /* Unmapped pages get this and not SIGBUS. */
@@ -324,28 +322,6 @@ os_install_interrupt_handlers(void)
 
     }
 }
-
-#else /* Currently PPC/Darwin/Cheney only */
-
-static void
-sigsegv_handler(int signal, siginfo_t *info, os_context_t *context)
-{
-    os_vm_address_t addr;
-
-    addr = arch_get_bad_addr(signal, info, context);
-    if (cheneygc_handle_wp_violation(context, addr)) return;
-
-    if (!handle_guard_page_triggered(context, addr))
-            interrupt_handle_now(signal, info, context);
-}
-
-void
-os_install_interrupt_handlers(void)
-{
-    ll_install_handler(SIG_MEMORY_FAULT, sigsegv_handler);
-}
-
-#endif /* defined GENCGC */
 
 #ifdef __NetBSD__
 static void netbsd_init()
@@ -367,20 +343,6 @@ The system may fail to start.\n",
     }
     max_allocation_size = (os_vm_size_t)((rl.rlim_cur / 2) &
       ~(32 * 1024 * 1024));
-
-#ifdef LISP_FEATURE_X86
-    {
-        size_t len;
-        int sse;
-
-        len = sizeof(sse);
-        if (sysctlbyname("machdep.sse", &sse, &len,
-                         NULL, 0) == 0 && sse != 0) {
-            /* Use the SSE detector */
-            fast_bzero_pointer = fast_bzero_detect;
-        }
-     }
-#endif /* LISP_FEATURE_X86 */
 }
 
 /* Various routines in NetBSD's C library are compatibility wrappers
@@ -448,41 +410,21 @@ static void freebsd_init()
     else
         sig_memory_fault = SIGSEGV;
 #endif
-
-    /* Quote from sbcl-devel (NIIMI Satoshi): "Some OSes, like FreeBSD
-     * 4.x with GENERIC kernel, does not enable SSE support even on
-     * SSE capable CPUs". Detect this situation and skip the
-     * fast_bzero sse/base selection logic that's normally done in
-     * x86-assem.S.
-     */
-#ifdef LISP_FEATURE_X86
-    {
-        size_t len;
-        int instruction_sse;
-
-        len = sizeof(instruction_sse);
-        if (sysctlbyname("hw.instruction_sse", &instruction_sse, &len,
-                         NULL, 0) == 0 && instruction_sse != 0) {
-            /* Use the SSE detector */
-            fast_bzero_pointer = fast_bzero_detect;
-        }
-    }
-#endif /* LISP_FEATURE_X86 */
 }
 
 #ifdef LISP_FEATURE_SB_FUTEX
 int
-futex_wait(int *lock_word, long oldval, long sec, unsigned long usec)
+futex_wait(int *lock_word, int oldval, long sec, unsigned long usec)
 {
     struct timespec timeout;
     int ret;
 
     if (sec < 0)
-        ret = _umtx_op((void *)lock_word, UMTX_OP_WAIT, oldval, 0, 0);
+        ret = _umtx_op(lock_word, UMTX_OP_WAIT_UINT_PRIVATE, oldval, 0, 0);
     else {
         timeout.tv_sec = sec;
         timeout.tv_nsec = usec * 1000;
-        ret = _umtx_op((void *)lock_word, UMTX_OP_WAIT, oldval, (void*)sizeof timeout, &timeout);
+        ret = _umtx_op(lock_word, UMTX_OP_WAIT_UINT_PRIVATE, oldval, (void*)sizeof timeout, &timeout);
     }
     if (ret == 0) return 0;
     // technically we would not need to check any of the error codes if the lisp side
@@ -495,7 +437,7 @@ futex_wait(int *lock_word, long oldval, long sec, unsigned long usec)
 int
 futex_wake(int *lock_word, int n)
 {
-    return _umtx_op((void *)lock_word, UMTX_OP_WAKE, n, 0, 0);
+    return _umtx_op(lock_word, UMTX_OP_WAKE_PRIVATE, n, 0, 0);
 }
 #endif
 #endif /* __FreeBSD__ */
@@ -503,17 +445,6 @@ futex_wake(int *lock_word, int n)
 #ifdef __DragonFly__
 static void dragonfly_init()
 {
-#ifdef LISP_FEATURE_X86
-    size_t len;
-    int instruction_sse;
-
-    len = sizeof(instruction_sse);
-    if (sysctlbyname("hw.instruction_sse", &instruction_sse, &len,
-                     NULL, 0) == 0 && instruction_sse != 0) {
-        /* Use the SSE detector */
-        fast_bzero_pointer = fast_bzero_detect;
-    }
-#endif /* LISP_FEATURE_X86 */
 }
 
 
@@ -629,9 +560,6 @@ openbsd_init()
     mib[1] = CPU_OSFXSR;
     size = sizeof (openbsd_use_fxsave);
     sysctl(mib, 2, &openbsd_use_fxsave, &size, NULL, 0);
-    if (openbsd_use_fxsave)
-        /* Use the SSE detector */
-        fast_bzero_pointer = fast_bzero_detect;
 #endif
 
     /* OpenBSD, like NetBSD, counts mmap()ed space against the
@@ -658,7 +586,7 @@ The system may fail to start.\n",
      */
     getrlimit (RLIMIT_DATA, &rl);
     if (dynamic_space_size + READ_ONLY_SPACE_SIZE + STATIC_SPACE_SIZE +
-        LINKAGE_TABLE_SPACE_SIZE + wantfree > rl.rlim_cur)
+        ALIEN_LINKAGE_SPACE_SIZE + wantfree > rl.rlim_cur)
         fprintf (stderr,
                  "RUNTIME WARNING: data size resource limit may be too low,\n"
                  "  try decreasing the dynamic space size with --dynamic-space-size\n"
@@ -679,5 +607,26 @@ os_dlsym(void *handle, const char *symbol)
     void * volatile ret = dlsym(handle, symbol);
     return ret;
 }
+
+#ifdef LISP_FEATURE_SB_FUTEX
+int
+futex_wait(int *lock_word, int oldval, long sec, unsigned long usec)
+{
+    struct timespec timeout = {.tv_sec = sec, .tv_nsec = usec * 1000};
+    int ret = futex(lock_word, FUTEX_WAIT_PRIVATE, oldval, sec < 0 ? NULL : &timeout, NULL);
+
+    if (ret == 0) return 0;
+    if (errno == ETIMEDOUT) return 1;
+    if (errno == EINTR) return 2;
+    return -1;
+}
+
+int
+futex_wake(int *lock_word, int n)
+{
+    futex(lock_word, FUTEX_WAKE_PRIVATE, n, NULL, NULL);
+    return 0;
+}
+#endif
 
 #endif

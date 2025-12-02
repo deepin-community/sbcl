@@ -14,7 +14,12 @@
        (load-symbol y val))
       (character
        (inst li y (logior (ash (char-code val) n-widetag-bits)
-                          character-widetag))))))
+                          character-widetag)))
+      (structure-object
+       (if (eq val sb-lockless:+tail+)
+           (inst add y null-tn (- lockfree-list-tail-value-offset
+                                  nil-value-offset))
+           (bug "immediate structure-object ~S" val))))))
 
 (define-move-fun (load-number 1) (vop x y)
   ((zero immediate)
@@ -140,13 +145,12 @@
   (:note "integer to untagged word coercion")
   (:temporary (:scs (non-descriptor-reg)) temp)
   (:generator 3
-    (let ((done (gen-label)))
-      (inst and temp x fixnum-tag-mask)
-      (inst beq temp done)
-      (inst sra y x n-fixnum-tag-bits)
+    (inst and temp x fixnum-tag-mask)
+    (inst beq temp done)
+    (inst sra y x n-fixnum-tag-bits)
 
-      (loadw y x bignum-digits-offset other-pointer-lowtag)
-      (emit-label done))))
+    (loadw y x bignum-digits-offset other-pointer-lowtag)
+    DONE))
 ;;;
 (define-move-vop move-to-word/integer :move
   (descriptor-reg) (signed-reg unsigned-reg))
@@ -184,7 +188,8 @@
     (inst sll y x n-fixnum-tag-bits)
 
     (with-fixed-allocation
-        (y pa-flag temp bignum-widetag (1+ bignum-digits-offset) nil)
+        (y pa-flag temp bignum-widetag (1+ bignum-digits-offset))
+      ;; FIXME: could this store be moved forward into the branch delay slot?
       (storew x y bignum-digits-offset other-pointer-lowtag))
     (inst b done)
     (inst nop)
@@ -249,9 +254,9 @@
     (inst beq temp done)
     (inst sll y x n-fixnum-tag-bits)
 
-    (pseudo-atomic
-      (pa-flag :extra (pad-data-block (+ bignum-digits-offset 2)))
-      (inst or y alloc-tn other-pointer-lowtag)
+    (pseudo-atomic (pa-flag)
+      (allocation bignum-widetag (pad-data-block (+ bignum-digits-offset 2)) y
+        other-pointer-lowtag `(,pa-flag ,temp))
       (inst slt temp x zero-tn)
       (inst sll temp n-widetag-bits)
       (inst addu temp (logior (ash 1 n-widetag-bits) bignum-widetag))

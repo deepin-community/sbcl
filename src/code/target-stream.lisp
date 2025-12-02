@@ -26,7 +26,7 @@
 ;;; SKIPPED-CHAR-FORM - the form to execute when skipping a character
 ;;; EOF-DETECTED-FORM - the form to execute when EOF has been detected
 ;;;                     (this will default to EOF-RESULT)
-(sb-xc:defmacro generalized-peeking-mechanism
+(defmacro generalized-peeking-mechanism
     (peek-type eof-value char-var read-form read-eof unread-form
      &optional (skipped-char-form nil) (eof-detected-form nil))
   `(let ((,char-var ,read-form))
@@ -47,10 +47,11 @@
                          ,char-var)))
              ,skipped-char-form))
           ((eql ,peek-type t)
-           (do ((,char-var ,char-var ,read-form))
+           (do ((.readtable. *readtable*)
+                (,char-var ,char-var ,read-form))
                ((or (eql ,char-var ,read-eof)
                     ;; whitespace[2]p will type-check for us
-                    (not (whitespace[2]p ,char-var)))
+                    (not (whitespace[2]p ,char-var .readtable.)))
                 (cond ((eql ,char-var ,read-eof)
                        ,(if eof-detected-form
                             eof-detected-form
@@ -71,14 +72,87 @@
 (declaim (inline ansi-stream-peek-char))
 (defun ansi-stream-peek-char (peek-type stream eof-error-p eof-value
                               recursive-p)
-  (cond ((typep stream 'echo-stream)
+  (cond ((ansi-stream-cin-buffer stream)
+         (prepare-for-fast-read-char stream
+           (declare (ignore %frc-method%))
+           (case peek-type
+             ((nil)
+              (block nil
+                (if (= %frc-index% +ansi-stream-in-buffer-length+)
+                    (let ((index-or-nil (fast-read-char-refill %frc-stream% eof-error-p)))
+                      (when (null index-or-nil)
+                        (return eof-value))
+                      (aref %frc-buffer% (truly-the (mod #.+ansi-stream-in-buffer-length+)
+                                                    index-or-nil)))
+                    (aref %frc-buffer% %frc-index%))))
+             ((t)
+              (let ((rt *readtable*))
+                (prog1
+                    (loop
+                     (when (= %frc-index% +ansi-stream-in-buffer-length+)
+                       (let ((index-or-nil (fast-read-char-refill %frc-stream% eof-error-p)))
+                         (when (null index-or-nil)
+                           (return eof-value))
+                         (setf %frc-index% (truly-the (mod #.+ansi-stream-in-buffer-length+)
+                                                      index-or-nil))))
+                     (let ((char (aref %frc-buffer% %frc-index%)))
+                       (if (whitespace[2]p char rt)
+                           (incf %frc-index%)
+                           (return char))))
+                  (done-with-fast-read-char))))
+             (t
+              (prog1
+                  (loop
+                   (when (= %frc-index% +ansi-stream-in-buffer-length+)
+                     (let ((index-or-nil (fast-read-char-refill %frc-stream% eof-error-p)))
+                       (when (null index-or-nil)
+                         (return eof-value))
+                       (setf %frc-index% (truly-the (mod #.+ansi-stream-in-buffer-length+)
+                                                    index-or-nil))))
+                   (let ((char (aref %frc-buffer% %frc-index%)))
+                     (if (char= char peek-type)
+                         (return char)
+                         (incf %frc-index%))))
+                (done-with-fast-read-char))))))
+        ((typep stream 'string-input-stream)
+         (let ((limit (string-input-stream-limit stream))
+               (string (string-input-stream-string stream))
+               (index (string-input-stream-index stream)))
+           (declare (optimize (sb-c:insert-array-bounds-checks 0)))
+           (case peek-type
+             ((nil)
+              (if (>= index limit)
+                  (eof-or-lose stream eof-error-p eof-value)
+                  (char string index)))
+             ((t)
+              (let ((rt *readtable*))
+                (prog1
+                    (loop
+                     (when (>= index limit)
+                       (return (eof-or-lose stream eof-error-p eof-value)))
+                     (let ((char (char string index)))
+                       (if (whitespace[2]p char rt)
+                           (incf index)
+                           (return char))))
+                  (setf (string-input-stream-index stream) index))))
+             (t
+              (prog1
+                  (loop
+                   (when (>= index limit)
+                     (return (eof-or-lose stream eof-error-p eof-value)))
+                   (let ((char (char string index)))
+                     (if (char= char peek-type)
+                         (return char)
+                         (incf index))))
+                (setf (string-input-stream-index stream) index))))))
+        ((typep stream 'echo-stream)
          (echo-stream-peek-char stream peek-type eof-error-p eof-value))
         (t
          (generalized-peeking-mechanism
-          peek-type eof-value char
-          (ansi-stream-read-char stream eof-error-p :eof recursive-p)
-          :eof
-          (ansi-stream-unread-char char stream)))))
+             peek-type eof-value char
+             (ansi-stream-read-char stream eof-error-p :eof recursive-p)
+             :eof
+             (ansi-stream-unread-char char stream)))))
 
 (defun peek-char (&optional (peek-type nil)
                             (stream *standard-input*)
@@ -86,7 +160,7 @@
                             eof-value
                             recursive-p)
   (declare (type (or character boolean) peek-type) (explicit-check))
-  (stream-api-dispatch (stream (in-stream-from-designator stream))
+  (stream-api-dispatch (stream :input)
     :simple (let ((char (s-%peek-char stream peek-type eof-error-p eof-value)))
               ;; simple-streams -%PEEK-CHAR always ignored RECURSIVE-P
               ;; so I removed it from the call.
@@ -111,16 +185,28 @@
               char
               (the character char)))))
 
+;; This should be identical to TWO-WAY-MISC except for :UNREAD, I
+;; think.
 (defun echo-misc (stream operation arg1)
   (let* ((in (two-way-stream-input-stream stream))
-         (out (two-way-stream-output-stream stream)))
+         (out (two-way-stream-output-stream stream))
+         (in-ansi-stream-p (ansi-stream-p in))
+         (out-ansi-stream-p (ansi-stream-p out)))
     (stream-misc-case (operation)
+      ;; Input operations forward to IN.
       (:listen
-       (if (ansi-stream-p in)
-           (%ansi-stream-listen in)
+       (if in-ansi-stream-p
+           (call-ansi-stream-misc in operation arg1)
            (stream-misc-dispatch in operation arg1)))
       (:unread (setf (echo-stream-unread-stuff stream) t)
                (unread-char arg1 in))
+      (:clear-input (clear-input in))
+      ;; Output operations forward to OUT
+      ((:finish-output :force-output :clear-output
+        :charpos :line-length)
+       (if out-ansi-stream-p
+           (call-ansi-stream-misc out operation arg1)
+           (stream-misc-dispatch out operation arg1)))
       (:element-type
        (let ((in-type (stream-element-type in))
              (out-type (stream-element-type out)))
@@ -135,10 +221,10 @@
       (:close
        (set-closed-flame stream))
       (t
-       (or (if (ansi-stream-p in)
+       (or (if in-ansi-stream-p
                (call-ansi-stream-misc in operation arg1)
                (stream-misc-dispatch in operation arg1))
-           (if (ansi-stream-p out)
+           (if out-ansi-stream-p
                (call-ansi-stream-misc out operation arg1)
                (stream-misc-dispatch out operation arg1)))))))
 
@@ -162,7 +248,7 @@
          (flet ((outfn (c)
                   (unless unread-p
                     (if (ansi-stream-p out)
-                        (funcall (ansi-stream-out out) out c)
+                        (funcall (ansi-stream-cout out) out c)
                         ;; gray-stream
                         (stream-write-char out c))))
                 (infn ()

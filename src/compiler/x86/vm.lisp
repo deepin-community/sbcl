@@ -29,12 +29,7 @@
                     ;; EVAL-WHEN is necessary because stuff like #.EAX-OFFSET
                     ;; (in the same file) depends on compile-time evaluation
                     ;; of the DEFCONSTANT. -- AL 20010224
-                (defconstant ,(symbolicate name "-OFFSET") ,offset)))
-           (defregset (name &rest regs)
-             `(defglobal ,name
-                  (list ,@(mapcar (lambda (name)
-                                    (symbolicate name "-OFFSET"))
-                                  regs)))))
+                (defconstant ,(symbolicate name "-OFFSET") ,offset))))
 
   ;; byte registers
   ;;
@@ -89,8 +84,7 @@
   ;; the number of arguments/return values passed in registers
   (defconstant  register-arg-count 3)
   ;; names and offsets for registers used to pass arguments
-  (eval-when (:compile-toplevel :load-toplevel :execute)
-    (defparameter *register-arg-names* '(edx edi esi)))
+  (defconstant-eqx register-arg-names '(edx edi esi) #'equal)
   (defregset    *register-arg-offsets* edx edi esi))
 
 ;;;; SB definitions
@@ -114,9 +108,7 @@
 
 (define-storage-base stack :unbounded :size 3 :size-increment 1)
 (define-storage-base constant :non-packed)
-(define-storage-base immediate-constant :non-packed)
-(define-storage-base noise :unbounded :size 2)
-)
+(define-storage-base immediate-constant :non-packed))
 
 ;;;; SC definitions
 
@@ -152,12 +144,6 @@
   (complex-double-stack stack :element-size 4)  ; complex-double-floats
   #+long-float
   (complex-long-stack stack :element-size 6)    ; complex-long-floats
-
-  ;;
-  ;; magic SCs
-  ;;
-
-  (ignore-me noise)
 
   ;;
   ;; things that can go in the integer registers
@@ -319,9 +305,7 @@
                  (let ((tn-name (symbolicate reg-name "-TN"))
                        (offset-name (symbolicate reg-name "-OFFSET")))
                    (forms `(defglobal ,tn-name
-                             (make-random-tn :kind :normal
-                                             :sc (sc-or-lose ',sc-name)
-                                             :offset ,offset-name))))))))
+                             (make-random-tn (sc-or-lose ',sc-name) ,offset-name))))))))
 
   (def-misc-reg-tns unsigned-reg eax ebx ecx edx ebp esp edi esi)
   (def-misc-reg-tns word-reg ax bx cx dx bp sp di si)
@@ -329,18 +313,16 @@
   (def-misc-reg-tns single-reg fr0 fr1 fr2 fr3 fr4 fr5 fr6 fr7))
 
 ;;; TNs for registers used to pass arguments
-(defparameter *register-arg-tns*
+(define-load-time-global *register-arg-tns*
   (mapcar (lambda (register-arg-name)
             (symbol-value (symbolicate register-arg-name "-TN")))
-          *register-arg-names*))
+          register-arg-names))
 
 ;;; FIXME: doesn't seem to be used in SBCL
 #|
 ;;; added by pw
 (defparameter fp-constant-tn
-  (make-random-tn :kind :normal
-                  :sc (sc-or-lose 'fp-constant)
-                  :offset 31))          ; Offset doesn't get used.
+  (make-random-tn (sc-or-lose 'fp-constant) 31))          ; Offset doesn't get used.
 |#
 
 ;;; If value can be represented as an immediate constant, then return
@@ -355,11 +337,11 @@
        immediate-sc-number))
     (single-float
        (case value
-         (($0f0 $1f0) fp-constant-sc-number)
+         ((0f0 1f0) fp-constant-sc-number)
          (t fp-single-immediate-sc-number)))
     (double-float
        (case value
-         (($0d0 $1d0) fp-constant-sc-number)
+         ((0d0 1d0) fp-constant-sc-number)
          (t fp-double-immediate-sc-number)))
     #+long-float
     (long-float
@@ -369,7 +351,10 @@
                  (eql value (log 2.718281828459045235360287471352662L0 2l0))
                  (eql value (log 2l0 10l0))
                  (eql value (log 2l0 2.718281828459045235360287471352662L0)))
-         fp-constant-sc-number))))
+         fp-constant-sc-number))
+    (structure-object
+     (when (eq value sb-lockless:+tail+)
+       immediate-sc-number))))
 
 (defun boxed-immediate-sc-p (sc)
   (eql sc immediate-sc-number))
@@ -385,7 +370,11 @@
           (integer (fixnumize val))
           (symbol (+ nil-value (static-symbol-offset val)))
           (character (logior (ash (char-code val) n-widetag-bits)
-                             character-widetag))))
+                             character-widetag))
+          (structure-object
+           (if (eq val sb-lockless:+tail+)
+               (+ static-space-start lockfree-list-tail-value-offset)
+               (bug "immediate structure-object ~S" val)))))
       tn))
 
 ;;;; miscellaneous function call parameters
@@ -422,7 +411,7 @@
                                         ; related to signal context stuff
 
 ;;; This is used by the debugger.
-(defconstant single-value-return-byte-offset 2)
+(defconstant single-value-return-byte-offset 0)
 
 ;;; This function is called by debug output routines that want a pretty name
 ;;; for a TN's location. It returns a thing that can be printed with PRINC.
@@ -447,34 +436,3 @@
       (constant (format nil "Const~D" offset))
       (immediate-constant "Immed")
       (noise (symbol-name (sc-name sc))))))
-
-(defun combination-implementation-style (node)
-  (declare (type sb-c::combination node))
-  (flet ((valid-funtype (args result)
-           (sb-c::valid-fun-use node
-                                (sb-c::specifier-type
-                                 `(function ,args ,result)))))
-    (case (sb-c::combination-fun-source-name node)
-      (logtest
-       (cond
-         ((valid-funtype '(fixnum fixnum) '*)
-          (values :maybe nil))
-         ((valid-funtype '((signed-byte 32) (signed-byte 32)) '*)
-          (values :maybe nil))
-         ((valid-funtype '((unsigned-byte 32) (unsigned-byte 32)) '*)
-          (values :maybe nil))
-         (t (values :default nil))))
-      (logbitp
-       (cond
-         ((and (valid-funtype '((integer 0 29) fixnum) '*)
-               (sb-c:constant-lvar-p (first (sb-c::basic-combination-args node))))
-          (values :transform '(lambda (index integer)
-                               (%logbitp integer index))))
-         ((valid-funtype '((integer 0 31) (signed-byte 32)) '*)
-          (values :transform '(lambda (index integer)
-                               (%logbitp integer index))))
-         ((valid-funtype '((integer 0 31) (unsigned-byte 32)) '*)
-          (values :transform '(lambda (index integer)
-                               (%logbitp integer index))))
-         (t (values :default nil))))
-      (t (values :default nil)))))

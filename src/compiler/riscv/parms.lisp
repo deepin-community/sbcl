@@ -16,22 +16,19 @@
 (defconstant sb-assem:assem-scheduler-p nil)
 (defconstant sb-assem:+inst-alignment-bytes+ 4) ; FIXME: C
 
-(defconstant +backend-fasl-file-implementation+ #-64-bit :rv32g #+64-bit :rv64g)
+(defconstant sb-fasl:+backend-fasl-file-implementation+ #-64-bit :rv32g #+64-bit :rv64g)
 
 (defconstant +backend-page-bytes+ #+linux 4096 #+netbsd 8192)
 
 ;;; The size in bytes of GENCGC cards, i.e. the granularity at which
 ;;; writes to old generations are logged.  With mprotect-based write
 ;;; barriers, this must be a multiple of the OS page size.
-(defconstant gencgc-card-bytes +backend-page-bytes+)
+(defconstant gencgc-page-bytes +backend-page-bytes+)
 ;;; The minimum size of new allocation regions.  While it doesn't
 ;;; currently make a lot of sense to have a card size lower than
 ;;; the alloc granularity, it will, once we are smarter about finding
 ;;; the start of objects.
 (defconstant gencgc-alloc-granularity 0)
-;;; The minimum size at which we release address ranges to the OS.
-;;; This must be a multiple of the OS page size.
-(defconstant gencgc-release-granularity +backend-page-bytes+)
 
 ;;; number of bits per word where a word holds one lisp descriptor
 (defconstant n-word-bits #-64-bit 32 #+64-bit 64)
@@ -61,32 +58,13 @@
 
 ;;;; Where to put the different spaces.
 
-;;; On non-gencgc we need large dynamic and static spaces for PURIFY
-#-gencgc
-(progn
-  (defconstant read-only-space-start #x04000000)
-  (defconstant read-only-space-end   #x07ff8000)
-  (defconstant static-space-start    #x08000000)
-  (defconstant static-space-end      #x097fff00)
+(gc-space-setup #x04000000 :dynamic-space-start #x4f000000)
 
-  (defconstant linkage-table-space-start #x0a000000)
-  (defconstant linkage-table-space-end   #x0b000000))
+(defconstant alien-linkage-table-entry-size #-64-bit 8 #+64-bit 24)
+(defconstant alien-linkage-table-growth-direction :down)
+(setq *alien-linkage-table-predefined-entries* '(("alloc" nil)
+                                                 ("alloc_list" nil)))
 
-;;; While on gencgc we don't.
-#+gencgc
-(!gencgc-space-setup #x04000000 :dynamic-space-start #x4f000000)
-
-(defconstant linkage-table-entry-size #-64-bit 4 #+64-bit 8) ; N-WORD-BYTES (not defined yet)
-(defconstant linkage-table-growth-direction :down)
-(setq *linkage-space-predefined-entries* '(#+gencgc("alloc" nil)
-                                           #+gencgc("alloc_list" nil)))
-
-#+(or linux netbsd)
-(progn
-  #-gencgc
-  (progn
-    (defparameter dynamic-0-space-start #x4f000000)
-    (defparameter dynamic-0-space-end   #x66fff000)))
 
 ;;;; other miscellaneous constants
 
@@ -116,33 +94,16 @@
 ;;; can be loaded directly out of them by indirecting relative to NIL.
 ;;;
 (defconstant-eqx +static-symbols+
- #.`#(,@+common-static-symbols+
-      *allocation-pointer*
-      #-sb-thread
-      ,@'(*binding-stack-pointer*
-          ;; interrupt handling
-          *pseudo-atomic-atomic*
-          *pseudo-atomic-interrupted*)
-      ,@*runtime-asm-routines*)
+ `#(,@+common-static-symbols+
+    #-sb-thread
+    ,@'(*binding-stack-pointer*
+        ;; interrupt handling
+        *pseudo-atomic-atomic*
+        *pseudo-atomic-interrupted*)
+    ,@*runtime-asm-routines*)
   #'equalp)
 
-(defconstant-eqx +static-fdefns+
-  #(two-arg-+
-    two-arg--
-    two-arg-*
-    two-arg-/
-    two-arg-<
-    two-arg->
-    two-arg-=
-    sb-kernel:%negate
-    eql
-    two-arg-and
-    two-arg-ior
-    two-arg-xor
-    two-arg-gcd
-    two-arg-lcm
-    two-arg-eqv)
-  #'equalp)
+(defconstant-eqx +static-fdefns+ `#(,@common-static-fdefns) #'equalp)
 
 
 ;;;; Assembler parameters:

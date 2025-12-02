@@ -190,12 +190,7 @@
     (assert (eq (find-package :cl) (test "cl:no-such-sym")))))
 
 ;; lp# 1012335 - also tested by 'READ-BOX above
-(handler-bind ((condition #'continue))
-    (defun nil (stream char) (declare (ignore stream char)) 'foo!))
 (with-test (:name :set-macro-char-lazy-coerce-to-fun)
-  (set-macro-character #\$ #'nil) ; #'NIL is a function
-  (assert (eq (read-from-string "$") 'foo!))
-
   (make-dispatch-macro-character #\$)
   (assert (set-dispatch-macro-character #\$ #\( 'read-metavar))
   (assert (eq (get-dispatch-macro-character #\$ #\() 'read-metavar))
@@ -342,4 +337,105 @@
       (assert (eq t (set-dispatch-macro-character #\# #\~ fun nil)))
       (assert (eq fun (get-dispatch-macro-character #\# #\~ nil))))))
 
-;;; success
+(defclass junk () (a))
+(defstruct foo a b)
+(with-test (:name :sharp=-visit-unbound-slot-no-crash)
+  (unwind-protect
+       (progn
+         (sb-int:encapsulate 'sb-int:add-to-xset 'wrap
+          (compile nil
+                   '(lambda (realfun elt xset)
+                     (cond ((sb-int:unbound-marker-p elt) (error "oh no"))
+                           (t (funcall realfun elt xset))))))
+         (read-from-string "#1=#S(FOO :A #.(MAKE-INSTANCE 'junk))"))
+    (sb-int:unencapsulate 'sb-int:add-to-xset 'wrap)))
+
+(defstruct node
+  (next nil :type (or null node))
+  (listnext nil :type (or null (cons node)))
+  (conscons nil :type (or null (cons node cons)))
+  (label 1 :type sb-vm:word))
+
+(with-test (:name (:sharp=-typed-slot :direct :no-error))
+  (assert (equalp (read-from-string "#S(NODE :NEXT NIL)")
+                  (make-node :next nil)))
+  (assert (equalp (read-from-string "#S(NODE :NEXT #S(NODE :NEXT NIL))")
+                  (make-node :next (make-node :next nil)))))
+(with-test (:name (:sharp=-typed-slot :direct error))
+  (assert-error (read-from-string "#S(NODE :NEXT 1)"))
+  (assert-error (read-from-string "#S(NODE :NEXT (1))"))
+  (assert-error (read-from-string "#S(NODE :NEXT (#S(NODE :NEXT NIL)))"))
+  (assert-error (read-from-string "#S(NODE :NEXT #(#S(NODE :NEXT NIL)))"))
+  (assert-error (read-from-string "#S(NODE :NEXT #S(NODE :NEXT 1))")))
+
+(with-test (:name (:sharp=-typed-slot :circular :no-error))
+  (let ((circ (read-from-string "#1=#S(NODE :NEXT #1#)")))
+    (assert (eql (node-next circ) circ))))
+(with-test (:name (:sharp=-typed-slot :circular error))
+  (assert-error (read-from-string "#1=#S(NODE :NEXT (#1#))"))
+  (assert-error (read-from-string "#1=#S(NODE :NEXT #(#1#))")))
+
+(with-test (:name (:sharp=-cons-typed-slot :direct :no-error))
+  (assert (equalp (read-from-string "#S(NODE :LISTNEXT NIL)")
+                  (make-node :listnext nil)))
+  (assert (equalp (read-from-string "#S(NODE :LISTNEXT (#S(NODE :LISTNEXT NIL)))")
+                  (make-node :listnext (list (make-node :listnext nil))))))
+(with-test (:name (:sharp=-cons-typed-slot :direct error))
+  (assert-error (read-from-string "#S(NODE :LISTNEXT 1)"))
+  (assert-error (read-from-string "#S(NODE :LISTNEXT (1))"))
+  (assert-error (read-from-string "#S(NODE :LISTNEXT #S(NODE :LISTNEXT NIL))"))
+  (assert-error (read-from-string "#S(NODE :LISTNEXT #(#S(NODE :LISTNEXT NIL)))"))
+  (assert-error (read-from-string "#S(NODE :LISTNEXT (#S(NODE :LISTNEXT 1)))")))
+
+(with-test (:name (:sharp=-cons-typed-slot :circular :no-error))
+  (let ((circ (read-from-string "#1=#S(NODE :LISTNEXT (#1#))")))
+    (assert (eql (car (node-listnext circ)) circ))))
+(with-test (:name (:sharp=-cons-typed-slot :circular error))
+  (assert-error (read-from-string "#1=#S(NODE :LISTNEXT #1#)"))
+  (assert-error (read-from-string "#1=#S(NODE :LISTNEXT #(#1#))")))
+
+(with-test (:name (:sharp=-cons-typed-cons-slot :direct :no-error))
+  (assert (equalp (read-from-string "#S(NODE :CONSCONS (#S(NODE) . (3 . 4)))")
+                  (make-node :conscons (cons (make-node) (cons 3 4))))))
+(with-test (:name (:sharp=-cons-typed-cons-slot :direct error))
+  (assert-error (read-from-string "#S(NODE :CONSCONS 1)"))
+  (assert-error (read-from-string "#S(NODE :CONSCONS (1))")))
+
+(with-test (:name (:sharp=-cons-typed-cons-slot :circular :no-error))
+  (let* ((circ (car (read-from-string "#1=(#S(NODE :CONSCONS #1#) . #1#)")))
+         (conscons (node-conscons circ)))
+    (assert (eql (car conscons) circ))
+    (assert (eql (cadr conscons) circ))))
+
+(with-test (:name (:sharp=-raw-typed-slot :direct :no-error))
+  (let ((node (read-from-string "#1=#S(NODE :LABEL 3)")))
+    (assert (eql (node-label node) 3))))
+(with-test (:name (:sharp=-raw-typed-slot :circular error))
+  (assert-error (read-from-string "#1=#S(NODE :LABEL #1#)")))
+
+(with-test (:name (:sharp= equalp hash-table :key) :fails-on :sbcl)
+  (let* ((*print-circle* t)
+         (string (write-to-string
+                  (let ((h (make-hash-table :size 10 :test 'equalp)))
+                    (setf (gethash 20 h) 30)
+                    (setf (gethash h h) 10)
+                    h)
+                  :readably t))
+         (table (read-from-string string)))
+    (assert (eql (gethash 20 table) 30))
+    (assert (eql (gethash table table) 10))))
+
+(with-test (:name (:sharp= make-array :displaced-to) :fails-on :sbcl)
+  (let* ((array (read-from-string "#1=#.(make-array 3 :displaced-to (make-array 5 :initial-element '#1#))"))
+         (displacement (array-displacement array))
+         (*print-circle* t)
+         (*print-array* nil))
+    (dotimes (i 3)
+      (assert (eql (aref array i) array)))
+    (dotimes (i 5)
+      (assert (eql (aref displacement i) array)))))
+
+(with-test (:name (:sharp= :circular-mismatch))
+  (assert-error
+      (read-from-string "#S(NODE :NEXT (#1=#S(NODE :NEXT #1#)))")
+      type-error))

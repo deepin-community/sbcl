@@ -17,6 +17,9 @@
 #include <sys/time.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#ifdef LISP_FEATURE_SB_THREAD
+#include <OS.h>
+#endif
 
 // Needs to be defined before including target-arch.h
 typedef caddr_t os_vm_address_t;
@@ -26,11 +29,6 @@ typedef int os_vm_prot_t;
 
 #include "target-arch-os.h"
 #include "target-arch.h"
-#define linuxversion(a, b, c) (((a)<<16)+((b)<<8)+(c))
-
-#define OS_VM_PROT_READ    PROT_READ
-#define OS_VM_PROT_WRITE   PROT_WRITE
-#define OS_VM_PROT_EXECUTE PROT_EXEC
 
 #define SIG_MEMORY_FAULT SIGSEGV
 

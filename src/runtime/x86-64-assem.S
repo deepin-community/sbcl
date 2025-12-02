@@ -18,15 +18,11 @@
 .section .note.GNU-stack,"",%progbits
 #endif
 
-#include "genesis/config.h"
+#include "genesis/sbcl.h"
 #include "validate.h"
-#include "sbcl.h"
 #include "genesis/closure.h"
-#include "genesis/fdefn.h"
 #include "genesis/static-symbols.h"
 #include "genesis/thread.h"
-#include "genesis/ratio.h"
-#include "genesis/complex.h"
 
 /* Minimize conditionalization for different OS naming schemes. */
 #if defined __linux__  || defined LISP_FEATURE_HAIKU || defined LISP_FEATURE_FREEBSD || \
@@ -39,26 +35,17 @@
 // Produce position-independent code.
 // macOS does not like the general way we do this, so do something different.
 #if defined(LISP_FEATURE_DARWIN) || defined(LISP_FEATURE_WIN32)
-#define PIC_CALL(x) x
 #define LOAD_PIC_VAR(x,dest) mov GNAME(x)(%rip), dest
 #else
-#define PIC_CALL(x) x@PLT
 #define LOAD_PIC_VAR(x,dest) mov GNAME(x)@GOTPCREL(%rip), dest ; mov (dest), dest
 #endif
 
 /* Get the right type of alignment. Linux, FreeBSD and OpenBSD
  * want alignment in bytes. */
 #if defined(__linux__) || defined(LISP_FEATURE_FREEBSD) || defined(__OpenBSD__) || defined __NetBSD__ || defined(__sun) || defined _WIN64 || defined(__DragonFly__)
-#define align_4byte	4
-#define align_8byte	8
 #define align_16byte	16
-#define align_32byte	32
-#define align_page	32768
 #else
-#define	align_4byte	2
-#define	align_8byte	3
 #define	align_16byte	4
-#define	align_page	15
 #endif
 
 /*
@@ -83,6 +70,9 @@
 #endif
 
 #define THREAD_BASE_REG %r13
+#define reg_NULL %r12
+
+#define THREAD_SAVED_CSP_OFFSET (- N_WORD_BYTES)
 
 #ifdef LISP_FEATURE_WIN32
 #define CARG1 %rcx
@@ -124,16 +114,26 @@ GNAME(funcall1_switching_stack):
 #endif
 
 	.text
-	.globl  GNAME(call_into_lisp_first_time)
-	TYPE(GNAME(call_into_lisp_first_time))
+	.globl  GNAME(call_into_lisp_first_time_)
+	TYPE(GNAME(call_into_lisp_first_time_))
+
+/* macros to save and restore the callee-saved regs which are
+ * potentially clobbered by Lisp, but which are guaranteed to be
+ * preserved across functions calls in accordance with the ABI.
+ * I do not understand why this is adequate for Windows calling
+ * convention, which additionally specifies RDI and RSI as preserved.
+ */
+#define PUSH_C_NONVOLATILE_REGS \
+ push %rbx ; push %r12 ; push %r13 ; push %r14 ; push %r15
+#define POP_C_NONVOLATILE_REGS \
+ pop %r15 ; pop %r14 ; pop %r13 ; pop %r12 ; pop %rbx
 
 /* We don't worry too much about saving registers
  * here, because we never expect to return from the initial call to lisp
  * anyway */
 
 	.align	align_16byte,0x90
-	.cfi_startproc
-GNAME(call_into_lisp_first_time):
+GNAME(call_into_lisp_first_time_):
 GNAME(lspmain): # so much easier to type 'b lspmain' in gdb
 	push	%rbp		# Save old frame pointer.
 	mov	%rsp,%rbp	# Establish new frame.
@@ -142,8 +142,8 @@ GNAME(lspmain): # so much easier to type 'b lspmain' in gdb
 	jmp     Lstack
 
 	.text
-	.globl  GNAME(call_into_lisp)
-	TYPE(GNAME(call_into_lisp))
+	.globl  GNAME(call_into_lisp_)
+	TYPE(GNAME(call_into_lisp_))
 
 /*
  * amd64 calling convention: C expects that
@@ -155,7 +155,7 @@ GNAME(lspmain): # so much easier to type 'b lspmain' in gdb
 # define SUPPORT_FOMIT_FRAME_POINTER
 #endif
 	.align	align_16byte,0x90
-GNAME(call_into_lisp):
+GNAME(call_into_lisp_):
 #ifdef SUPPORT_FOMIT_FRAME_POINTER
 	mov	%rbp,%rax
 #endif
@@ -168,30 +168,12 @@ Lstack:
 	push	%r15
 	mov	%rax,%r15
 #endif
-	.cfi_def_cfa rbp, 16
-	.cfi_offset  rbp, -16
 	/* FIXME x86 saves FPU state here */
-	push	%rbx  	# these regs are callee-saved according to C
-	push	%r12	# so must be preserved and restored when
-	push	%r13    # the lisp function returns
-	push	%r14    #
-	push	%r15    #
+	PUSH_C_NONVOLATILE_REGS
 	push	%rdi	# args from C
 	push	%rsi	#
 	push	%rdx	#
-#if defined LISP_FEATURE_SB_THREAD && !defined LISP_FEATURE_GS_SEGMENT_THREAD
-#ifdef LISP_FEATURE_GCC_TLS
-	movq	GNAME(current_thread)@GOTTPOFF(%rip), THREAD_BASE_REG
-	movq	%fs:(THREAD_BASE_REG), THREAD_BASE_REG
-#elif defined LISP_FEATURE_WIN32
-	call    PIC_CALL(GNAME(read_current_thread))
-	mov	%rax, THREAD_BASE_REG
-#else
-	LOAD_PIC_VAR(specials, %rdi)
-	call    PIC_CALL(GNAME(pthread_getspecific))
-	mov	%rax, THREAD_BASE_REG
-#endif
-#endif
+	movq	%rcx, THREAD_BASE_REG
 	pop	%rcx	# num args
 	pop	%rbx	# arg vector
 	pop	%rax	# function ptr/lexenv
@@ -211,19 +193,23 @@ Ltwo:	mov	8(%rbx),%rdi	# arg1
 Lone:	mov	0(%rbx),%rdx	# arg0
 Lzero:
 	shl	$(N_FIXNUM_TAG_BITS),%rcx	# (fixnumize num-args)
-	/* Registers rax, rcx, rdx, rdi, and rsi are now live. */
-	xor	%rbx,%rbx	# available
+	
+#ifdef LISP_FEATURE_NONSTOP_FOREIGN_CALL
+	mov     THREAD_SAVED_CSP_OFFSET(THREAD_BASE_REG), %r8
+        push    %r8
+        test    %r8, %r8
+        je      1f
+	movq     $0, THREAD_SAVED_CSP_OFFSET(THREAD_BASE_REG)
+1:
+#endif
 
 	/* Alloc new frame. */
 	push	%rbp            # Dummy for return address
 	push	%rbp		# fp in save location S1
 	mov	%rsp,%rbp	# The current sp marks start of new frame.
-	# Inform unwinder that the new frame has not been entered yet.
-	# The CFA is what it was (old RBP+16) before the preceding mov.
-	# This sequence encodes DW_CFA_def_cfa_expression
-	# DW_OP_breg6 (rbp): 0 / DW_OP_deref / DW_OP_lit16 / DW_OP_plus
-	.cfi_escape 0x0f, 5, 0x76, 0, 6, 0x40, 0x22
 Lcall:
+	LOAD_PIC_VAR(gc_card_mark, reg_NULL)
+	sub	NIL_CARDTABLE_DISP, reg_NULL
 	call	*CLOSURE_FUN_OFFSET(%rax)
 
 	/* If the function returned multiple values, the carry flag will be set.
@@ -232,12 +218,15 @@ Lcall:
 	mov	%rbx, %rsp
 LsingleValue:
 
-/* Restore C regs */
-	pop	%r15
-	pop	%r14
-	pop	%r13
-	pop	%r12
-	pop	%rbx
+#ifdef LISP_FEATURE_NONSTOP_FOREIGN_CALL
+        pop    %r8
+        test   %r8, %r8
+        je     1f
+	movq   %r8, THREAD_SAVED_CSP_OFFSET(THREAD_BASE_REG)
+1:
+#endif
+
+	POP_C_NONVOLATILE_REGS
 
 /* FIXME Restore the NPX state. */
 
@@ -250,8 +239,7 @@ LsingleValue:
 	leave
 #endif
 	ret
-	.cfi_endproc
-	SIZE(GNAME(call_into_lisp))
+	SIZE(GNAME(call_into_lisp_))
 
 	.text
 	.globl  GNAME(funcall_alien_callback)
@@ -268,36 +256,32 @@ GNAME(funcall_alien_callback):
 	push	%rbp		# Save old frame pointer.
 	mov	%rsp,%rbp	# Establish new frame.
 
-	push	%rbx  	# these regs are callee-saved according to C
-	push	%r12	# so must be preserved and restored when
-	push	%r13    # the lisp function returns
-	push	%r14    #
-	push	%r15    #
+	PUSH_C_NONVOLATILE_REGS
 #ifdef LISP_FEATURE_SB_THREAD
         mov     %rcx, THREAD_BASE_REG
+#else
+        LOAD_PIC_VAR(all_threads, THREAD_BASE_REG)
 #endif
         mov     $(3 << N_FIXNUM_TAG_BITS),%rcx
+
+#ifdef LISP_FEATURE_NONSTOP_FOREIGN_CALL
+        push    THREAD_SAVED_CSP_OFFSET(THREAD_BASE_REG)
+	movq    $0, THREAD_SAVED_CSP_OFFSET(THREAD_BASE_REG)
+#endif
 
 	/* Alloc new frame. */
         push	%rbp            # Dummy for return address
 	push	%rbp		# fp in save location S1
         mov	%rsp,%rbp
-#ifdef LISP_FEATURE_IMMOBILE_CODE
-#include "genesis/vector.h"
-        // An extra instruction is needed to load the fdefn.
-        mov	(STATIC_FDEFNS+VECTOR_DATA_OFFSET+8*ENTER_ALIEN_CALLBACK_fdefn),%rax
-        mov	FDEFN_FUN_OFFSET(%rax),%rax
-#else
-        mov     (ENTER_ALIEN_CALLBACK_FDEFN+FDEFN_FUN_OFFSET),%rax
-#endif
-	call	*CLOSURE_FUN_OFFSET(%rax)
+	LOAD_PIC_VAR(gc_card_mark, reg_NULL)
+	sub	NIL_CARDTABLE_DISP, reg_NULL
+	LOAD_PIC_VAR(linkage_space, %rax)
+	call	*(8*ENTER_ALIEN_CALLBACK_fname_index)(%rax)
 
-/* Restore C regs */
-	pop	%r15
-	pop	%r14
-	pop	%r13
-	pop	%r12
-	pop	%rbx
+#ifdef LISP_FEATURE_NONSTOP_FOREIGN_CALL
+	pop   THREAD_SAVED_CSP_OFFSET(THREAD_BASE_REG)
+#endif
+	POP_C_NONVOLATILE_REGS
 
 	leave
 
@@ -315,7 +299,6 @@ GNAME(funcall_alien_callback):
 
 	.text
 	.globl 	GNAME(fun_end_breakpoint_guts)
-	.align	align_16byte
 GNAME(fun_end_breakpoint_guts):
 	/* Multiple Value return */
 	jc	multiple_value_return
@@ -325,8 +308,8 @@ GNAME(fun_end_breakpoint_guts):
 	mov	%rsp,%rbx	# Setup ebx - the ofp.
 	sub	$8,%rsp		# Allocate one stack slot for the return value
 	mov	$(1 << N_FIXNUM_TAG_BITS),%rcx		# Setup ecx for one return value.
-	mov	$(NIL),%rdi	# default second value
-	mov	$(NIL),%rsi	# default third value
+	mov	reg_NULL,%rdi	# default second value
+	mov	reg_NULL,%rsi	# default third value
 multiple_value_return:
 
 	.globl  GNAME(fun_end_breakpoint_trap)
@@ -426,7 +409,11 @@ GNAME(arch_scrub_control_stack):
 	 * guard page upper bound in R8, and our hard guard
 	 * page upper bound in R9. */
 	lea	-8(%rsp), %rax
+#ifdef LISP_FEATURE_WIN32
+	LOAD_PIC_VAR(win32_page_size, %r9)
+#else
 	LOAD_PIC_VAR(os_vm_page_size, %r9)
+#endif
 	lea	(%rsi,%r9), %r8
 	lea	(%rdx,%r9), %r9
 

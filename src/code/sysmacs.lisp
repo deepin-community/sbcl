@@ -11,7 +11,7 @@
 
 (in-package "SB-IMPL")
 
-;;;; these are initialized by create_thread_struct()
+;;;; these are initialized by alloc_thread_struct()
 
 (defvar *in-without-gcing*)
 (defvar *gc-inhibit*)
@@ -26,11 +26,10 @@
 #+sb-thread
 (defvar *stop-for-gc-pending*)
 
-;;; This one is initialized by the runtime, at thread creation.  On
-;;; non-x86oid gencgc targets, this is a per-thread list of objects
-;;; which must not be moved during GC.  It is frobbed by the code for
-;;; with-pinned-objects in src/compiler/{arch}/macros.lisp.
-#+(and gencgc (not (or x86 x86-64)))
+;;; This one is initialized by the runtime, at thread creation.
+;;; It is a per-thread list of objects which must not be moved during GC,
+;;; and manipulated by WITH-PINNED-OBJECTS.
+;;; If doesn't really do anything if #+cheneygc
 (defvar sb-vm::*pinned-objects*)
 
 (defmacro without-gcing (&body body)
@@ -86,7 +85,7 @@ maintained."
 ;;;
 ;;; FIXME: Shouldn't these be functions instead of macros?
 (defmacro in-stream-from-designator (stream)
-  (let ((svar (sb-xc:gensym)))
+  (let ((svar (gensym)))
     `(let ((,svar ,stream))
        (cond ((null ,svar) *standard-input*)
              ((eq ,svar t) *terminal-io*)
@@ -111,7 +110,7 @@ maintained."
               (t (return x))))))
 |#
 (defmacro out-stream-from-designator (stream)
-  (let ((svar (sb-xc:gensym)))
+  (let ((svar (gensym)))
     `(let ((,svar ,stream))
        (cond ((null ,svar) *standard-output*)
              ((eq ,svar t) *terminal-io*)
@@ -133,8 +132,6 @@ maintained."
 ;;;
 ;;; KLUDGE: Some functions (e.g. ANSI-STREAM-READ-LINE) use these variables
 ;;; directly, instead of indirecting through FAST-READ-CHAR.
-;;; When ANSI-STREAM-INPUT-CHAR-POS is non-null, we take care to update it,
-;;; but not for each character of input.
 (defmacro prepare-for-fast-read-char (stream &body forms)
   `(let* ((%frc-stream% ,stream)
           (%frc-method% (ansi-stream-in %frc-stream%))
@@ -152,10 +149,7 @@ maintained."
 ;;; If buffer refills occurred within FAST-READ-CHAR, the refill logic
 ;;; similarly scans the cin-buffer before placing anything new into it.
 (defmacro done-with-fast-read-char ()
-  `(progn
-     (when (ansi-stream-input-char-pos %frc-stream%)
-       (update-input-char-pos %frc-stream% %frc-index%))
-     (setf (ansi-stream-in-index %frc-stream%) %frc-index%)))
+  `(setf (ansi-stream-in-index %frc-stream%) %frc-index%))
 
 ;;; a macro with the same calling convention as READ-CHAR, to be used
 ;;; within the scope of a PREPARE-FOR-FAST-READ-CHAR.
@@ -165,7 +159,7 @@ maintained."
 (defmacro fast-read-char (&optional (eof-error-p t) (eof-value ()))
   (let ((result
          `(if (not %frc-buffer%)
-              (funcall %frc-method% %frc-stream% ,eof-error-p ,eof-value)
+              (values (funcall %frc-method% %frc-stream% ,eof-error-p ,eof-value))
               (block nil
                 (when (= %frc-index% +ansi-stream-in-buffer-length+)
                   (let ((index-or-nil
@@ -209,22 +203,16 @@ maintained."
                 (type index ,f-index))
        (declare (disable-package-locks fast-read-byte))
        (flet ((fast-read-byte ()
-                (,@(cond ((equal '(unsigned-byte 8) type)
-                          ;; KLUDGE: For some reason I haven't tracked down
-                          ;; this makes a difference even in given the TRULY-THE.
-                          `(logand #xff))
-                         (t
-                          `(identity)))
-                 (truly-the ,type
-                            (cond
-                              ((not ,f-buffer)
-                               (funcall ,f-method ,f-stream ,eof-p ,eof-val))
-                              ((< ,f-index (length ,f-buffer))
-                               (prog1 (aref ,f-buffer ,f-index)
-                                 (setf (ansi-stream-in-index ,f-stream) (incf ,f-index))))
-                              (t
-                               (prog1 (fast-read-byte-refill ,f-stream ,eof-p ,eof-val)
-                                 (setq ,f-index (ansi-stream-in-index ,f-stream)))))))))
+                (truly-the ,type
+                           (cond
+                             ((not ,f-buffer)
+                              (funcall ,f-method ,f-stream ,eof-p ,eof-val))
+                             ((< ,f-index (length ,f-buffer))
+                              (prog1 (aref ,f-buffer ,f-index)
+                                (setf (ansi-stream-in-index ,f-stream) (incf ,f-index))))
+                             (t
+                              (prog1 (fast-read-byte-refill ,f-stream ,eof-p ,eof-val)
+                                (setq ,f-index (ansi-stream-in-index ,f-stream))))))))
          (declare (inline fast-read-byte))
          (declare (enable-package-locks fast-read-byte))
          (locally ,@body)))))
@@ -235,19 +223,28 @@ maintained."
                        &body body)
   ;; If the &REST arg never needs to be reified, this is slightly quicker
   ;; than using a DX list.
-  (let ((index (sb-xc:gensym "INDEX")))
+  (let ((index (or index-var (gensym "INDEX"))))
     `(let ((,index ,start))
+       (declare (index ,index))
        (loop
         (cond ((< (truly-the index ,index) (length ,rest-var))
-               (let ((,var (fast-&rest-nth ,index ,rest-var))
-                     ,@(if index-var `((,index-var ,index))))
+               (let ((,var (fast-&rest-nth ,index ,rest-var)))
                  ,@body)
-               (incf ,index))
+               (incf (truly-the index ,index)))
               (t
                (return ,result)))))))
 
 (in-package "SB-THREAD")
 
+;;; SBCL-internal code should prefer this variant of a mutex acquire/release.
+;;; Also I'm exploring whether WITH-MUTEX could optionally using absl::Mutex
+;;; (https://abseil.io/about/design/mutex) under user control. SBCL mutexes are
+;;; very fast, as they avoid a foreign call, but absl::Mutex provides metrics
+;;; on lock contention. Using those universally though would require solving some
+;;; problems: (1) absl::Mutex is never recursive, (2) If finalization is needed
+;;; to free the C++ object, and the finalizer table has a mutex, how to insert
+;;; the finalizer on the finalizer table mutex into the table.
+;;; System mutexes will always be our own mutex-based-on-futex (if available).
 (defmacro with-system-mutex ((mutex &key without-gcing allow-with-interrupts)
                                     &body body)
   `(dx-flet ((with-system-mutex-thunk () ,@body))

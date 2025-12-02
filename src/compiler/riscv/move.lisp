@@ -12,7 +12,7 @@
 (in-package "SB-VM")
 
 (define-move-fun (load-immediate 1) (vop x y)
-  ((immediate)
+  ((zero immediate)
    (any-reg descriptor-reg))
   (let ((val (tn-value x)))
     (etypecase val
@@ -24,10 +24,15 @@
        (load-symbol y val))
       (character
        (inst li y (logior (ash (char-code val) n-widetag-bits)
-                          character-widetag))))))
+                          character-widetag)))
+      (structure-object
+       (if (eq val sb-lockless:+tail+)
+           (inst addi y null-tn (- lockfree-list-tail-value-offset
+                                   nil-value-offset))
+           (bug "immediate structure-object ~S" val))))))
 
 (define-move-fun (load-number 1) (vop x y)
-  ((immediate)
+  ((zero immediate)
    (signed-reg unsigned-reg))
   (inst li y (tn-value x)))
 
@@ -46,12 +51,7 @@
       (short-immediate
        (loadw y code-tn (tn-offset x) other-pointer-lowtag))
       (u+i-immediate
-       (multiple-value-bind (u i)
-           (u-and-i-inst-immediate offset)
-         ;; Should be GC safe.
-         (inst lui y u)
-         (inst add lip-tn code-tn y)
-         (inst #-64-bit lw #+64-bit ld y lip-tn i))))))
+       (inst load-far-constant y x)))))
 
 (define-move-fun (load-stack 5) (vop x y)
   ((control-stack) (any-reg descriptor-reg))
@@ -62,10 +62,10 @@
    (sap-stack) (sap-reg)
    (signed-stack) (signed-reg)
    (unsigned-stack) (unsigned-reg))
-  (loadw y (current-nfp-tn vop) (tn-offset x)))
+  (load-frame-word y (current-nfp-tn vop) (tn-offset x) 'load-number-stack nil))
 
 (define-move-fun (store-stack 5) (vop x y)
-  ((any-reg descriptor-reg) (control-stack))
+  ((any-reg descriptor-reg zero) (control-stack))
   (store-stack-tn y x))
 
 (define-move-fun (store-number-stack 5) (vop x y)
@@ -73,32 +73,27 @@
    (sap-reg) (sap-stack)
    (signed-reg) (signed-stack)
    (unsigned-reg) (unsigned-stack))
-  (storew x (current-nfp-tn vop) (tn-offset y)))
-
+  (store-frame-word x (current-nfp-tn vop) (tn-offset y) 'store-number-stack nil))
 
+
 ;;;; The Move VOP:
 ;;;
 (define-vop (move)
   (:args (x :target y
-            :scs (any-reg descriptor-reg)
-            :load-if (not (or (location= x y)
-                              (and (sc-is x immediate)
-                                   (eql (tn-value x) 0))))))
+            :scs (any-reg zero descriptor-reg)
+            :load-if (not (location= x y))))
   (:results (y :scs (any-reg descriptor-reg control-stack)
                :load-if (not (location= x y))))
   (:generator 0
-    (let ((x (if (and (sc-is x immediate)
-                      (eql (tn-value x) 0))
-                 zero-tn
-                 x)))
-      (cond ((location= x y))
-            ((sc-is y control-stack)
-             (store-stack-tn y x))
-            (t
-             (move y x))))))
+    (unless (location= x y)
+      (sc-case y
+        ((any-reg descriptor-reg)
+         (move y x))
+        (control-stack
+         (store-stack-tn y x))))))
 
 (define-move-vop move :move
-  (any-reg descriptor-reg)
+  (any-reg descriptor-reg zero)
   (any-reg descriptor-reg))
 
 
@@ -107,19 +102,20 @@
 ;;;
 (define-vop (move-arg)
   (:args (x :target y
-            :scs (any-reg descriptor-reg))
+            :scs (any-reg descriptor-reg zero))
          (fp :scs (any-reg)
              :load-if (not (sc-is y any-reg descriptor-reg))))
   (:results (y))
+  (:temporary (:sc unsigned-reg) tmp) ; TODO- :unused-if based on frame size
   (:generator 0
     (sc-case y
       ((any-reg descriptor-reg)
        (move y x))
       (control-stack
-       (storew x fp (tn-offset y))))))
+       (store-frame-word x fp (tn-offset y) 'move-arg tmp)))))
 ;;;
 (define-move-vop move-arg :move-arg
-  (any-reg descriptor-reg)
+  (any-reg descriptor-reg zero)
   (any-reg descriptor-reg))
 
 ;;;; Moves and coercions:
@@ -165,16 +161,15 @@
   (:note "integer to untagged word coercion")
   (:temporary (:scs (non-descriptor-reg)) temp)
   (:generator 3
-    (let ((done (gen-label)))
-      (inst andi temp x fixnum-tag-mask)
-      (sc-case y
-        (signed-reg
-         (inst srai y x n-fixnum-tag-bits))
-        (unsigned-reg
-         (inst srli y x n-fixnum-tag-bits)))
-      (inst beq temp zero-tn done)
-      (loadw y x bignum-digits-offset other-pointer-lowtag)
-      (emit-label done))))
+    (inst andi temp x fixnum-tag-mask)
+    (sc-case y
+      (signed-reg
+       (inst srai y x n-fixnum-tag-bits))
+      (unsigned-reg
+       (inst srli y x n-fixnum-tag-bits)))
+    (inst beq temp zero-tn done)
+    (loadw y x bignum-digits-offset other-pointer-lowtag)
+    DONE))
 
 (define-move-vop move-to-word/integer :move
   (descriptor-reg) (signed-reg unsigned-reg))

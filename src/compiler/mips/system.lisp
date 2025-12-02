@@ -14,6 +14,17 @@
 
 ;;;; Type frobbing VOPs
 
+(define-vop (descriptor-hash32)
+  (:translate descriptor-hash32)
+  (:args (arg :scs (any-reg descriptor-reg)))
+  (:results (res :scs (any-reg)))
+  (:result-types positive-fixnum)
+  (:temporary (:scs (non-descriptor-reg)) temp)
+  (:policy :fast-safe)
+  (:generator 1
+    (inst li temp #x7FFFFFFC)
+    (inst and res arg temp)))
+
 (define-vop (widetag-of)
   (:translate widetag-of)
   (:policy :fast-safe)
@@ -53,7 +64,6 @@
 
     OTHER-PTR
     (load-type result object (- other-pointer-lowtag))
-    (inst nop)
 
     DONE))
 
@@ -69,7 +79,7 @@
   (:generator 4
     (let ((label (register-inline-constant :layout-id test-layout))
           (offset (+ (id-bits-offset)
-                     (ash (- (wrapper-depthoid test-layout) 2) 2)
+                     (ash (- (layout-depthoid test-layout) 2) 2)
                      (- instance-pointer-lowtag))))
       (inst lw test-id sb-vm::code-tn label)
       (inst lw this-id x offset)
@@ -93,8 +103,7 @@
   (:results (result :scs (unsigned-reg)))
   (:result-types positive-fixnum)
   (:generator 6
-    (load-type result function (- fun-pointer-lowtag))
-    (inst nop)))
+    (load-type result function (- fun-pointer-lowtag))))
 
 (define-vop (get-header-data)
   (:translate get-header-data)
@@ -130,26 +139,8 @@
       (zero))
     (storew t1 x 0 other-pointer-lowtag)))
 
-(define-vop (pointer-hash)
-  (:translate pointer-hash)
-  (:args (ptr :scs (any-reg descriptor-reg)))
-  (:results (res :scs (any-reg descriptor-reg)))
-  (:temporary (:scs (non-descriptor-reg)) temp)
-  (:policy :fast-safe)
-  (:generator 1
-    (inst li temp (lognot fixnum-tag-mask))
-    (inst and res ptr temp)))
-
 
 ;;;; Allocation
-
-(define-vop (dynamic-space-free-pointer)
-  (:results (int :scs (sap-reg)))
-  (:result-types system-area-pointer)
-  (:translate dynamic-space-free-pointer)
-  (:policy :fast-safe)
-  (:generator 1
-    (move int alloc-tn)))
 
 (define-vop (binding-stack-pointer-sap)
   (:results (int :scs (sap-reg)))

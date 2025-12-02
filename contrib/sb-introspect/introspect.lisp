@@ -79,10 +79,6 @@ For example, the debug source for a function compiled from a file will
 include the pathname of the file and the position of the definition."
   'sb-c::debug-source)
 
-(deftype debug-function ()
-  "Debug function represent static compile-time information about a function."
-  'sb-c::compiled-debug-fun)
-
 (declaim (ftype (sfunction (function) debug-info) function-debug-info))
 (defun function-debug-info (function)
   (let* ((function-object (%fun-fun function))
@@ -96,11 +92,6 @@ include the pathname of the file and the position of the definition."
 (declaim (ftype (sfunction (debug-info) debug-source) debug-info-source))
 (defun debug-info-source (debug-info)
   (sb-c::debug-info-source debug-info))
-
-(declaim (ftype (sfunction (t debug-info) debug-function) debug-info-debug-function))
-(defun debug-info-debug-function (function debug-info)
-  (sb-di::compiled-debug-fun-from-pc debug-info
-                                     (sb-di::function-start-pc-offset function)))
 
 (defun valid-function-name-p (name)
   "True if NAME denotes a valid function name, ie. one that can be passed to
@@ -137,6 +128,17 @@ constant pool."
      spaces
      (lambda (obj size)
        (declare (ignore size))
+       ;; There are no constants for linkage-space calls. Not only that,
+       ;; but certain linkage entry refs get elided because it is not
+       ;; required for liveness from a GC perspective.
+       #+linkage-space
+       (dolist (index (sb-c:unpack-code-fixup-locs (sb-vm::%code-fixups obj)))
+         (let ((ep (sb-sys:sap-ref-word
+                    (sb-alien:extern-alien "linkage_space" sb-sys:system-area-pointer)
+                    (ash index sb-vm:word-shift))))
+           (when (eq (sb-kernel:%make-lisp-obj (+ ep -16 sb-vm:fun-pointer-lowtag)) function)
+             (funcall fn obj))))
+       #-linkage-space
        (map-code-constants
         obj
         (lambda (constant)
@@ -190,8 +192,10 @@ constant pool."
                               vop
                               (gethash (sb-c::vop-info-name vop)
                                        sb-c::*backend-parsed-vops*))
-          for name = (sb-c::vop-parse-name vop-parse)
-          for loc = (sb-c::vop-parse-source-location vop-parse)
+          for name = (and vop-parse
+                          (sb-c::vop-parse-name vop-parse))
+          for loc = (and vop-parse
+                         (sb-c::vop-parse-source-location vop-parse))
           when loc
           collect (let ((source (translate-source-location loc)))
                     (setf (definition-source-description source)
@@ -270,15 +274,18 @@ If an unsupported TYPE is requested, the function will return NIL.
           (and converter
            (find-definition-source converter))))
        ((:function :generic-function)
-        (when (and (fboundp name)
-                   (or (consp name)
-                       (and
-                        (not (macro-function name))
-                        (not (special-operator-p name)))))
-          (let ((fun (real-fdefinition name)))
-            (when (eq (not (typep fun 'generic-function))
-                      (not (eq type :generic-function)))
-              (find-definition-source fun)))))
+        (if (fboundp name)
+            (when (and (or (consp name)
+                           (and
+                            (not (macro-function name))
+                            (not (special-operator-p name)))))
+              (let ((fun (real-fdefinition name)))
+                (when (eq (not (typep fun 'generic-function))
+                          (not (eq type :generic-function)))
+                  (find-definition-source fun))))
+            (let ((dd (info :function :source-transform name)))
+              (when (typep dd '(cons defstruct-description))
+                (find-definition-sources-by-name (dd-name (car dd)) :structure)))))
        ((:type)
         ;; Source locations for types are saved separately when the expander
         ;; is a closure without a good source-location.
@@ -354,17 +361,22 @@ If an unsupported TYPE is requested, the function will return NIL.
                             (sb-c:fun-info-ltn-annotate . sb-c:ltn-annotate)
                             (sb-c:fun-info-optimizer . sb-c:optimizer)
                             (sb-c:fun-info-ir2-convert . sb-c:ir2-convert)
-                            (sb-c::fun-info-stack-allocate-result
-                             . sb-c::stack-allocate-result)
-                            (sb-c::fun-info-constraint-propagate
-                             . sb-c::constraint-propagate)
-                            (sb-c::fun-info-constraint-propagate-if
-                             . sb-c::constraint-propagate-if)
-                            (sb-c::fun-info-call-type-deriver
-                             . sb-c::call-type-deriver))))
+                            (sb-c::fun-info-ir2-hook . sb-c::ir2-hook)
+                            (sb-c::fun-info-stack-allocate-result . sb-c::stack-allocate-result)
+                            (sb-c::fun-info-constraint-propagate . sb-c::constraint-propagate)
+                            (sb-c::fun-info-constraint-propagate-if . sb-c::constraint-propagate-if)
+                            (sb-c::fun-info-constraint-propagate-back . sb-c::constraint-propagate-back)
+                            (sb-c::fun-info-constraint-propagate-result . sb-c::constraint-propagate-result)
+                            (sb-c::fun-info-equality-constraint . sb-c::equality-constraint)
+                            (sb-c::fun-info-folder . sb-c::folder)
+                            (sb-c::fun-info-externally-checkable-type . sb-c::externally-checkable-type)
+                            (sb-c::fun-info-constants . sb-c::constants)
+                            (sb-c::fun-info-call-type-deriver . sb-c::call-type-deriver)
+                            (sb-c::fun-info-rewrite-full-call . sb-c::rewrite-full-call)
+                            (sb-c::fun-info-fold-p . sb-c::fold-p))))
               (loop for (reader . name) in otypes
                     for fn = (funcall reader fun-info)
-                    when fn collect
+                    when (functionp fn) collect
                     (let ((source (find-definition-source fn)))
                       (setf (definition-source-description source)
                             (list name))
@@ -457,19 +469,25 @@ If an unsupported TYPE is requested, the function will return NIL.
             (type-of object)))))
 
 (defun find-function-definition-source (function)
-  (let* ((debug-info (function-debug-info function))
-         (debug-source (debug-info-source debug-info))
-         (debug-fun (debug-info-debug-function function debug-info))
-         (tlf (sb-c::compiled-debug-info-tlf-number debug-info)))
+  (let* ((debug-source (debug-info-source (function-debug-info function)))
+         (debug-fun (sb-di::fun-debug-fun function))
+         (tlf (sb-c::compiled-debug-fun-tlf-number
+               (sb-di::compiled-debug-fun-compiler-debug-fun debug-fun))))
     (make-definition-source
      :pathname
-     (when (stringp (debug-source-namestring debug-source))
-       (parse-namestring (debug-source-namestring debug-source)))
+     (when (stringp (sb-c::debug-source-namestring debug-source))
+       (parse-namestring (sb-c::debug-source-namestring debug-source)))
      :character-offset
-     (sb-c::compiled-debug-info-char-offset debug-info)
+     (if tlf
+         (elt (sb-c::debug-source-start-positions debug-source) tlf))
      :form-path (if tlf (list tlf))
-     :form-number (sb-c::compiled-debug-fun-form-number debug-fun)
-     :file-write-date (debug-source-created debug-source)
+     :form-number (handler-case (sb-di::code-location-form-number
+                                 (sb-di::debug-fun-start-location debug-fun))
+                    (sb-di::unknown-code-location (cond)
+                      (declare (ignore cond))
+                      (sb-c::compiled-debug-fun-blocks
+                       (sb-di::compiled-debug-fun-compiler-debug-fun debug-fun))))
+     :file-write-date (sb-c::debug-source-created debug-source)
      :plist (sb-c::debug-source-plist debug-source))))
 
 (defun translate-source-location (location)
@@ -575,20 +593,39 @@ or a method combination name."
 ;;; strategy would be to use the disassembler to find actual
 ;;; call-sites.
 
+;; FIXME[1]: this is quite clearly intended to do just about the same thing
+;;           as CTU:FIND-NAMED-CALLEES yet the two are unnecessarily different.
+;; FIXME[2]: for at least #+linkage-space we should disassemble FUNCTION
+;;           because the stored linkage indices underestimate the answer.
+;;           The gain from doing it right is that code constants overestimate
+;;           especially if >1 simple-fun is present in the code.
 (defun find-function-callees (function)
   "Return functions called by FUNCTION."
-  (declare (simple-fun function))
-  (let ((callees '()))
-    (map-code-constants
-     (fun-code-header function)
-     (lambda (obj)
-       (when (fdefn-p obj)
-         (push (fdefn-fun obj) callees))))
-    callees))
+  (if (typep function 'generic-function)
+      (loop for method in (sb-mop:generic-function-methods function)
+            for method-fun = (sb-mop:method-function method)
+            append (find-function-callees
+                    (if (typep (%fun-name method-fun) '(cons (eql sb-pcl::call)))
+                        (sb-kernel:%closure-index-ref  method-fun 0)
+                        method-fun)))
+      (let ((callees '()))
+        #+linkage-space
+        (dolist (index (sb-c:unpack-code-fixup-locs
+                        (sb-vm::%code-fixups (fun-code-header (sb-kernel:%fun-fun function)))))
+          (let ((name (sb-vm::linkage-addr->name index :index)))
+            (when (fboundp name)
+              (push (fdefinition name) callees))))
+        #-linkage-space
+        (map-code-constants
+         (fun-code-header (sb-kernel:%fun-fun function))
+         (lambda (obj)
+           (when (fdefn-p obj)
+             (let ((fun (fdefn-fun obj)))
+               (when fun
+                 (push fun callees))))))
+        callees)))
 
-(defun find-function-callers (function &optional (spaces '(:read-only :static
-                                                           :dynamic
-                                                           #+immobile-code :immobile)))
+(defun find-function-callers (function &optional (spaces '(:all)))
   "Return functions which call FUNCTION, by searching SPACES for code objects"
   (let ((referrers '()))
     (map-caller-code-components
@@ -601,23 +638,161 @@ or a method combination name."
 
 ;;; XREF facility
 
+#-(and system-tlabs (not mark-region-gc))
+(progn
+  (labels ((functoid-simple-fun (functoid)
+             ;; looks like this is supposed to ignore INTERPRETED-FUNCTION ?
+             (typecase functoid
+               (simple-fun functoid)
+               (closure
+                (let ((fun (%closure-fun functoid)))
+                  (if (and (eq (%fun-name fun) 'sb-impl::encapsulation))
+                      (functoid-simple-fun
+                       (sb-impl::encapsulation-info-definition
+                        (sb-impl::encapsulation-info functoid)))
+                      fun))))))
+    (defun map-simple-funs (function)
+      (let ((function (%coerce-callable-to-fun function)))
+        (labels ((process (name value)
+                   (awhen (functoid-simple-fun value)
+                     (funcall function name it))))
+          (call-with-each-globaldb-name
+           (lambda (name)
+             ;; Methods are processed with their generic function
+             (unless (typep name '(cons (member sb-pcl::slow-method sb-pcl::fast-method)))
+               (let ((f (or (and (symbolp name) (macro-function name))
+                            (and (legal-fun-name-p name) (fboundp name)))))
+                 (typecase f
+                   (generic-function
+                    (loop for method in (sb-mop:generic-function-methods f)
+                          for fun = (sb-pcl::safe-method-fast-function method)
+                          when fun do (process (sb-kernel:%fun-name fun) fun)))
+                   (function
+                    (process name f)))))
+             #+sb-xref-for-internals
+             (let ((info (info :function :info name)))
+               (when info
+                 (loop for transform in (sb-c::fun-info-transforms info)
+                       for fun = (sb-c::transform-function transform)
+                       ;; Defined using :defun-only and a later %deftransform.
+                       unless (symbolp fun)
+                       do (process transform fun))))))
+          #+sb-xref-for-internals
+          (sb-int:dohash ((name vop) sb-c::*backend-template-names*)
+            (declare (ignore name))
+            (let ((fun (sb-c::vop-info-generator-function vop)))
+              (when fun
+                (process vop fun))))))))
+  (defun collect-xref (wanted-kind wanted-name)
+    (let ((result '()))
+      (map-simple-funs
+       (lambda (name fun)
+         (binding* ((xrefs (%simple-fun-xrefs fun) :exit-if-null))
+           (sb-c:map-packed-xref-data
+            (lambda (xref-kind xref-name xref-form-number)
+              (when (and (eq xref-kind wanted-kind)
+                         (equal xref-name wanted-name))
+                (let ((source-location (find-function-definition-source fun)))
+                  ;; Use the more accurate source path from the xref
+                  ;; entry.
+                  (setf (definition-source-form-number source-location)
+                        xref-form-number)
+                  (let ((name (typecase name
+                                (sb-c::transform
+                                 (let ((fun-name (%fun-name fun)))
+                                   (append (if (consp fun-name)
+                                               fun-name
+                                               (list fun-name))
+                                           (let* ((type (sb-c::transform-type name))
+                                                  (type-spec (type-specifier type)))
+                                             (and (sb-kernel:fun-type-p type)
+                                                  (list (second type-spec)))))))
+                                (sb-c::vop-info
+                                 (list 'sb-c:define-vop
+                                       (sb-c::vop-info-name name)))
+                                (t
+                                 name))))
+                    (push (cons name source-location) result)))))
+            xrefs))))
+      result)))
+
+#+(and system-tlabs (not mark-region-gc))
+(progn
+(sb-ext:defglobal *codeblob-cache* nil)
+(flet ((gather-code (stamp) ; = the value of sb-vm::*code-alloc-count*
+         ;; Remove unreachable functions.
+         (sb-ext:gc :full t)
+         (let ((arena (sb-vm:new-arena (* 2 1024 1024)))
+               (result))
+           ;; Can allocate inside an arena while holding without-gcing in sb-vm:map-code-objects
+           ;; Anyway this approach is silly because Lisp should maintain at all times
+           ;; a binary-searchable tree of all code which would solve all problems
+           ;; related to finding a codeblob from a PC without relying on whatever
+           ;; a particular GC implementation exposes in terms of linearly searchable
+           ;; ranges of memory. immobile-space does maintain such a tree. Of course the tree
+           ;; should also _weakly_ reference all code, and should be usable for xref
+           ;; and other consumers beside the debugger. And it should come with a pony too.
+           (unwind-protect
+                (sb-vm:with-arena (arena)
+                  ;; No filtering since we want this to pertain to all COLLECT-XREFS calls
+                  (sb-vm:map-code-objects (lambda (code) (push code result))))
+             ;; arenas are not suitable for returning memoized data
+             (setq result (coerce result 'vector))
+             (sb-vm:destroy-arena arena))
+           (setf *codeblob-cache* (cons stamp (sb-ext:make-weak-pointer result)))
+           result)))
 (defun collect-xref (wanted-kind wanted-name)
-  (let ((result '()))
-    (sb-c:map-simple-funs
-     (lambda (name fun)
-       (binding* ((xrefs (%simple-fun-xrefs fun) :exit-if-null))
-         (sb-c:map-packed-xref-data
-          (lambda (xref-kind xref-name xref-form-number)
-            (when (and (eq xref-kind wanted-kind)
-                       (equal xref-name wanted-name))
-              (let ((source-location (find-function-definition-source fun)))
-                ;; Use the more accurate source path from the xref
-                ;; entry.
-                (setf (definition-source-form-number source-location)
-                      xref-form-number)
-                (push (cons name source-location) result))))
-          xrefs))))
-    result))
+  (let* ((current-stamp sb-vm::*code-alloc-count*)
+         (all-code
+          ;; this is not an attempt to be 100% correct in observing an up-to-date
+          ;; snapshot at a point in time.  It's close enough though.
+          ;; I can't imagine that users are clamoring for a perfect solution to
+          ;; racing threads and XREFing jit-compiled code.
+          (or (let ((cache *codeblob-cache*))
+                (and (eql (car cache) current-stamp)
+                     (sb-ext:weak-pointer-value (cdr cache))))
+              (loop ; expect exactly 1 iteration
+               (let ((vector (gather-code current-stamp))
+                     (new-stamp sb-vm::*code-alloc-count*))
+                 (if (eq new-stamp current-stamp) ; say it's done
+                     (return vector)
+                     (setq current-stamp new-stamp))))))
+         (funs))
+    (dovector (code all-code)
+      (dotimes (i (code-n-entries code))
+        (let ((fun (%code-entry-point code i)))
+          (binding* ((xrefs (%simple-fun-xrefs fun) :exit-if-null))
+            (sb-c:map-packed-xref-data
+             (lambda (xref-kind xref-name xref-form-number)
+               (when (and (eq xref-kind wanted-kind)
+                          (equal xref-name wanted-name))
+                 (push (cons fun xref-form-number) funs)))
+             xrefs)))))
+    (let (result)
+      (loop for (fun . xref-form-number) in funs
+            do
+            (let ((source-location (find-function-definition-source fun)))
+              ;; Use the more accurate source path from the xref
+              ;; entry.
+              (setf (definition-source-form-number source-location) xref-form-number)
+              (let* ((name (sb-c::%fun-name fun))
+                     (name (cond ((typep name '(cons (eql sb-c:deftransform)))
+                                  (let* ((fun-name (second name))
+                                         (info (sb-int:info :function :info fun-name))
+                                         (transform (and info
+                                                         (find fun (sb-c::fun-info-transforms info)
+                                                               :key #'sb-c::transform-function))))
+                                    (if transform
+                                        (append name
+                                                (let* ((type (sb-c::transform-type transform))
+                                                       (type-spec (type-specifier type)))
+                                                  (and (sb-kernel:fun-type-p type)
+                                                       (list (second type-spec)))))
+                                        name)))
+                                 (t
+                                  name))))
+                (pushnew (cons name source-location) result :test #'equalp))))
+      result)))))
 
 (defun who-calls (function-name)
   "Use the xref facility to search for source locations where the
@@ -736,6 +911,14 @@ Experimental.
 
 ;;;; ALLOCATION INTROSPECTION
 
+(eval-when (:compile-toplevel :execute)
+  (defmacro pinnedp (addr)
+    `(eql (sb-alien:alien-funcall
+           (sb-alien:extern-alien "sb_introspect_pinnedp"
+                                  (function sb-alien:int sb-alien:unsigned))
+           ,addr)
+          1)))
+
 (defun allocation-information (object)
   "Returns information about the allocation of OBJECT. Primary return value
 indicates the general type of allocation: :IMMEDIATE, :HEAP, :STACK,
@@ -795,38 +978,26 @@ Experimental: interface subject to change."
              (sb-sys:with-pinned-objects (object)
                (let ((space (sb-ext:heap-allocated-p object)))
                  (when space
-                   #+gencgc
+                   #+generational
                    (if (eq :dynamic space)
                        (symbol-macrolet ((page (sb-alien:deref sb-vm::page-table index)))
                          ;; No wonder #+big-endian failed introspection tests-
                          ;; bits are packed in the opposite order. And thankfully,
                          ;; this fix seems not to depend on whether the numbering
                          ;; scheme is MSB 0 or LSB 0, afaict.
-                         (let* ((index (sb-vm:find-page-index
+                         (let* ((wp (page-protected-p object))
+                                (index (sb-vm:find-page-index
                                         (get-lisp-obj-address object)))
-                                (flags (sb-alien:slot page 'sb-vm::flags))
-                                .
-                                ;; The unused WP-CLR is for ease of counting
-                                #+big-endian
-                                ((type      (ldb (byte 5 3) flags))
-                                 (wp        (logbitp 2 flags))
-                                 (wp-clr    (logbitp 1 flags))
-                                 (dontmove  (logbitp 0 flags)))
-                                #+little-endian
-                                ((type      (ldb (byte 5 0) flags))
-                                 (wp        (logbitp 5 flags))
-                                 (wp-clr    (logbitp 6 flags))
-                                 (dontmove  (logbitp 7 flags))))
-                           (declare (ignore wp-clr))
+                                (type (sb-alien:slot page 'sb-vm::flags)))
                            (list :space space
                                  :generation (sb-alien:slot page 'sb-vm::gen)
                                  :write-protected wp
-                                 :boxed (logbitp 0 type)
-                                 :pinned dontmove
+                                 :boxed (> (logand type #xf) 1)
+                                 :pinned (pinnedp (get-lisp-obj-address object))
                                  :large (logbitp 4 type)
                                  :page index)))
                        (list :space space))
-                   #-gencgc
+                   #-generational
                    (list :space space))))))
         (cond (plist
                (values :heap plist))
@@ -871,6 +1042,7 @@ Experimental: interface subject to change."
                         (not (xset-member-p part seen)))
                  (add-to-xset part seen)
                  (funcall fun part))))
+      (declare (dynamic-extent #'call))
       (when ext
         (multiple-value-bind (value foundp)
             (let ((table sb-pcl::*eql-specializer-table*))
@@ -907,7 +1079,7 @@ Experimental: interface subject to change."
                       (sb-thread:interrupt-thread-error ()))
                     ;; This is whacky - the other thread signals our condition var,
                     ;; *then* we call the funarg on objects that may no longer
-                    ;; satisfy VALID-LISP-POINTER-P.
+                    ;; satisfy VALID-TAGGED-POINTER-P.
                     ;; And incidentally, we miss any references from TLS indices
                     ;; that map onto the 'struct thread', which is just as well
                     ;; since they're either fixnums or dynamic-extent objects.
@@ -1023,17 +1195,17 @@ Experimental: interface subject to change."
                                    (= this-bin-size (+ prev-bin-size 2)))
                                this-bin-size))))))))
 
-(defun largest-objects (&key (threshold #+gencgc sb-vm:gencgc-card-bytes
-                                        #-gencgc sb-c:+backend-page-bytes+)
+(defun largest-objects (&key (threshold #+generational sb-vm:gencgc-page-bytes
+                                        #-generational sb-c:+backend-page-bytes+)
                              (sort :size))
   (declare (type (member :address :size) sort))
   (flet ((show-obj (obj)
-           #-gencgc
+           #-generational
            (format t "~10x ~7x ~s~%"
                      (get-lisp-obj-address obj)
                      (primitive-object-size obj)
                      (type-of obj))
-           #+gencgc
+           #+generational
            (let* ((gen (generation-of obj))
                   (page (sb-vm::find-page-index (sb-kernel:get-lisp-obj-address obj)))
                   (flags (if (>= page 0)

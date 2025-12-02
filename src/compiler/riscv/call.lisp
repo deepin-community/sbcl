@@ -17,10 +17,8 @@
 
 ;;; Make a passing location TN for a local call return PC.
 (defun make-return-pc-passing-location (standard)
-  ;; Should we have a non standard convention? RISCV gives a hardware bonus to using x1 and x5
-  (if standard
-      (make-wired-tn *backend-t-primitive-type* descriptor-reg-sc-number lra-offset)
-      (make-restricted-tn *backend-t-primitive-type* descriptor-reg-sc-number)))
+  (declare (ignore standard))
+  (make-wired-tn *fixnum-primitive-type* immediate-arg-scn ra-offset))
 
 ;;; This is similar to MAKE-RETURN-PC-PASSING-LOCATION, but makes a
 ;;; location to pass OLD-FP in. This is (obviously) wired in the
@@ -38,13 +36,14 @@
 ;;; them at a known location.
 (defun make-old-fp-save-location (env)
   (specify-save-tn
-   (physenv-debug-live-tn (make-normal-tn *fixnum-primitive-type*) env)
+   (environment-debug-live-tn (make-normal-tn *fixnum-primitive-type*) env)
    (make-wired-tn *fixnum-primitive-type* control-stack-arg-scn ocfp-save-offset)))
 
 (defun make-return-pc-save-location (env)
-  (specify-save-tn
-   (physenv-debug-live-tn (make-normal-tn *backend-t-primitive-type*) env)
-   (make-wired-tn *backend-t-primitive-type* control-stack-arg-scn lra-save-offset)))
+  (let ((ptype *fixnum-primitive-type*))
+    (specify-save-tn
+     (environment-debug-live-tn (make-normal-tn ptype) env)
+     (make-wired-tn ptype control-stack-arg-scn ra-save-offset))))
 
 ;;; Make a TN for the standard argument count passing location.  We
 ;;; only need to make the standard location, since a count is never
@@ -83,22 +82,29 @@
   (:args (frame-pointer :scs (descriptor-reg))
          (variable-home-tn :load-if nil))
   (:results (value :scs (descriptor-reg any-reg)))
+  ;; :unused-if does not work because offsets haven't been assigned
+  (:temporary (#|:unused-if (typep (ash (tn-offset variable-home-tn) word-shift) 'short-immediate)|#
+               :sc unsigned-reg) tmp)
   (:policy :fast-safe)
   (:generator 4
     (aver (sc-is variable-home-tn control-stack))
-    (loadw value frame-pointer (tn-offset variable-home-tn))))
+    (load-frame-word value frame-pointer (tn-offset variable-home-tn) 'ancestor-frame-ref tmp)))
 
 (define-vop (ancestor-frame-set)
   (:args (frame-pointer :scs (descriptor-reg))
          (value :scs (descriptor-reg any-reg)))
   (:results (variable-home-tn :load-if nil))
+  ;; :unused-if does not work because offsets haven't been assigned
+  (:temporary (#|:unused-if (typep (ash (tn-offset variable-home-tn) word-shift) 'short-immediate)|#
+               :sc unsigned-reg) tmp)
   (:generator 4
     (aver (sc-is variable-home-tn control-stack))
-    (storew value frame-pointer (tn-offset variable-home-tn))))
+    (store-frame-word value frame-pointer (tn-offset variable-home-tn) 'ancestor-frame-set tmp)))
 
 (define-vop (xep-allocate-frame)
   (:info start-lab)
   (:temporary (:scs (interior-reg)) lip)
+  (:temporary (:scs (descriptor-reg) :offset l0-offset) fn)
   (:generator 1
     ;; Make sure the function is aligned, and drop a label pointing to this
     ;; function header.
@@ -107,12 +113,13 @@
     ;; Allocate function header.
     (inst simple-fun-header-word)
     (inst .skip (* (1- simple-fun-insts-offset) n-word-bytes))
-    (inst compute-code code-tn lip start-lab)))
+    (inst compute-code-from-fn code-tn fn lip start-lab)))
 
 (define-vop (xep-setup-sp)
   (:vop-var vop)
+  (:temporary (:sc unsigned-reg) tmp) ; TODO- can :unused-if be based on frame size?
   (:generator 1
-    (inst addi csp-tn cfp-tn (* n-word-bytes (sb-allocated-size 'control-stack)))
+    (add-imm csp-tn cfp-tn (* n-word-bytes (sb-allocated-size 'control-stack)) 'xep-setup-sp tmp)
     (let ((nfp (current-nfp-tn vop)))
       (when nfp
         (inst subi nsp-tn nsp-tn (bytes-needed-for-non-descriptor-stack-frame))
@@ -121,11 +128,12 @@
 (define-vop (allocate-frame)
   (:results (res :scs (any-reg))
             (nfp :scs (any-reg)))
+  (:temporary (:sc unsigned-reg) tmp)
   (:info callee)
   (:generator 2
     (move res csp-tn)
-    (inst addi csp-tn csp-tn (* n-word-bytes (sb-allocated-size 'control-stack)))
-    (when (ir2-physenv-number-stack-p callee)
+    (add-imm csp-tn csp-tn (* n-word-bytes (sb-allocated-size 'control-stack)) 'allocate-frame tmp)
+    (when (ir2-environment-number-stack-p callee)
       (inst addi nsp-tn nsp-tn (- (bytes-needed-for-non-descriptor-stack-frame)))
       (move nfp nsp-tn))))
 
@@ -135,10 +143,12 @@
 (define-vop (allocate-full-call-frame)
   (:info nargs)
   (:results (res :scs (any-reg)))
+  (:temporary (:sc unsigned-reg
+               :unused-if (typep (* nargs n-word-bytes) 'short-immediate)) tmp)
   (:generator 2
     (when (> nargs register-arg-count)
       (move res csp-tn)
-      (inst addi csp-tn csp-tn (* nargs n-word-bytes)))))
+      (add-imm csp-tn csp-tn (* nargs n-word-bytes) 'allocate-full-call-frame tmp))))
 
 ;;; Emit code needed at the return-point from an unknown-values call
 ;;; for a fixed number of values.  VALUES is the head of the TN-REF
@@ -175,7 +185,7 @@
     (note-this-location vop (if (<= nvals 1)
                                 :single-value-return
                                 :unknown-return))
-    (inst compute-code code-tn lip lra-label)
+    (inst compute-code-from-ra code-tn ra-tn lip lra-label)
     ;; Pick off the single-value case first.
     (sb-assem:without-scheduling ()
 
@@ -267,10 +277,10 @@
 ;;;    Args and Nargs are TNs wired to the named locations.  We must
 ;;; explicitly allocate these TNs, since their lifetimes overlap with the
 ;;; results Start and Count (also, it's nice to be able to target them).
-(defun receive-unknown-values (args nargs start count lra-label lip)
+(defun receive-unknown-values (args nargs start count label lip)
   (declare (type tn args nargs start count))
   (assemble ()
-    (inst compute-code code-tn lip lra-label)
+    (inst compute-code-from-ra code-tn ra-tn lip label)
     (inst bge nargs-tn zero-tn MULTIPLE)
     (move start csp-tn)
     (inst addi csp-tn csp-tn n-word-bytes)
@@ -350,10 +360,9 @@
         (when callee-nfp
           (maybe-load-stack-tn callee-nfp nfp)))
       (maybe-load-stack-tn cfp-tn fp)
-      (inst compute-lra (callee-return-pc-tn callee) lip label code-tn)
       (note-this-location vop :call-site)
-      (inst j target)
-      (emit-return-pc label)
+      (inst jal ra-tn target)
+      (emit-label label)
       (default-unknown-values vop values nvals move-temp lip label)
       (when cur-nfp
         (load-stack-tn cur-nfp nfp-save)))))
@@ -386,10 +395,9 @@
         (when callee-nfp
           (maybe-load-stack-tn callee-nfp nfp)))
       (maybe-load-stack-tn cfp-tn fp)
-      (inst compute-lra (callee-return-pc-tn callee) lip label code-tn)
       (note-this-location vop :call-site)
-      (inst j target)
-      (emit-return-pc label)
+      (inst jal ra-tn target)
+      (emit-label label)
       (note-this-location vop :unknown-return)
       (receive-unknown-values values-start nvals start count label lip)
       (when cur-nfp
@@ -415,20 +423,16 @@
   (:move-args :local-call)
   (:vop-var vop)
   (:temporary (:sc control-stack :offset nfp-save-offset) nfp-save)
-  (:temporary (:scs (interior-reg)) lip)
   (:generator 5
-    (let ((label (gen-label))
-          (cur-nfp (current-nfp-tn vop)))
+    (let ((cur-nfp (current-nfp-tn vop)))
       (when cur-nfp
         (store-stack-tn nfp-save cur-nfp))
       (let ((callee-nfp (callee-nfp-tn callee)))
         (when callee-nfp
           (maybe-load-stack-tn callee-nfp nfp)))
       (maybe-load-stack-tn cfp-tn fp)
-      (inst compute-lra (callee-return-pc-tn callee) lip label code-tn)
       (note-this-location vop :call-site)
-      (inst j target)
-      (emit-return-pc label)
+      (inst jal ra-tn target)
       (note-this-location vop :known-return)
       (when cur-nfp
         (load-stack-tn cur-nfp nfp-save)))))
@@ -441,11 +445,11 @@
 ;;; since all registers may be tied up by the more operand.  Instead,
 ;;; we use MAYBE-LOAD-STACK-TN.
 (define-vop (known-return)
-  (:args (old-fp :scs (any-reg))
-         (return-pc :scs (descriptor-reg))
+  (:args (old-fp :target old-fp-temp)
+         (return-pc :target return-pc-temp)
          (values :more t))
   (:temporary (:sc any-reg :from (:argument 0)) old-fp-temp)
-  (:temporary (:sc descriptor-reg :from (:argument 1)) return-pc-temp)
+  (:temporary (:sc any-reg :from (:argument 1) :offset ra-offset) return-pc-temp)
   (:info val-locs)
   (:ignore val-locs values)
   (:move-args :known-return)
@@ -456,7 +460,7 @@
     (move csp-tn cfp-tn)
     (clear-number-stack vop)
     (move cfp-tn old-fp-temp)
-    (lisp-return return-pc-temp :known)))
+    (inst jalr zero-tn return-pc-temp 0)))
 
 
 ;;;; Full call:
@@ -516,7 +520,7 @@
             '((old-fp :target old-fp-pass)
               (return-pc :target return-pc-pass)))
         ,@(unless variable
-            '((args :more t :scs (descriptor-reg)))))
+            '((args :more t :scs (descriptor-reg control-stack)))))
        ,@(when (eq return :fixed)
            '((:results (values :more t))))
        (:save-p ,(if (eq return :tail) :compute-only t))
@@ -529,7 +533,8 @@
         ,@(when (eq named :direct) '(fun))
         ,@(when (eq return :fixed) '(nvals))
         step-instrumenting)
-       (:ignore ,@(unless (or variable (eq return :tail)) '(arg-locs))
+       (:ignore ,@(unless (eq return :tail) '(return-pc-pass))
+                ,@(unless (or variable (eq return :tail)) '(arg-locs))
                 ,@(unless variable '(args)))
 
        (:temporary (:sc descriptor-reg
@@ -539,8 +544,8 @@
                         '(:to :eval)))
                    old-fp-pass)
 
-       (:temporary (:sc descriptor-reg
-                    :offset lra-offset
+       (:temporary (:sc any-reg
+                    :offset ra-offset
                     :from (:argument ,(if (eq return :tail) 2 1))
                     :to :eval)
                    return-pc-pass)
@@ -550,7 +555,8 @@
                         :from (:argument ,(if (eq return :tail) 0 1))
                         :to :eval)
                        ,(if named 'name-pass 'lexenv))))
-       (:temporary (:scs (descriptor-reg) :to :eval)
+       (:temporary (:scs (descriptor-reg) :offset l0-offset
+                         :to :eval)
                    function)
        (:temporary (:sc any-reg :offset nargs-offset :to
                         ,(if (eq return :fixed)
@@ -581,7 +587,7 @@
                        (if (eq return :unknown) 25 0))
          (let* ((cur-nfp (current-nfp-tn vop))
                 ,@(unless (eq return :tail)
-                    '((lra-label (gen-label))))
+                    '((label (gen-label))))
                 (step-done-label (gen-label))
                 (filler
                   (remove nil
@@ -594,8 +600,7 @@
                                           :load-return-pc)
                                         (when cur-nfp
                                           :frob-nfp))
-                                      '(:comp-lra
-                                        (when cur-nfp
+                                      '((when cur-nfp
                                           :frob-nfp)
                                         :save-fp
                                         :load-fp))))))
@@ -621,16 +626,14 @@
                                     (load-stack-tn old-fp-pass old-fp))))
                                 (:load-return-pc
                                  (sc-case return-pc
-                                   (descriptor-reg
+                                   (any-reg
                                     (move return-pc-pass return-pc))
                                    (control-stack
                                     (load-stack-tn return-pc-pass return-pc))))
                                 (:frob-nfp
                                  (inst addi nsp-tn cur-nfp
                                   (bytes-needed-for-non-descriptor-stack-frame))))
-                              `((:comp-lra
-                                 (inst compute-lra return-pc-pass lip lra-label code-tn))
-                                (:frob-nfp
+                              `((:frob-nfp
                                  (store-stack-tn nfp-save cur-nfp))
                                 (:save-fp
                                  (move old-fp-pass cfp-tn))
@@ -683,35 +686,39 @@
                     (do-next-filler)
                     (insert-step-instrumenting function)))
                  (:direct
-                  `((let ((offset (static-fun-offset fun)))
-                       (cond ((typep offset 'short-immediate)
-                              (inst #-64-bit lw #+64-bit ld function null-tn offset))
-                             ((typep (+ nil-value offset) 'u+i-immediate)
-                              (multiple-value-bind (u i)
-                                  (u-and-i-inst-immediate (+ nil-value offset))
-                                (inst lui function u)
-                                (inst #-64-bit lw #+64-bit ld function function i)))
-                             (t
-                              (error "Static function offset for ~a too far." fun)))))))
+                  `((etypecase (static-fun-offset fun)
+                      (short-immediate
+                       (inst #-64-bit lw #+64-bit ld function null-tn (static-fun-offset fun)))
+                      (u+i-immediate
+                       (multiple-value-bind (u i)
+                           (u-and-i-inst-immediate (static-fun-offset fun))
+                         (inst lui function u)
+                         (inst add function null-tn function)
+                         (inst #-64-bit lw #+64-bit ld function function i)))))))
              (loop
                (if filler
                    (do-next-filler)
                    (return)))
 
              (note-this-location vop :call-site)
-             (lisp-jump function))
+             (inst jalr ,(if (eq return :tail)
+                             'zero-tn
+                             'ra-tn)
+                   function
+                   (- (ash simple-fun-insts-offset word-shift)
+                      fun-pointer-lowtag)))
 
            ,@(ecase return
                (:fixed
-                '((emit-return-pc lra-label)
-                  (default-unknown-values vop values nvals move-temp lip lra-label)
+                '((emit-label label)
+                  (default-unknown-values vop values nvals move-temp lip label)
                   (when cur-nfp
                     (load-stack-tn cur-nfp nfp-save))))
                (:unknown
-                '((emit-return-pc lra-label)
+                '((emit-label label)
                   (note-this-location vop :unknown-return)
                   (receive-unknown-values values-start nvals start count
-                                          lra-label lip)
+                                          label lip)
                   (when cur-nfp
                     (load-stack-tn cur-nfp nfp-save))))
                (:tail)))))))
@@ -735,22 +742,22 @@
    (args-arg :scs (any-reg) :target args)
    (function-arg :scs (descriptor-reg) :target lexenv)
    (old-fp-arg :scs (any-reg) :target old-fp)
-   (lra-arg :scs (descriptor-reg) :target lra))
+   (ra-arg :scs (any-reg) :target ra))
   (:temporary (:sc any-reg :offset nl0-offset :from (:argument 0)) args)
   (:temporary (:sc any-reg :offset lexenv-offset :from (:argument 1)) lexenv)
   (:temporary (:sc any-reg :offset ocfp-offset :from (:argument 2)) old-fp)
-  (:temporary (:sc any-reg :offset lra-offset :from (:argument 3)) lra)
+  (:temporary (:sc any-reg :offset ra-offset :from (:argument 3)) ra)
   (:vop-var vop)
   (:generator 75
     ;; Move these into the passing locations if they are not already there.
     (move args args-arg)
     (move lexenv function-arg)
     (move old-fp old-fp-arg)
-    (move lra lra-arg)
+    (move ra ra-arg)
     ;; Clear the number stack if anything is there.
     (clear-number-stack vop)
     ;; And jump to the assembly routine.
-    (invoke-asm-routine 'tail-call-variable)))
+    (inst jal zero-tn (make-fixup 'tail-call-variable :assembly-routine))))
 
 
 ;;;; Unknown values return:
@@ -763,8 +770,10 @@
 ;;; Return a single value using the unknown-values convention.
 (define-vop (return-single)
   (:args (old-fp :scs (any-reg))
-         (return-pc :scs (descriptor-reg))
+         (return-pc :scs (any-reg) :target ra)
          (value))
+  (:temporary (:sc any-reg :offset ra-offset :from (:argument 1)) ra)
+  (:temporary (:sc any-reg :offset nargs-offset) nargs)
   (:ignore value)
   (:vop-var vop)
   (:generator 6
@@ -774,7 +783,9 @@
     (move csp-tn cfp-tn)
     (move cfp-tn old-fp)
     ;; Out of here.
-    (lisp-return return-pc :single-value)))
+    (inst li nargs -1) ; mark single value return
+    (move ra return-pc)
+    (inst jalr zero-tn ra 0)))
 
 ;;; Do unknown-values return of a fixed number of values.  The Values
 ;;; are required to be set up in the standard passing locations.
@@ -791,7 +802,7 @@
                             collect (gensym))))
                `(define-vop (return)
                   (:args (old-fp :scs (any-reg))
-                         (return-pc :scs (descriptor-reg) :to (:eval 1))
+                         (return-pc :scs (any-reg) :to (:eval 1) :target ra)
                          (values :more t))
                   (:ignore values)
                   ,@(loop for an-offset in *register-arg-offsets*
@@ -802,6 +813,7 @@
                                                ,an))
                   (:temporary (:sc any-reg :offset nargs-offset) nargs)
                   (:temporary (:sc any-reg :offset ocfp-offset) val-ptr)
+                  (:temporary (:sc any-reg :offset ra-offset :from (:eval 1)) ra)
                   (:info nvals)
                   (:vop-var vop)
                   (:generator 6
@@ -822,7 +834,8 @@
                       (dolist (reg (subseq (list ,@a) nvals))
                         (move reg null-tn)))
                     ;; And away we go.
-                    (lisp-return return-pc :multiple-values))))))
+                    (move ra return-pc)
+                    (inst jalr zero-tn ra 0))))))
   (frob))
 
 ;;; Do unknown-values return of an arbitrary number of values (passed
@@ -832,11 +845,11 @@
 ;;; assembly-routine.
 (define-vop (return-multiple)
   (:args (old-fp-arg :scs (any-reg) :target old-fp)
-         (lra-arg :scs (descriptor-reg) :target lra)
+         (return-pc :scs (any-reg) :target ra)
          (vals-arg :scs (any-reg) :target vals)
          (nvals-arg :scs (any-reg) :target nvals))
   (:temporary (:sc any-reg :offset nl1-offset :from (:argument 0)) old-fp)
-  (:temporary (:sc descriptor-reg :offset lra-offset :from (:argument 1)) lra)
+  (:temporary (:sc any-reg :offset ra-offset :from (:argument 1)) ra)
   (:temporary (:sc any-reg :offset nl0-offset :from (:argument 2)) vals)
   (:temporary (:sc any-reg :offset nargs-offset :from (:argument 3)) nvals)
   (:temporary (:scs (descriptor-reg) :offset a0-offset) a0)
@@ -854,15 +867,17 @@
     ;; Return with one value.
     (move csp-tn cfp-tn)
     (move cfp-tn old-fp-arg)
-    (lisp-return lra-arg :single-value)
+    (inst li nargs-tn -1) ; mark single value return
+    (move ra return-pc)
+    (inst jalr zero-tn ra 0)
 
     NOT-SINGLE
     (move old-fp old-fp-arg)
-    (move lra lra-arg)
+    (move ra return-pc)
     (move vals vals-arg)
     (move nvals nvals-arg)
 
-    (invoke-asm-routine 'return-multiple)))
+    (inst jal zero-tn (make-fixup 'return-multiple :assembly-routine))))
 
 
 ;;;; XEP hackery:
@@ -892,6 +907,10 @@
   (:temporary (:sc any-reg :offset nl1-offset) count)
   (:temporary (:sc any-reg :offset nl3-offset) dest)
   (:temporary (:sc descriptor-reg :offset l0-offset) temp)
+  ;; EXTRA-TEMP can possibly be eliminated. But since TEMP is wired to L0, it is an
+  ;; arg-passing reg which gets utilized in (NTH I *REGISTER-ARG-TNS*) and so
+  ;; should not be clobbered with random data there. I think.
+  (:temporary (:sc unsigned-reg) extra-temp)
   (:vop-var vop)
   (:info fixed)
   (:generator 20
@@ -901,8 +920,8 @@
           (delta (- (sb-allocated-size 'control-stack) fixed)))
       ;; Compute the end of the fixed stack frame (start of the MORE arg
       ;; area) into RESULT.
-      (inst addi result cfp-tn
-            (* n-word-bytes (sb-allocated-size 'control-stack)))
+      (add-imm result cfp-tn
+            (* n-word-bytes (sb-allocated-size 'control-stack)) 'copy-more-arg extra-temp)
       ;; Compute the end of the MORE arg area (and our overall frame
       ;; allocation) into the stack pointer.
       (cond ((zerop fixed)
@@ -951,7 +970,7 @@
                ;; the list starting from the end (so that we don't
                ;; overwrite any elements before they're copied).
                (inst bge result dest do-regs)
-               (loadw temp dest (- (1+ delta)))
+               (load-frame-word temp dest (- (1+ delta)) 'copy-more-arg extra-temp)
                (storew temp dest -1)
                (inst subi dest dest n-word-bytes)
                (inst j loop))
@@ -961,6 +980,7 @@
                ;; need to copy the list from the start in order to close
                ;; the gap.
                (inst bge result dest done)
+               ;; Unlike above, this LOADW can't have IMM that is too large
                (loadw temp result (- delta))
                (storew temp result 0)
                (inst addi result result n-word-bytes)
@@ -972,7 +992,7 @@
       (when (< fixed register-arg-count)
         ;; Now we have to deposit any more args that showed up in registers.
         (when (zerop fixed)
-          (inst subi count nargs-tn (fixnumize fixed)))
+          (move count nargs-tn))
         (do ((i fixed (1+ i)))
             ((>= i register-arg-count))
           ;; Don't deposit any more than there are.
@@ -980,9 +1000,10 @@
           (inst subi count count (fixnumize 1))
           ;; Store it into the space reserved to it, by displacement
           ;; from the frame pointer.
-          (storew (nth i *register-arg-tns*) cfp-tn
+          (store-frame-word (nth i *register-arg-tns*) cfp-tn
                   (+ (sb-allocated-size 'control-stack)
-                     (- i fixed)))))
+                     (- i fixed))
+                  'copy-more-arg extra-temp)))
       (emit-label done)
       ;; Now that we're done with the &MORE args, we can set up the
       ;; number stack frame.
@@ -1002,7 +1023,7 @@
   (:generator 3
     (move value null-tn)
     (cond ((zerop index)
-           (inst bge zero-tn count done))
+           (inst beq count zero-tn done))
           (t
            (inst li index-temp (fixnumize index))
            (inst bge index-temp count done)))

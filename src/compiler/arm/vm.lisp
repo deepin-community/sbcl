@@ -22,13 +22,7 @@
              (let ((offset-sym (symbolicate name "-OFFSET")))
                `(eval-when (:compile-toplevel :load-toplevel :execute)
                   (defconstant ,offset-sym ,offset)
-                  (setf (svref *register-names* ,offset-sym) ,(symbol-name name)))))
-
-           (defregset (name &rest regs)
-             `(eval-when (:compile-toplevel :load-toplevel :execute)
-                (defparameter ,name
-                  (list ,@(mapcar #'(lambda (name)
-                                      (symbolicate name "-OFFSET")) regs))))))
+                  (setf (svref *register-names* ,offset-sym) ,(symbol-name name))))))
 
   (defreg r0 0)
   (defreg r1 1)
@@ -65,7 +59,7 @@
   (defconstant register-arg-count 3)
   ;; names and offsets for registers used to pass arguments
   (defregset *register-arg-offsets*  r0 r1 r2)
-  (defparameter *register-arg-names* '(r0 r1 r2)))
+  (defconstant-eqx register-arg-names '(r0 r1 r2) #'equal))
 
 
 ;;;; SB and SC definition:
@@ -210,9 +204,7 @@
                (let ((offset-sym (symbolicate name "-OFFSET"))
                      (tn-sym (symbolicate name "-TN")))
                  `(defparameter ,tn-sym
-                   (make-random-tn :kind :normal
-                    :sc (sc-or-lose ',sc)
-                    :offset ,offset-sym)))))
+                   (make-random-tn (sc-or-lose ',sc) ,offset-sym)))))
 
   (defregtn null descriptor-reg)
   (defregtn code descriptor-reg)
@@ -236,7 +228,10 @@
     (symbol
      (if (static-symbol-p value)
          immediate-sc-number
-         nil))))
+         nil))
+    (structure-object
+     (when (eq value sb-lockless:+tail+)
+       immediate-sc-number))))
 
 (defun boxed-immediate-sc-p (sc)
   (or (eql sc null-sc-number)
@@ -260,11 +255,9 @@
 
 ;;; A list of TN's describing the register arguments.
 ;;;
-(defparameter *register-arg-tns*
+(define-load-time-global *register-arg-tns*
   (mapcar #'(lambda (n)
-              (make-random-tn :kind :normal
-                              :sc (sc-or-lose 'descriptor-reg)
-                              :offset n))
+              (make-random-tn (sc-or-lose 'descriptor-reg) n))
           *register-arg-offsets*))
 
 ;;; This function is called by debug output routines that want a pretty name
@@ -281,31 +274,6 @@
       (constant (format nil "Const~D" offset))
       (immediate-constant "Immed")
       (float-registers (format nil "F~D" offset)))))
-
-(defun combination-implementation-style (node)
-  (flet ((valid-funtype (args result)
-           (sb-c::valid-fun-use node
-                                (sb-c::specifier-type
-                                 `(function ,args ,result)))))
-    (case (sb-c::combination-fun-source-name node)
-      (logtest
-       (cond
-         ((valid-funtype '(fixnum fixnum) '*)
-          (values :maybe nil))
-         ((valid-funtype '((signed-byte 32) (signed-byte 32)) '*)
-          (values :maybe nil))
-         ((valid-funtype '((unsigned-byte 32) (unsigned-byte 32)) '*)
-          (values :maybe nil))
-         (t (values :default nil))))
-      (logbitp
-       (cond
-         ((or (valid-funtype '((constant-arg (integer 0 29)) fixnum) '*)
-              (valid-funtype '((constant-arg (integer 0 31)) (signed-byte 32)) '*)
-              (valid-funtype '((constant-arg (integer 0 31)) (unsigned-byte 32)) '*))
-          (values :transform '(lambda (index integer)
-                               (%logbitp integer index))))
-         (t (values :default nil))))
-      (t (values :default nil)))))
 
 (defun primitive-type-indirect-cell-type (ptype)
   (declare (ignore ptype))

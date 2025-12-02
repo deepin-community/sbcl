@@ -81,12 +81,12 @@
   (:temporary (:scs (descriptor-reg)) temp)
   (:temporary (:scs (interior-reg)) lip)
   (:generator 22
-    (inst addi block cfp-tn (tn-byte-offset tn))
+    (add-imm block cfp-tn (tn-byte-offset tn) 'make-unwind-block temp)
     (load-current-unwind-protect-block temp)
     (storew temp block unwind-block-uwp-slot)
     (storew cfp-tn block unwind-block-cfp-slot)
     (storew code-tn block unwind-block-code-slot)
-    (inst compute-lra temp lip entry-label code-tn)
+    (inst compute-ra-from-code temp code-tn lip entry-label)
     (storew temp block catch-block-entry-pc-slot)))
 
 ;;; Like Make-Unwind-Block, except that we also store in the specified tag, and
@@ -100,12 +100,20 @@
   (:temporary (:scs (descriptor-reg) :target block :to (:result 0)) result)
   (:temporary (:scs (interior-reg)) lip)
   (:generator 44
-    (inst addi result cfp-tn (tn-byte-offset tn))
+    ;; ADD-IMM needs 3 instructions usually, but this way almost always needs
+    ;; at most 2 instructions in all likelihood.
+    (do ((src-operand cfp-tn)
+         (imm (tn-byte-offset tn)))
+        ((zerop imm))
+      (let ((short-imm (min imm 2040))) ; 2040 = maximum short immediate
+        (inst addi result src-operand short-imm)
+        (setq src-operand result)
+        (zerop (decf imm short-imm))))
     (load-current-unwind-protect-block temp)
     (storew temp result catch-block-uwp-slot)
     (storew cfp-tn result catch-block-cfp-slot)
     (storew code-tn result catch-block-code-slot)
-    (inst compute-lra temp lip entry-label code-tn)
+    (inst compute-ra-from-code temp code-tn lip entry-label)
     (storew temp result catch-block-entry-pc-slot)
 
     (storew tag result catch-block-tag-slot)
@@ -155,7 +163,7 @@
   (:save-p :force-to-stack)
   (:vop-var vop)
   (:generator 30
-    (emit-return-pc label)
+    (emit-label label)
     (note-this-location vop :non-local-entry)
     (cond ((zerop nvals))
           ((= nvals 1)
@@ -186,6 +194,19 @@
                     (store-stack-tn tn move-temp))))))))
     (load-stack-tn csp-tn sp)))
 
+(define-vop (nlx-entry-single)
+  (:args (sp)
+         (value))
+  (:results (res :from :load))
+  (:info label)
+  (:save-p :force-to-stack)
+  (:vop-var vop)
+  (:generator 30
+    (emit-label label)
+    (note-this-location vop :non-local-entry)
+    (move res value)
+    (load-stack-tn csp-tn sp)))
+
 (define-vop (nlx-entry-multiple)
   (:args (top :target result)
          (src)
@@ -203,7 +224,7 @@
   (:save-p :force-to-stack)
   (:vop-var vop)
   (:generator 30
-    (emit-return-pc label)
+    (emit-label label)
     (note-this-location vop :non-local-entry)
 
     (let ((loop (gen-label))
@@ -237,5 +258,5 @@
   (:ignore block start count)
   (:vop-var vop)
   (:generator 0
-    (emit-return-pc label)
+    (emit-label label)
     (note-this-location vop :non-local-entry)))

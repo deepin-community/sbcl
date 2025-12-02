@@ -11,7 +11,8 @@
 
 (in-package "SB-VM")
 
-(defconstant-eqx +fixup-kinds+ #(:absolute :absolute64 :layout-id :b :ba :ha :l) #'equalp)
+(defconstant-eqx +fixup-kinds+ #(:absolute :layout-id :b :ba :ha :l :rldic-m :addis+ld)
+  #'equalp)
 
 ;;; NUMBER-STACK-DISPLACEMENT
 ;;;
@@ -30,13 +31,7 @@
                (let ((offset-sym (symbolicate name "-OFFSET")))
                  `(eval-when (:compile-toplevel :load-toplevel :execute)
                    (defconstant ,offset-sym ,offset)
-                   (setf (svref *register-names* ,offset-sym) ,(symbol-name name)))))
-
-           (defregset (name &rest regs)
-               `(eval-when (:compile-toplevel :load-toplevel :execute)
-                 (defparameter ,name
-                   (list ,@(mapcar #'(lambda (name)
-                                       (symbolicate name "-OFFSET")) regs))))))
+                   (setf (svref *register-names* ,offset-sym) ,(symbol-name name))))))
 
   (defreg zero 0)
   (defreg nsp 1)
@@ -55,7 +50,7 @@
   (defreg bsp 14)
   (defreg cfp 15)
   (defreg csp 16)
-  (defreg alloc 17)
+  (defreg gc-card-table 17)
   (defreg null 18)
   ;; Use of a tagged pointer in reg_CODE on PPC64 is expensive, adding an extra
   ;; instruction to each load of a boxed constant. We should allow this register
@@ -89,7 +84,7 @@
 
 
  (defregset *register-arg-offsets*  a0 a1 a2 a3)
- (defparameter register-arg-names '(a0 a1 a2 a3)))
+ (defconstant-eqx register-arg-names '(a0 a1 a2 a3) #'equal))
 
 
 
@@ -225,18 +220,20 @@
 
 ;;;; Make some random tns for important registers.
 
+(defparameter thread-base-tn
+  (make-random-tn (sc-or-lose 'unsigned-reg) thread-offset))
+(defparameter card-table-base-tn
+  (make-random-tn (sc-or-lose 'unsigned-reg) gc-card-table-offset))
+
 (macrolet ((defregtn (name sc)
                (let ((offset-sym (symbolicate name "-OFFSET"))
                      (tn-sym (symbolicate name "-TN")))
                  `(defparameter ,tn-sym
-                   (make-random-tn :kind :normal
-                    :sc (sc-or-lose ',sc)
-                    :offset ,offset-sym)))))
+                   (make-random-tn (sc-or-lose ',sc) ,offset-sym)))))
 
   (defregtn lip interior-reg)
   (defregtn null descriptor-reg)
   (defregtn code descriptor-reg)
-  (defregtn alloc any-reg)
   (defregtn lra descriptor-reg)
   (defregtn lexenv descriptor-reg)
 
@@ -259,7 +256,10 @@
     (symbol
      (if (static-symbol-p value)
          immediate-sc-number
-         nil))))
+         nil))
+    (structure-object
+     (when (eq value sb-lockless:+tail+)
+       immediate-sc-number))))
 
 (defun boxed-immediate-sc-p (sc)
   (or (eql sc null-sc-number)
@@ -289,16 +289,10 @@
 
 ;;; A list of TN's describing the register arguments.
 ;;;
-(defparameter *register-arg-tns*
+(define-load-time-global *register-arg-tns*
   (mapcar #'(lambda (n)
-              (make-random-tn :kind :normal
-                              :sc (sc-or-lose 'descriptor-reg)
-                              :offset n))
+              (make-random-tn (sc-or-lose 'descriptor-reg) n))
           *register-arg-offsets*))
-
-(defparameter thread-base-tn
-  (make-random-tn :kind :normal :sc (sc-or-lose 'unsigned-reg)
-                  :offset thread-offset))
 
 (export 'single-value-return-byte-offset)
 
@@ -320,55 +314,6 @@
       (constant (format nil "Const~D" offset))
       (immediate-constant "Immed"))))
 
-(defun combination-implementation-style (node)
-  (declare (type sb-c::combination node) (ignore node))
-  (values :default nil))
-
-;;; The 32-bit constants below are obviously wrong.
-#+nil
-(defun combination-implementation-style (node)
-  (declare (type sb-c::combination node))
-  (flet ((valid-funtype (args result)
-           (sb-c::valid-fun-use node
-                                (sb-c::specifier-type
-                                 `(function ,args ,result)))))
-    (case (sb-c::combination-fun-source-name node)
-      (logtest
-       (cond
-         ((or (valid-funtype '(fixnum fixnum) '*)
-              (valid-funtype '((signed-byte 32) (signed-byte 32)) '*)
-              (valid-funtype '((unsigned-byte 32) (unsigned-byte 32)) '*))
-          (values :maybe nil))
-         (t (values :default nil))))
-      (logbitp
-       (cond
-         ((or (valid-funtype '((constant-arg (integer 0 29)) fixnum) '*)
-              (valid-funtype '((constant-arg (integer 0 31)) (signed-byte 32)) '*)
-              (valid-funtype '((constant-arg (integer 0 31)) (unsigned-byte 32)) '*))
-          (values :transform '(lambda (index integer)
-                               (%logbitp integer index))))
-         (t (values :default nil))))
-      ;; FIXME: can handle MIN and MAX here
-      (%ldb
-       (flet ((validp (type width)
-                (and (valid-funtype `((constant-arg (integer 1 29))
-                                      (constant-arg (mod ,width))
-                                      ,type)
-                                    'fixnum)
-                     (destructuring-bind (size posn integer)
-                         (sb-c::basic-combination-args node)
-                       (declare (ignore integer))
-                       (<= (+ (sb-c:lvar-value size)
-                              (sb-c:lvar-value posn))
-                           width)))))
-         (if (or (validp 'fixnum 29)
-                 (validp '(signed-byte 32) 32)
-                 (validp '(unsigned-byte 32) 32))
-             (values :transform '(lambda (size posn integer)
-                                  (%%ldb integer size posn)))
-             (values :default nil))))
-      (t (values :default nil)))))
-
 (defun primitive-type-indirect-cell-type (ptype)
   (declare (ignore ptype))
   nil)
@@ -380,6 +325,4 @@
 ;;; See ld instruction for reference.
 ;;; See also the comments above DEFINE-INDEXER for some thoughts on how to
 ;;; regain the ability to subtract lowtags "for free".
-(defglobal temp-reg-tn (make-random-tn :kind :normal
-                                       :sc (sc-or-lose 'unsigned-reg)
-                                       :offset zero-offset))
+(defglobal temp-reg-tn (make-random-tn (sc-or-lose 'unsigned-reg) zero-offset))

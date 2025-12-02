@@ -22,8 +22,7 @@
 #include <unistd.h>
 #include <errno.h>
 
-#include "sbcl.h"
-#include "./signal.h"
+#include "genesis/sbcl.h"
 #include "os.h"
 #include "arch.h"
 #include "globals.h"
@@ -54,7 +53,8 @@ int arch_os_thread_init(struct thread *thread) {
     stack_t sigstack;
 #ifdef LISP_FEATURE_SB_THREAD
     struct user_desc desc = {
-        0, (unsigned long) thread, dynamic_values_bytes,
+        0, (unsigned long) thread,
+        (dynamic_values_bytes>>12)-1,
         1, 0, 0, 1, 0, 1
     };
 
@@ -123,12 +123,6 @@ os_context_register_addr(os_context_t *context, int offset)
     default: return 0;
     }
     return &context->uc_mcontext.gregs[offset];
-}
-
-os_context_register_t *
-os_context_pc_addr(os_context_t *context)
-{
-    return &context->uc_mcontext.gregs[14]; /*  REG_EIP */
 }
 
 os_context_register_t *

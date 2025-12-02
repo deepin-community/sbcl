@@ -20,14 +20,6 @@
   (%primitive print "too early in cold init to recover from errors")
   (%halt))
 
-(defun !cold-failed-aver (expr)
-  ;; output the message and invoke ldb monitor
-  (terpri)
-  (write-line "failed AVER:")
-  (write expr)
-  (terpri)
-  (%halt))
-
 ;;; last-ditch error reporting for things which should never happen
 ;;; and which, if they do happen, are sufficiently likely to torpedo
 ;;; the normal error-handling system that we want to bypass it
@@ -41,24 +33,19 @@
 
 ;;; a list of toplevel things set by GENESIS
 (defvar *!cold-toplevels*)
-(defvar *!cold-defsymbols*)  ; "easy" DEFCONSTANTs
 
 ;;; a SIMPLE-VECTOR set by GENESIS
 (defvar *!load-time-values*)
 
-  ;; FIXME: Perhaps we should make SHOW-AND-CALL-AND-FMAKUNBOUND, too,
-  ;; and use it for most of the cold-init functions. (Just be careful
-  ;; not to use it for the COLD-INIT-OR-REINIT functions.)
+;; FIXME: Perhaps we should make SHOW-AND-CALL-AND-FMAKUNBOUND, too,
+;; and use it for most of the cold-init functions. (Just be careful
+;; not to use it for the COLD-INIT-OR-REINIT functions.)
 (defmacro show-and-call (name)
-    `(progn
-       (/show "Calling" ,(symbol-name name))
-       (,name)))
+  `(progn
+     (/show "Calling" ,(symbol-name name))
+     (,name)))
 
 (defun !c-runtime-noinform-p () (/= (extern-alien "lisp_startup_options" char) 0))
-
-(defun !format-cold-init ()
-  (sb-format::!late-format-init)
-  (sb-format::!format-directives-init))
 
 ;;; Allows the SIGNAL function to be called early.
 (defun !signal-function-cold-init ()
@@ -66,7 +53,7 @@
   (progn
     (setq *break-on-signals* nil)
     (setq sb-kernel::*current-error-depth* 0))
-  (setq *stack-top-hint* nil))
+  (setq sb-debug:*stack-top-hint* nil))
 
 (defun !printer-control-init ()
   (setq *print-readably* nil
@@ -76,6 +63,7 @@
         *print-radix* nil
         *print-vector-length* nil
         *print-circle* nil
+        *print-circle-not-shared* nil
         *print-case* :upcase
         *print-array* t
         *print-gensym* t
@@ -86,18 +74,68 @@
         *suppress-print-errors* nil
         *current-level-in-print* 0))
 
+;;; Create a stream that works early.
+(defun !make-cold-stderr-stream ()
+  (let* ((stderr
+           #-win32 2
+           #+win32 (sb-win32::get-std-handle-or-null sb-win32::+std-error-handle+))
+         (ucs2 #+win32 (sb-win32::console-handle-p stderr))
+         (char-size (if ucs2 4 1))
+         (buf (make-string 1 :element-type (if ucs2 'character 'base-char) :initial-element #\Space)))
+    (flet ((cout (stream ch)
+             (declare (ignore stream))
+             (setf (char buf 0) ch)
+             (sb-unix:unix-write stderr buf 0 char-size)
+             ch))
+      (%make-fd-stream
+       :cout #'cout
+       :sout (lambda (stream string start end)
+               (declare (simple-string string) (index start end))
+               (loop for i from start below end
+                     do (cout stream (char string i))))
+       :misc (lambda (stream operation arg1)
+               (declare (ignore stream arg1))
+               (stream-misc-case (operation :default nil)
+                                 (:charpos ; impart just enough smarts to make FRESH-LINE dtrt
+                                  (if (eql (char buf 0) #\newline) 0 1))))))))
+
+(defun !xc-sanity-checks ()
+  ;; Verify on startup that some constants were dumped reflecting the
+  ;; correct action of our vanilla-host-compatible functions.  For
+  ;; now, just SXHASH is checked.
+
+  ;; Parallelized build doesn't get the full set of data because the
+  ;; side effect of data recording when invoking compile-time
+  ;; functions aren't propagated back to process that forked the
+  ;; children doing the grunt work.
+  (let ((list (with-open-file (stream "output/sxhash-calls.lisp-expr"
+                                      :if-does-not-exist nil)
+                (when stream
+                  (let ((*package* (find-package "SB-KERNEL"))) (read stream))))))
+    (dolist (item list)
+      (destructuring-bind (object hash) item
+        (let ((calc (sxhash object)))
+          (unless (= hash calc)
+            (error "cross-compiler SXHASH failure on ~S: ~X vs ~X" object hash calc)))))
+    (when list
+      (format t "~&cross-compiler SXHASH tests passed: ~D cases~%" (length list)))))
+
 ;;; called when a cold system starts up
-(defun !cold-init (&aux (real-choose-symbol-out-fun #'choose-symbol-out-fun)
-                        (real-failed-aver-fun #'%failed-aver))
+(defun !cold-init ()
   "Give the world a shove and hope it spins."
 
   (/show0 "entering !COLD-INIT")
   #+sb-show (setq */show* t)
-  (/show0 "cold-initializing streams")
-  (sb-impl::!cold-stream-init)
+  (setq sb-vm::*immobile-codeblob-tree* nil
+        sb-vm::*dynspace-codeblob-tree* nil)
+  (setq sb-kernel::*defstruct-hooks* '(sb-kernel::!bootstrap-defstruct-hook)
+        sb-kernel::*struct-accesss-fragments-delayed* nil)
+  (let ((stream (!make-cold-stderr-stream)))
+    (setq *error-output* stream
+          *standard-output* stream
+          *trace-output* stream))
   (show-and-call !signal-function-cold-init)
   (show-and-call !printer-control-init) ; needed before first instance of FORMAT or WRITE-STRING
-  (setq *unparse-fun-type-simplify* nil) ; needed by TLFs in target-error.lisp
   (setq sb-unix::*unblock-deferrables-on-enabling-interrupts-p* nil) ; needed by LOAD-LAYOUT called by CLASSES-INIT
   (setq *print-length* 6
         *print-level* 3)
@@ -106,42 +144,50 @@
   ;; debugging.
   (show-and-call !format-cold-init)
   (unless (!c-runtime-noinform-p)
-    ;; I'd like FORMAT to remain working in cold-init, where it does work,
-    ;; hence the conditional.
-    #+(or x86 x86-64) (format t "COLD-INIT... ")
-    #-(or x86 x86-64) (write-string "COLD-INIT... "))
+    (write-string "COLD-INIT... "))
 
   ;; Anyone might call RANDOM to initialize a hash value or something;
   ;; and there's nothing which needs to be initialized in order for
   ;; this to be initialized, so we initialize it right away.
   (show-and-call !random-cold-init)
 
+  (setq sb-c::*compilation-unit* nil) ; its DEFVAR is not processed yet
+
   ;; All sorts of things need INFO and/or (SETF INFO).
   (/show0 "about to SHOW-AND-CALL !GLOBALDB-COLD-INIT")
   (show-and-call !globaldb-cold-init)
   (show-and-call !function-names-init)
-
-  (setf (symbol-function '%failed-aver) #'!cold-failed-aver)
+  (show-and-call !pathname-cold-init)
 
   ;; And now *CURRENT-THREAD*
   (sb-thread::init-main-thread)
 
+  (show-and-call !hash-table-cold-init)
+
+  ;; not sure why this is needed on some architectures. Dark magic.
+  #-linkage-space
+  (setf (fdefn-fun (find-or-create-fdefn '%coerce-callable-for-call))
+        #'%coerce-callable-to-fun)
+  (show-and-call !loader-cold-init)
+  #+linkage-space (show-and-call sb-vm::!initialize-lisp-linkage-table)
   ;; Assert that FBOUNDP doesn't choke when its answer is NIL.
   ;; It was fine if T because in that case the legality of the arg is certain.
   ;; And be extra paranoid - ensure that it really gets called.
-  (locally (declare (notinline fboundp)) (fboundp '(setf !zzzzzz)))
+  (locally
+      (declare (notinline fboundp) (optimize safety)) ; is unsafely flushable
+    (fboundp '(setf !zzzzzz)))
 
   ;; Printing of symbols requires that packages be filled in, because
   ;; OUTPUT-SYMBOL calls FIND-SYMBOL to determine accessibility. Also
   ;; allows IN-PACKAGE to work.
   (show-and-call !package-cold-init)
-  ;; debug machinery needed for printing symbols
-  #+sb-devel
-  (progn
-    (!readtable-cold-init)
-    ;; Because L-T-V forms have not executed, CHOOSE-SYMBOL-OUT-FUN doesn't work.
-    (setf (symbol-function 'choose-symbol-out-fun)
-          (lambda (&rest args) (declare (ignore args)) #'output-preserve-symbol)))
+
+  ;; The readtable needs to be initialized for printing symbols early,
+  ;; which is useful for debugging.
+  (!readtable-cold-init)
+  (write-string "Checking symbol printer: ")
+  (write 't)
+  (terpri)
 
   ;; *RAW-SLOT-DATA* is essentially a compile-time constant
   ;; but isn't dumpable as such because it has functions in it.
@@ -149,6 +195,13 @@
 
   ;; Must be done before any non-opencoded array references are made.
   (show-and-call sb-vm::!hairy-data-vector-reffer-init)
+
+  ;; It's not unreasonable to call PARSE-INTEGER in cold-init, which demands that
+  ;; WHITESPACE[1]P work properly, so it needs *STANDARD-READTABLE* established.
+  (let ((*readtable* (make-readtable)))
+    (show-and-call !reader-cold-init)
+    ;; *STANDARD-READTABLE* is assigned last to avoid an error about altering it.
+    (setf *standard-readtable* *readtable*))
 
   ;; Various toplevel forms call MAKE-ARRAY, which calls SUBTYPEP, so
   ;; the basic type machinery needs to be initialized before toplevel
@@ -158,10 +211,6 @@
   (show-and-call sb-kernel::!primordial-type-cold-init)
 
   (show-and-call !type-cold-init)
-  ;; FIXME: It would be tidy to make sure that that these cold init
-  ;; functions are called in the same relative order as the toplevel
-  ;; forms of the corresponding source files.
-
   (show-and-call !policy-cold-init-or-resanify)
   (/show0 "back from !POLICY-COLD-INIT-OR-RESANIFY")
 
@@ -170,33 +219,15 @@
   ;; to the subclasses of STRUCTURE-OBJECT.
   (show-and-call sb-kernel::!set-up-structure-object-class)
 
-  ;; Genesis is able to perform some of the work of DEFCONSTANT, but
-  ;; not all of it. It assigns symbol values, but can not manipulate
-  ;; globaldb. Therefore, a subtlety of these macros for bootstrap is
-  ;; that we see each DEFthing twice: once during cold-load and again
-  ;; here.
-  (setq sb-pcl::*!docstrings* nil) ; needed by %DEFCONSTANT
-  (dolist (x *!cold-defsymbols*)
-    (destructuring-bind (fun name source-loc . docstring) x
-      (aver (boundp name)) ; it's a bug if genesis didn't initialize
-      (ecase fun
-        (%defconstant
-         (apply #'%defconstant name (symbol-value name) source-loc docstring)))))
-
   (unless (!c-runtime-noinform-p)
-    #+(or x86 x86-64) (format t "[Length(TLFs)=~D]" (length *!cold-toplevels*))
-    #-(or x86 x86-64) (write `("Length(TLFs)=" ,(length *!cold-toplevels*)) :escape nil))
+    (write `("Length(TLFs)=" ,(length *!cold-toplevels*)) :escape nil))
 
+  (setq sb-pcl::*!docstrings* nil) ; needed before any documentation is set
   (setq sb-c::*queued-proclaims* nil) ; needed before any proclaims are run
 
-  (loop with *package* = *package* ; rebind to self, as if by LOAD
-        for index-in-cold-toplevels from 0
-        for toplevel-thing in (prog1 *!cold-toplevels*
-                                 (makunbound '*!cold-toplevels*))
-        do
-      #+sb-show
-      (when (zerop (mod index-in-cold-toplevels 1000))
-        (/show index-in-cold-toplevels))
+  (/show0 "calling cold toplevel forms and fixups")
+  (let ((*package* *package*)) ; rebind to self, as if by LOAD
+    (dolist (toplevel-thing *!cold-toplevels*)
       (typecase toplevel-thing
         (function
          (funcall toplevel-thing))
@@ -205,23 +236,28 @@
                (funcall (second toplevel-thing))))
         ((cons (eql :load-time-value-fixup))
          (destructuring-bind (object index value) (cdr toplevel-thing)
+           (let ((replacement (svref *!load-time-values* value)))
+             (etypecase object
+               (code-component
+                (aver (unbound-marker-p (code-header-ref object index)))
+                (setf (code-header-ref object index) replacement))
+               (cons
+                (aver (= index 0))
+                (aver (unbound-marker-p (car object)))
+                (rplaca object replacement))))))
+        ((cons (eql :named-constant))
+         (destructuring-bind (object index name) (cdr toplevel-thing)
            (aver (typep object 'code-component))
            (aver (unbound-marker-p (code-header-ref object index)))
-           (setf (code-header-ref object index) (svref *!load-time-values* value))))
+           (sb-fasl::named-constant-set object index name)))
         ((cons (eql :begin-file))
          (unless (!c-runtime-noinform-p) (print (cdr toplevel-thing))))
         (t
-         (!cold-lose "bogus operation in *!COLD-TOPLEVELS*"))))
+         (!cold-lose "bogus operation in *!COLD-TOPLEVELS*")))))
   (/show0 "done with loop over cold toplevel forms and fixups")
   (unless (!c-runtime-noinform-p) (terpri))
 
-  ;; Precise GC seems to think these symbols are live during the final GC
-  ;; which in turn enlivens a bunch of other "*!foo*" symbols.
-  ;; Setting them to NIL helps a little bit.
-  (setq *!cold-defsymbols* nil *!cold-toplevels* nil)
-
-  ;; Now that L-T-V forms have executed, the symbol output chooser works.
-  (setf (symbol-function 'choose-symbol-out-fun) real-choose-symbol-out-fun)
+  (makunbound '*!cold-toplevels*) ; so it gets GC'd
 
   #+win32 (show-and-call reinit-internal-real-time)
 
@@ -236,12 +272,22 @@
   ;; now that the type system is definitely initialized, fixup UNKNOWN
   ;; types that have crept in.
   (show-and-call !fixup-type-cold-init)
-  ;; run the PROCLAIMs.
-  (show-and-call !late-proclaim-cold-init)
 
-  (show-and-call !loader-cold-init)
+  ;; We run through queued-up type and ftype proclaims that were made
+  ;; before the type system was initialized, and (since it is now
+  ;; initalized) reproclaim them.
+  (loop for claim in sb-c::*queued-proclaims*
+        do
+        (when (eq (car claim) 'ftype)
+          ;; Avoid warnings about mismatched types.
+          (loop for name in (cddr claim)
+                do (setf (info :function :where-from name) :assumed)))
+        (proclaim claim))
+
+  (makunbound 'sb-c::*queued-proclaims*)
+
   (show-and-call os-cold-init-or-reinit)
-  (show-and-call !pathname-cold-init)
+  (show-and-call !lpn-cold-init)
 
   (show-and-call stream-cold-init-or-reset)
   (/show "Enabled buffered streams")
@@ -260,9 +306,6 @@
     (show-and-call !reader-cold-init)
     (show-and-call !sharpm-cold-init)
     (show-and-call !backq-cold-init)
-    ;; The *STANDARD-READTABLE* is assigned at last because the above
-    ;; functions would operate on the standard readtable otherwise---
-    ;; which would result in an error.
     (setf *standard-readtable* *readtable*))
   (setf *readtable* (copy-readtable *standard-readtable*))
   (setf sb-debug:*debug-readtable* (copy-readtable *standard-readtable*))
@@ -273,17 +316,19 @@
   (setf sb-kernel:*maximum-error-depth* 10)
   (/show0 "enabling internal errors")
   (setf (extern-alien "internal_errors_enabled" int) 1)
-  (setf (symbol-function '%failed-aver) real-failed-aver-fun)
 
   (show-and-call sb-disassem::!compile-inst-printers)
 
   ;; Toggle some readonly bits
+  #-sb-devel
   (dovector (sc sb-c:*backend-sc-numbers*)
     (when sc
       (logically-readonlyize (sb-c::sc-move-funs sc))
       (logically-readonlyize (sb-c::sc-load-costs sc))
       (logically-readonlyize (sb-c::sc-move-vops sc))
       (logically-readonlyize (sb-c::sc-move-costs sc))))
+
+  (show-and-call !xc-sanity-checks)
 
   ;; The system is finally ready for GC.
   (/show0 "enabling GC")
@@ -360,17 +405,18 @@ process to continue normally."
     ;; Until *CURRENT-THREAD* has been set, nothing the slightest bit complicated
     ;; can be called, as pretty much anything can assume that it is set.
     (when total ; newly started process, and not a failed save attempt
-      (sb-thread::init-main-thread))
-    ;; Initializing the standard streams calls ALLOC-BUFFER which calls FINALIZE
-    (finalizers-reinit)
+      (sb-thread::init-main-thread)
+      (rebuild-package-vector))
     ;; Initialize streams next, so that any errors can be printed
     (stream-reinit t)
+    (rebuild-pathname-cache)
     (os-cold-init-or-reinit)
     #-(and win32 (not sb-thread))
     (signal-cold-init-or-reinit)
     (setf (extern-alien "internal_errors_enabled" int) 1)
     (float-cold-init-or-reinit))
   (gc-reinit)
+  (finalizers-reinit)
   (foreign-reinit)
   #+win32 (reinit-internal-real-time)
   ;; If the debugger was disabled in the saved core, we need to
@@ -378,7 +424,8 @@ process to continue normally."
   (when (eq *invoke-debugger-hook* 'sb-debug::debugger-disabled-hook)
     (sb-debug::disable-debugger))
   (call-hooks "initialization" *init-hooks*)
-  #+sb-thread (finalizer-thread-start))
+  #+sb-thread (finalizer-thread-start)
+  (sb-vm::!setup-cpu-specific-routines))
 
 ;;;; some support for any hapless wretches who end up debugging cold
 ;;;; init code

@@ -81,7 +81,6 @@
 (defconstant eexist 17) ; #x11
 (defconstant eloop 40) ; #x28
 (defconstant epipe 32) ; #x20
-(defconstant espipe 29) ; #x1d
 (defconstant ewouldblock 11) ; #xb
 
 (defconstant sc-nprocessors-onln 84) ; #x54
@@ -127,6 +126,9 @@
 (defconstant sigwinch 28) ; #x1c
 (defconstant sigxcpu 24) ; #x18
 (defconstant sigxfsz 25) ; #x19
+(defconstant itimer-real 0) ; #x0
+(defconstant itimer-virtual 1) ; #x1
+(defconstant itimer-prof 2) ; #x2
 (defconstant fpe-intovf 2) ; #x2
 (defconstant fpe-intdiv 1) ; #x1
 (defconstant fpe-fltdiv 3) ; #x3
@@ -155,6 +157,9 @@
   (struct timespec
           (tv-sec (signed 32))
           (tv-nsec (signed 32))))
+
+(defconstant sizeof-timespec 8) ; #x8
+(defconstant sizeof-timeval 8) ; #x8
 
 (in-package "SB-KERNEL")
 

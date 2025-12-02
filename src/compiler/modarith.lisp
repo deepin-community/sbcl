@@ -124,7 +124,7 @@
              ((nil) 'unsigned-byte)
              ((t) 'signed-byte))
           ,width)
-         (foldable flushable movable)
+         (foldable flushable movable always-translatable)
        :derive-type (make-modular-fun-type-deriver ',prototype ,width ',signedp))))
 
 (defun %define-good-modular-fun (name kind signedp)
@@ -136,15 +136,20 @@
   `(%define-good-modular-fun ',name ',kind ',signedp))
 
 (defmacro define-modular-fun-optimizer
-    (name ((&rest lambda-list) kind signedp &key (width (gensym "WIDTH")))
+    (name ((&rest lambda-list) kind signedp &key (width (gensym "WIDTH"))
+                                                 result-width
+                                                 (node (gensym "NODE")))
      &body body)
   (%check-modular-fun-macro-arguments name kind lambda-list)
-  (with-unique-names (call args)
+  (with-unique-names (args result-width-name)
     `(setf (gethash ',name (modular-class-funs (find-modular-class ',kind ',signedp)))
-           (lambda (,call ,width)
-             (declare (type basic-combination ,call)
-                      (type (integer 0) ,width))
-             (let ((,args (basic-combination-args ,call)))
+           (lambda (,node ,width ,(or result-width
+                                   result-width-name))
+             (declare (type basic-combination ,node)
+                      (type (integer 0) ,width)
+                      ,@(unless result-width
+                          `((ignore ,result-width-name))))
+             (let ((,args (basic-combination-args ,node)))
                (when (= (length ,args) ,(length lambda-list))
                  (destructuring-bind ,lambda-list ,args
                    (declare (type lvar ,@lambda-list))
@@ -167,7 +172,7 @@
 ;;; modular version, if it exists, or NIL. If we have changed
 ;;; anything, we need to flush old derived types, because they have
 ;;; nothing in common with the new code.
-(defun cut-to-width (lvar kind width signedp)
+(defun cut-to-width (lvar kind width signedp &optional (result-width width))
   (declare (type lvar lvar) (type (integer 0) width))
   (let ((type (specifier-type (if (zerop width)
                                   '(eql 0)
@@ -175,15 +180,7 @@
                                        ((nil) 'unsigned-byte)
                                        ((t) 'signed-byte))
                                      ,width)))))
-    (labels ((reoptimize-node (node name)
-               (setf (node-derived-type node)
-                     (fun-type-returns
-                      (global-ftype name)))
-               (setf (lvar-%derived-type (node-lvar node)) nil)
-               (setf (node-reoptimize node) t)
-               (setf (block-reoptimize (node-block node)) t)
-               (reoptimize-component (node-component node) :maybe))
-             (insert-lvar-cut (lvar)
+    (labels ((insert-lvar-cut (lvar)
                "Insert a LOGAND/MASK-SIGNED-FIELD to cut the value of LVAR
                 to the required bit width. Returns T if any change was made.
 
@@ -213,13 +210,16 @@
                (filter-lvar lvar
                             (if signedp
                                 (lambda (dummy)
-                                  `(mask-signed-field ,width ,dummy))
+                                  `(truly-the (signed-byte ,width) (mask-signed-field ,width ,dummy)))
                                 (lambda (dummy)
-                                  `(logand ,dummy ,(ldb (byte width 0) -1)))))
+                                  `(truly-the (unsigned-byte ,width) (logand ,dummy ,(ldb (byte width 0) -1))))))
                (do-uses (node lvar)
                  (setf (block-reoptimize (node-block node)) t)
                  (reoptimize-component (node-component node) :maybe))
                t)
+             (change-return-type (node type)
+               (setf (node-derived-type node) type)
+               (setf (lvar-%derived-type (node-lvar node)) nil))
              (cut-node (node)
                "Try to cut a node to width. The primary return value is
                 whether we managed to cut (cleverly), and the second whether
@@ -242,12 +242,9 @@
                        (cond ((= constant-value new-value)
                               (values t nil)) ; we knew what to do and did nothing
                              (t
-                              (change-ref-leaf node (make-constant new-value)
+                              (change-ref-leaf node (find-constant new-value)
                                                :recklessly t)
-                              (let ((lvar (node-lvar node)))
-                                (setf (lvar-%derived-type lvar)
-                                      (and (lvar-has-single-use-p lvar)
-                                           (make-values-type :required (list (ctype-of new-value))))))
+                              (change-return-type node (make-values-type (list (ctype-of new-value))))
                               (setf (block-reoptimize (node-block node)) t)
                               (reoptimize-component (node-component node) :maybe)
                               (values t t)))))))
@@ -282,17 +279,18 @@
                                                 (modular-fun-info
                                                  (modular-fun-info-name modular-fun))
                                                 (function
-                                                 (funcall modular-fun node width)))
+                                                 (funcall modular-fun node width result-width)))
                                               :exit-if-null)
                                         (did-something nil)
                                         (over-wide nil))
                                (unless (eql modular-fun :good)
                                  (setq did-something t
                                        over-wide t)
-                                 (change-ref-leaf
-                                  fun-ref
-                                  (find-free-fun name "in a strange place"))
-                                 (setf (combination-kind node) :full))
+                                 (unless (eq name t)
+                                   (change-ref-leaf
+                                    fun-ref
+                                    (find-free-fun name "CUT-TO-WIDTH"))
+                                   (setf (combination-kind node) :full)))
                                (unless (functionp modular-fun)
                                  (dolist (arg (basic-combination-args node))
                                    (multiple-value-bind (change wide)
@@ -300,8 +298,34 @@
                                      (setf did-something (or did-something change)
                                            over-wide (or over-wide wide)))))
                                (when did-something
-                                 (reoptimize-node node name))
-                               (values t did-something over-wide)))))))))
+                                 ;; Can't rely on REOPTIMIZE-NODE, as it may neve get reoptimized.
+                                 ;; But the outer functions don't want the type to get
+                                 ;; widened and their VOPs may never be applied.
+                                 (change-return-type node
+                                                     (fun-type-returns (global-ftype (if (eq name t)
+                                                                                         fun-name
+                                                                                         name))))
+                                 (ir1-optimize-combination node))
+                               (values t did-something over-wide)))))))
+                 (cast
+                  ;; Cut (logand (+ x 1) m), which is (logand (the integer (+ x 1)) m),
+                  ;; and X can only be an integer for that to be true.
+                  (when (eq (cast-type-to-check node)
+                            (specifier-type 'integer))
+                    (let (did-something)
+                      (do-uses (combination (cast-value node))
+                        (when (and (combination-matches* '(+ -) '(* *) combination)
+                                   (almost-immediately-used-p (node-lvar combination) combination
+                                                              :flushable t))
+                          (destructuring-bind (a b) (combination-args combination)
+                            (when (or (not (types-equal-or-intersect (lvar-type a)
+                                                                     #1=(specifier-type '(or ratio (complex rational)))))
+                                      (not (types-equal-or-intersect (lvar-type b) #1#)))
+                              (when (cut-node combination)
+                                (setf did-something t))))))
+                      (when did-something
+                        (change-return-type node (values-specifier-type '(values integer &optional))))
+                      nil)))))
              (cut-lvar (lvar &key head
                         &aux did-something must-insert over-wide)
                "Cut all the LVAR's use nodes. If any of them wasn't handled
@@ -387,15 +411,16 @@
               ;; We cut to W not WIDTH if SIGNEDP is true, because
               ;; signed constant replacement needs to know which bit
               ;; in the field is the signed bit.
-              (let ((xact (cut-to-width x kind (if signedp w width) signedp))
-                    (yact (cut-to-width y kind (if signedp w width) signedp)))
+              (let ((xact (cut-to-width x kind (if signedp w width) signedp width))
+                    (yact (cut-to-width y kind (if signedp w width) signedp width)))
                 (declare (ignore xact yact))
                 nil) ; After fixing above, replace with T, meaning
                                         ; "don't reoptimize this (LOGAND) node any more".
               )))))))
 
+(setf (fun-info-optimizer (fun-info-or-lose 'logandc2)) #'logand-optimizer-optimizer)
+
 (defoptimizer (mask-signed-field optimizer) ((width x) node)
-  (declare (ignore width))
   (let ((result-type (single-value-type (node-derived-type node))))
     (multiple-value-bind (low high)
         (integer-type-numeric-bounds result-type)
@@ -428,31 +453,55 @@
                 nil) ; After fixing above, replace with T
               )))))))
 
+;;; Combine (ash (ash x 1) 1) into (ash x 2)
 (deftransform ash ((value amount))
   (let ((value-node (lvar-uses value)))
     (unless (combination-p value-node)
       (give-up-ir1-transform))
     (let ((inside-fun-name (lvar-fun-name (combination-fun value-node))))
-      (multiple-value-bind (prototype width)
-          (modular-version-info inside-fun-name :untagged nil)
-        (unless (eq (or prototype inside-fun-name) 'ash)
-          (give-up-ir1-transform))
-        (when (and width (not (constant-lvar-p amount)))
-          (give-up-ir1-transform))
-        (let ((inside-args (combination-args value-node)))
-          (unless (= (length inside-args) 2)
-            (give-up-ir1-transform))
-          (let ((inside-amount (second inside-args)))
-            (unless (and (constant-lvar-p inside-amount)
-                         (not (minusp (lvar-value inside-amount))))
-              (give-up-ir1-transform)))
-          (splice-fun-args value inside-fun-name 2)
-          (if width
+      (if (eq inside-fun-name 'ash)
+          (let* ((inside-args (combination-args value-node))
+                 (inside-amount (second inside-args))
+                 ;; Can't do anything if it shifts right erasing bits.
+                 (in-range (or (type-approximate-interval (lvar-type inside-amount))
+                               (give-up-ir1-transform)))
+                 (in-range (if (eq (interval-range-info in-range) '+)
+                               in-range
+                               (give-up-ir1-transform)))
+                 (out-range (type-approximate-interval (lvar-type amount)))
+                 (new-range (when out-range
+                              (interval-add in-range out-range))))
+
+            (when (and (or ;; Don't do it if the new amount won't shift in one direction
+                        (and new-range
+                             (not (interval-range-info new-range))
+                             (interval-range-info out-range))
+                        ;; Do not disturb the conversion to a right shift
+                        (combination-is (lvar-uses amount) '(%negate -)))
+                       ;; but not if it won't be inlined anyway
+                       (or (csubtypep (lvar-type value) (specifier-type 'word))
+                           (csubtypep (lvar-type value) (specifier-type 'sb-vm:signed-word))))
+              (give-up-ir1-transform))
+            (splice-fun-args value inside-fun-name 2)
+            `(lambda (value amount1 amount2)
+               (ash value (+ amount1 amount2))))
+          (multiple-value-bind (prototype width)
+              (modular-version-info inside-fun-name :untagged nil)
+            (unless (eq prototype 'ash)
+              (give-up-ir1-transform))
+            (when (not (constant-lvar-p amount))
+              (give-up-ir1-transform))
+            (let ((inside-args (combination-args value-node)))
+              (unless (= (length inside-args) 2)
+                (give-up-ir1-transform))
+              (let ((inside-amount (second inside-args)))
+                (unless (and (constant-lvar-p inside-amount)
+                             (not (minusp (lvar-value inside-amount))))
+                  (give-up-ir1-transform)))
+              (splice-fun-args value inside-fun-name 2)
               `(lambda (value amount1 amount2)
                  (logand (ash value (+ amount1 amount2))
-                         ,(1- (ash 1 (+ width (lvar-value amount))))))
-              `(lambda (value amount1 amount2)
-                 (ash value (+ amount1 amount2)))))))))
+                         ,(1- (ash 1 (+ width (lvar-value amount))))))))))))
 (macrolet
     ((def (left-name name kind width signedp)
        (declare (ignorable name))
@@ -463,26 +512,31 @@
             (defknown ,left-name (integer (integer 0)) (,type ,width)
                 (foldable flushable movable)
               :derive-type (make-modular-fun-type-deriver 'ash ',width ',signedp))
-            (define-modular-fun-optimizer ash ((integer count) ,kind ,signedp :width width)
+            (define-modular-fun-optimizer ash ((integer count) ,kind ,signedp :width width
+                                               :result-width result-width)
               (let ((integer-type (lvar-type integer))
                     (count-type (lvar-type count)))
                 (declare (ignorable integer-type))
                 (when (<= width ,width)
                   (cond ((or (and (constant-lvar-p count)
                                   (plusp (lvar-value count)))
-                             (csubtypep count-type
-                                        (specifier-type '(and unsigned-byte fixnum))))
+                             (csubtypep count-type (specifier-type 'word)))
                          (cut-to-width integer ,kind width ,signedp)
                          ',left-name)
                         #+(or arm64 x86-64)
                         ((and (not (constant-lvar-p count))
-                              (csubtypep count-type (specifier-type 'fixnum))
+                              (csubtypep count-type (specifier-type 'sb-vm:signed-word))
                               ;; Unknown sign
                               (not (csubtypep count-type (specifier-type '(integer * 0))))
                               (not (csubtypep count-type (specifier-type '(integer 0 *))))
                               (or (csubtypep integer-type (specifier-type `(unsigned-byte ,sb-vm:n-word-bits)))
                                   (csubtypep integer-type (specifier-type `(signed-byte ,sb-vm:n-word-bits)))))
-                         ',name)))))
+                         ',name)
+                        ((and (not (csubtypep integer-type (specifier-type 'word)))
+                              (not (csubtypep integer-type (specifier-type 'sb-vm:signed-word)))
+                              (csubtypep count-type (specifier-type `(integer ,(- result-width width) ,most-positive-fixnum))))
+                         (cut-to-width integer ,kind width ,signedp)
+                         t)))))
             (setf (gethash ',left-name (modular-class-versions (find-modular-class ',kind ',signedp)))
                   `(ash ,',width))
             (deftransform ,left-name ((integer count) (t (constant-arg (eql 0))))
@@ -509,3 +563,228 @@
     #.(intern (format nil "ASH-MOD~D" sb-vm:n-machine-word-bits) "SB-VM")
     :untagged #.sb-vm:n-machine-word-bits nil))
 
+;;; Take a perfect hash expression using {+,-,^,&,<<,>>} and convert it to a simple
+;;; register-based intermediate language ("IL") that is suspiciously similar to x86-64 asm.
+;;; The IL can be lowered to real asm by a vop which prefixes all its instructions
+;;; with :DWORD.  See CALC-PHASH in src/compiler/x86-64/arith.
+;;; TABLES should be an alist specify the values of TAB and SCRAMBLE
+;;; as output by MAKE-PERFECT-HASH-LAMBDA.
+#+x86-64
+(progn
+(export '(phash-convert-to-2-operand-code phash-renumber-temps))
+(defglobal *enable-32-bit-codegen* t)
+(defun phash-convert-to-2-operand-code (expr tables &aux (temp-counter 0) temps statements)
+  (labels ((scan-for-shr (x)
+             (typecase x
+               ((eql val) (values 1 0)) ; no right-shift is like a right-shift of 0
+               (atom (values 0 nil))
+               ((cons (eql >>) (cons (eql val)))
+                (let ((n (caddr x)))
+                  (aver (fixnump n)) ; shift amount is constant
+                  (values 1 n)))
+               (t (let ((tot 0) (min 32))
+                    (dolist (cell x (values tot min))
+                      (multiple-value-bind (count local-min) (scan-for-shr cell)
+                        (incf tot count)
+                        (setf min (min (or local-min 32) min)))))))))
+    ;; If all uses of the argument are right-shifted, compute the smallest right-shift
+    ;; and do it once, decreasing all other shift amounts.
+    (multiple-value-bind (n-shifts preshift) (scan-for-shr expr)
+      (cond ((and (plusp preshift) (> n-shifts 1))
+             (setq expr
+                   (named-let decrease-shift ((x expr))
+                     (typecase x
+                       (atom x)
+                       ((cons (eql >>) (cons (eql val)))
+                        (let ((n (- (caddr x) preshift)))
+                          (if (= n 0) 'val `(>> val ,n))))
+                       (t (mapcar #'decrease-shift x))))))
+            (t
+             (setq preshift 0)))
+      ;; Untag the fixnum and then maybe right-shift some more.
+      (push `(>>= val ,(+ preshift sb-vm:n-fixnum-tag-bits)) expr)))
+  (labels ((emit (statement)
+             (push statement statements))
+           (move (dest source)
+             (unless (eq dest source)
+               (emit `(move ,dest ,source))))
+           (new-temp ()
+             (let ((temp (intern (format nil "v~D" (incf temp-counter)))))
+               (push temp temps)
+               temp))
+           (select-instruction (op)
+             (ecase op
+               (& 'and)
+               ((+ u32+ +=) 'add)
+               ((- u32-) 'sub)
+               (<< 'shl)
+               ((>> >>=) 'shr)
+               ((^ ^=) 'xor)
+               (aref 'aref)))
+           (commutativep (inst) (member inst '(add and xor)))
+           (convert-list (list) ; like PROGN
+             (let ((car (convert (car list))))
+               (acond ((cdr list) (convert-list it))
+                      (t car))))
+           (convert (expr)
+             (case (car expr)
+               ((let) ; there will be exactly one binding
+                (destructuring-bind (((name value)) . body) (cdr expr)
+                  (aver (member name '(val newval a b)))
+                  (convert-operand value name)
+                  (convert-list body)))
+               (t
+                (convert-arith expr))))
+           (convert-operand (x &optional name)
+             (cond ((cadr (assoc x tables :test 'eq)))
+                   ((typep x '(or symbol (unsigned-byte 32) array)) x)
+                   (t (convert-arith x name))))
+           (convert-arith (expr &optional name &aux (operator (car expr)))
+             (case operator
+               ((^= += >>=)
+                (destructuring-bind (varname operand) (cdr expr)
+                  (let ((operand (convert-operand operand)))
+                    (emit `(,(select-instruction operator) ,varname ,operand)))))
+               (t
+                (when (and (member operator '(+ ^)) (= (length (cdr expr)) 3))
+                  ;; left-associate
+                  (destructuring-bind (first second third) (cdr expr)
+                    (return-from convert-arith
+                      (convert-arith `(,operator (,operator ,first ,second) ,third) name))))
+                (multiple-value-bind (first second)
+                    (if (eq operator 'u32-) ; always unary
+                        (destructuring-bind (operand) (cdr expr) operand)
+                        (destructuring-bind (first second) (cdr expr) ; binary
+                          (values first second)))
+                  (let* ((first (convert-operand first name))
+                         (second (if second (convert-operand second)))
+                         (inst (select-instruction operator))
+                         (result (cond (name)
+                                       ((memq first temps) first)
+                                       ((and (memq second temps) (commutativep inst))
+                                        (rotatef first second)
+                                        first)
+                                       (t (new-temp)))))
+                    (move result first)
+                    (emit (cond ((eq inst 'aref)
+                                 (let ((scale
+                                        (etypecase first
+                                          ((simple-array (unsigned-byte 8) (*)) 1)
+                                          ((simple-array (unsigned-byte 16) (*)) 2)
+                                          ((simple-array (unsigned-byte 32) (*)) 4))))
+                                   `(,inst ,result ,second ,scale)))
+                                ((not second) `(neg ,result))
+                                (t `(,inst ,result ,second))))
+                    result))))))
+    (convert `(let ((val arg)) ,@expr)))
+  (values (reverse (coerce statements 'vector))
+          temp-counter))
+
+(defun phash-renumber-temps (statements)
+  (let ((var-map (make-array 4 :initial-element 0))
+        (temps #(t0 t1 t2 t3))
+        (temps-used 0))
+    (flet ((assign-temp (statement operand-index r/w)
+             (let* ((var (nth (1+ operand-index) statement))
+                    (temp (position var var-map :test #'eq)))
+               (unless temp
+                 (aver r/w)
+                 (let ((claimed (position 0 var-map)))
+                   (aver claimed) ; mustn't run out of temps
+                   (setf (aref var-map claimed) var
+                         temps-used (max temps-used (1+ claimed))
+                         temp claimed)))
+               (setf (nth (1+ operand-index) statement) (svref temps temp))
+               temp))
+           (is-unused-after (symbol start)
+             (loop for i from start below (length statements)
+                   never (find symbol (aref statements i)))))
+      (loop for i below (length statements)
+            do (let* ((statement (svref statements i))
+                      (source-operand (third statement)))
+                 ;; Process the source register before the dest because doing that
+                 ;; might find that the source is unused after, and so the dest
+                 ;; can be the same, eliminating a move
+                 (when (typep source-operand '(and symbol (not null)))
+                   (let ((temp (assign-temp statement 1 nil)))
+                     (when (is-unused-after source-operand (1+ i))
+                       (setf (aref var-map temp) 0)))) ; kill
+                 (assign-temp statement 0 t)
+                 (when (and (eq (car statement) 'move)
+                            (eq (cadr statement) (caddr statement)))
+                   (setf (svref statements i) 'nop)))))
+    (values (remove 'nop statements) temps-used)))
+
+;;; Predict whether the compiler will generate better or worse code on its own
+;;; when compared to SB-VM::CALC-PHASH. Do this by counting the arithmetic
+;;; operations that require an extra instruction when performed on tagged words.
+;;; These are as follows:
+;;;   {<< U32+ U32- +=} - ANDed with (FIXNUMIZE UINT-MAX)
+;;;   {>> >>=}          - ANDed with (LOGNOT FIXNUM-TAG-MASK)
+(defun phash-count-32-bit-modular-ops (expr &aux (count 0))
+  (named-let recurse ((expr expr))
+    (cond ((listp expr)
+           (mapc #'recurse expr))
+          ((find expr '(<< u32+ u32- += >> >>=))
+           (incf count))))
+  count)
+
+(defun optimize-for-calc-phash (form env)
+  (aver (eq (cadr form) 'val))
+  (let ((scramble (lexenv-find 'scramble vars :lexenv env))
+        (tab (lexenv-find 'tab vars :lexenv env))
+        (calculation (cddr form)))
+    (unless (and *enable-32-bit-codegen*
+                 (or scramble tab
+                     (>= (phash-count-32-bit-modular-ops calculation) 2)))
+      (return-from optimize-for-calc-phash form)) ; decline
+    (let (tables)
+      (when scramble
+        (aver (typep scramble '(cons (eql macro))))
+        (push `(scramble ,(cdr scramble)) tables))
+      (when tab
+        (aver (typep tab '(cons (eql macro))))
+        (push `(tab ,(cdr tab)) tables))
+      (multiple-value-bind (steps n-temps)
+          (phash-renumber-temps
+           (phash-convert-to-2-operand-code calculation tables))
+        (if (<= n-temps 4) ; always, I think?
+            `(sb-vm::calc-phash val ,n-temps ,steps)
+            form)))))
+)
+
+#+(or arm64 x86-64)
+(progn
+  (defknown sb-vm::truncate-mod64 (sb-vm:signed-word sb-vm:signed-word)
+      (values word sb-vm:signed-word)
+      (foldable flushable movable))
+
+  (defoptimizer (sb-vm::truncate-mod64 derive-type) ((n d) node)
+    (let ((res (truncate-derive-type-optimizer node)))
+      (when res
+        (destructuring-bind (q r) (values-type-required res)
+          (make-values-type  (list (%two-arg-derive-type q
+                                                         (specifier-type `(eql ,(ldb (byte sb-vm:n-word-bits 0) -1)))
+                                                         #'logand-derive-type-aux)
+                                   r))))))
+
+  (deftransform sb-vm::truncate-mod64 ((n d) * * :node node)
+    (let ((truncate-type (truncate-derive-type-optimizer node)))
+      (if (and truncate-type
+               (values-subtypep truncate-type
+                                (values-specifier-type `(values sb-vm:signed-word t &optional))))
+          `(multiple-value-bind (q r) (truncate n d)
+             (values (logand q ,most-positive-word)
+                     r))
+          (give-up-ir1-transform))))
+
+  (define-modular-fun-optimizer truncate
+      ((n d) :untagged nil :width width :node node)
+    (when (and (= width sb-vm:n-word-bits)
+               (not (values-subtypep (node-derived-type node)
+                                     (values-specifier-type `(values sb-vm:signed-word t &optional))))
+               (csubtypep (lvar-type n) (specifier-type 'sb-vm:signed-word))
+               (csubtypep (lvar-type d) (specifier-type 'sb-vm:signed-word)))
+      'sb-vm::truncate-mod64))
+  (setf (gethash 'sb-vm::truncate-mod64 (modular-class-versions (find-modular-class ':untagged 'nil)))
+        `(truncate ,sb-vm:n-word-bits)))

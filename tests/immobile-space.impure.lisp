@@ -1,13 +1,11 @@
 
-#-immobile-space (sb-ext:exit :code 104)
+#+(or (not immobile-space) gc-stress) (invoke-restart 'run-tests::skip-file)
 
 ;;; If an instance was allocated but its layout not stored yet
 ;;; it could crash
 (defun alloc-layoutless-instances ()
   (list (sb-vm::alloc-immobile-fixedobj
-         6 (logior (ash 5 sb-vm:instance-length-shift) sb-vm:instance-widetag))
-        (sb-vm::alloc-immobile-fixedobj
-         6 (logior (ash 5 sb-vm:n-widetag-bits) sb-vm:funcallable-instance-widetag))))
+         6 (logior (ash 5 sb-vm:instance-length-shift) sb-vm:instance-widetag))))
 (compile 'alloc-layoutless-instances)
 ;;; the first GC should WP some pages but might not crash
 (dotimes (i 1000 (gc)) (alloc-layoutless-instances))
@@ -18,25 +16,22 @@
 
 ;;; Assign a bitmap that is not the special case for "all tagged"
 ;;; but does correctly indicate 1 tagged slot.
-(let* ((l (sb-kernel:wrapper-friend (sb-kernel:find-layout 'trythis)))
+(let* ((l (sb-kernel:find-layout 'trythis))
        (slot (1- (sb-kernel:%instance-length l))))
   (assert (eql (sb-kernel:%raw-instance-ref/signed-word l slot)
                sb-kernel:+layout-all-tagged+))
-  (sb-kernel:%raw-instance-set/word l slot 1))
+  #+compact-instance-header (sb-kernel:%raw-instance-set/word l slot #b01)
+  #-compact-instance-header (sb-kernel:%raw-instance-set/word l slot #b10))
 
 (defun ll-alloc ()
   ;; This must be in its own function because the vop preserves no registers
   ;; when calling to C.
-  (values(sb-sys:%primitive
-            sb-vm::alloc-immobile-fixedobj
-            8 ; an unused sized class
-            2 ; physical words
-            (logior (ash 1 sb-vm:instance-length-shift)
-                    sb-vm:instance-widetag))))
+  (sb-vm::alloc-immobile-fixedobj 8 (logior (ash 7 sb-vm:instance-length-shift)
+                                            sb-vm:instance-widetag)))
 (compile 'll-alloc) ; low level allocator
 (defun make ()
   (let ((inst (ll-alloc)))
-    (setf (sb-kernel:%instance-wrapper (truly-the trythis inst))
+    (setf (sb-kernel:%instance-layout (truly-the trythis inst))
           (sb-kernel:find-layout 'trythis))
     (setf (trythis-a inst) (copy-seq "Hello"))
     inst))

@@ -14,64 +14,31 @@
 
 (in-package "SB-IMPL")
 
-;; This variable properly belongs in 'target-hash-table',
-;; but it's compiled after this file is.
-(define-load-time-global *user-hash-table-tests* nil)
-
 
 ;;;; fdefinition (fdefn) objects
 
-(defun make-fdefn (name)
-  #-immobile-space (make-fdefn name)
-  #+immobile-space
-  (let ((fdefn (truly-the (values fdefn &optional)
-                          (sb-vm::alloc-immobile-fdefn))))
-    (sb-vm::%set-fdefn-name fdefn name)
-    (fdefn-makunbound fdefn)
-    fdefn))
-
+(declaim (ftype (sfunction (t) (or fdefn #+linkage-space symbol)) find-or-create-fdefn))
+#-linkage-space
+(progn
+(defun fset (fname fun)
+  (declare (type (or fdefn symbol list) fname))
+  (setf (fdefn-fun (if (fdefn-p fname) fname (find-or-create-fdefn fname))) fun))
 (defun (setf fdefn-fun) (fun fdefn)
-  (declare (type function fun)
-           (type fdefn fdefn)
-           (values function))
-  #+immobile-code (sb-vm::%set-fdefn-fun fdefn fun)
-  #-immobile-code (setf (fdefn-fun fdefn) fun))
+  (%primitive sb-vm::set-fdefn-fun fun fdefn)
+  fun))
 
-;; Given Info-Vector VECT, return the fdefn that it contains for its root name,
-;; or nil if there is no value. NIL input is acceptable and will return NIL.
-;; (see src/compiler/info-vector for more details)
-(declaim (inline info-vector-fdefn))
-(defun info-vector-fdefn (vect)
-  (when vect
-    ;; This is safe: Info-Vector invariant requires that it have length >= 1.
-    (let ((word (the fixnum (svref vect 0))))
-      ;; Test that the first info-number is +fdefn-info-num+ and its n-infos
-      ;; field is nonzero. These conditions can be tested simultaneously
-      ;; using a SIMD-in-a-register idea. The low 6 bits must be nonzero
-      ;; and the next 6 must be exactly #b111111, so considered together
-      ;; as a 12-bit unsigned integer it must be >= #b111111000001
-      (when (>= (ldb (byte (* info-number-bits 2) 0) word)
-                (1+ (ash +fdefn-info-num+ info-number-bits)))
-        ;; DATA-REF-WITH-OFFSET doesn't know the info-vector length invariant,
-        ;; so depite (safety 0) eliding bounds check, FOLD-INDEX-ADDRESSING
-        ;; wasn't kicking in without (TRULY-THE (INTEGER 1 *)).
-        (aref vect (1- (truly-the (integer 1 *) (length vect))))))))
-
-;; Return SYMBOL's fdefinition, if any, or NIL. SYMBOL must already
-;; have been verified to be a symbol by the caller.
-(defun symbol-fdefn (symbol)
-  (declare (optimize (safety 0)))
-  (info-vector-fdefn (symbol-info-vector symbol)))
-
-;; Return the fdefn object for NAME, or NIL if there is no fdefn.
-;; Signal an error if name isn't valid.
-;; Assume that exists-p implies LEGAL-FUN-NAME-P.
-;;
+;;; Return the FDEFN object for NAME, or NIL if there is no fdefn.
+;;; Signal an error if name isn't valid.
+;;; Assume that exists-p implies LEGAL-FUN-NAME-P.
 (declaim (ftype (sfunction ((or symbol list)) (or fdefn null)) find-fdefn))
 (defun find-fdefn (name)
   (declare (explicit-check))
   (when (symbolp name) ; Don't need LEGAL-FUN-NAME-P check
-    (return-from find-fdefn (symbol-fdefn name)))
+    ;; FDEFNs can only be created for names that aren't symbols with #+linkage-space
+    #+linkage-space (bug "FIND-FDEFN ~S" name)
+    #-linkage-space
+    (let ((fdefn (sb-vm::%symbol-fdefn name))) ; slot default is 0, not NIL
+      (return-from find-fdefn (if (eql fdefn 0) nil fdefn))))
   ;; Technically the ALLOW-ATOM argument of NIL isn't needed, but
   ;; the compiler isn't figuring out not to test SYMBOLP twice in a row.
   (with-globaldb-name (key1 key2 nil) name
@@ -80,7 +47,7 @@
         (return-from find-fdefn it))
       :simple
       (progn
-        (awhen (symbol-info-vector key1)
+        (awhen (symbol-dbinfo key1)
           (multiple-value-bind (data-idx descriptor-idx field-idx)
               (info-find-aux-key/packed it key2)
             (declare (type index descriptor-idx)
@@ -93,32 +60,10 @@
               (when (eql (packed-info-field it descriptor-idx field-idx)
                          +fdefn-info-num+)
                 (return-from find-fdefn
-                  (aref it (1- (the index data-idx))))))))
+                  (%info-ref it (1- (the index data-idx))))))))
         (when (eq key1 'setf) ; bypass the legality test
           (return-from find-fdefn nil))))
   (legal-fun-name-or-type-error name))
-
-(declaim (ftype (sfunction (t) fdefn) find-or-create-fdefn))
-(defun find-or-create-fdefn (name)
-  (or (find-fdefn name)
-      ;; We won't reach here if the name was not legal
-      (let (made-new)
-        (dx-flet ((new (name)
-                    (setq made-new t)
-                    (make-fdefn name)))
-          (let ((fdefn (with-globaldb-name (key1 key2) name
-                        :simple (get-info-value-initializing
-                                 :function :definition name (new name))
-                        :hairy (get-fancily-named-fdefn name #'new))))
-            ;; Slot accessors spring into existence as soon as a reference
-            ;; is made to the respective fdefn, but we can't do this in
-            ;; (flet NEW) because ENSURE-ACCESSOR calls (SETF FDEFINITION)
-            ;; which would recurse, as the fdefn would not have been
-            ;; installed yet.
-            (when (and made-new
-                       (typep name '(cons (eql sb-pcl::slot-accessor))))
-              (sb-pcl::ensure-accessor name))
-            fdefn)))))
 
 ;;; Return T if FUNCTION is the error-signaling trampoline for a macro or a
 ;;; special operator. Test for this by seeing whether FUNCTION is the same
@@ -138,6 +83,51 @@
        (eq (load-time-value (%closure-fun (symbol-function 'dx-let)) t)
            (%closure-fun function))))
 
+;;; This is the implementation of (COERCE s 'function) when S is of type symbol
+;;; used by either the full call or the compile-time transform for that pattern.
+(defun coerce-symbol-to-fun (symbol)
+  (let ((def (%symbol-function symbol)))
+    (cond ((not def) (error 'undefined-function :name symbol))
+          ((macro/special-guard-fun-p def)
+           (error (ecase (car (%fun-name def))
+                    (:macro "~S names a macro.")
+                    (:special "~S names a special operator."))
+                  symbol))
+          (t def))))
+
+#-linkage-space (define-load-time-global *fdefn-of-nil* (make-fdefn nil))
+(defun find-or-create-fdefn (name)
+  (cond
+    ((symbolp name)
+     #+linkage-space name
+     #-linkage-space
+     (let ((fdefn (sb-vm::%symbol-fdefn name)))
+       (cond ((and fdefn (neq fdefn 0)) fdefn)
+             ((null name) *fdefn-of-nil*)
+             (t (let* ((new (make-fdefn name))
+                       (actual (sb-vm::cas-symbol-fdefn name 0 new)))
+                  (if (eql actual 0) new (the fdefn actual)))))))
+    ((find-fdefn name))
+    (t
+      ;; We won't reach here if the name was not legal
+      (let (made-new)
+        (dx-flet ((new (name)
+                    (setq made-new t)
+                    (make-fdefn name)))
+          (let ((fdefn (with-globaldb-name (key1 key2) name
+                        :simple (get-info-value-initializing
+                                 :function :definition name (new name))
+                        :hairy (get-fancily-named-fdefn name #'new))))
+            ;; Slot accessors spring into existence as soon as a reference
+            ;; is made to the respective fdefn, but we can't do this in
+            ;; (flet NEW) because ENSURE-ACCESSOR calls (SETF FDEFINITION)
+            ;; which would recurse, as the fdefn would not have been
+            ;; installed yet.
+            (when (and made-new
+                       (typep name '(cons (eql sb-pcl::slot-accessor))))
+              (sb-pcl::ensure-accessor name))
+            fdefn))))))
+
 ;;; Remove NAME's FTYPE information unless it was explicitly PROCLAIMED.
 ;;; The NEW-FUNCTION argument is presently unused, but could be used
 ;;; for checking compatibility of the NEW-FUNCTION against a proclamation.
@@ -149,42 +139,27 @@
     (unless (eq :declared (info :function :where-from name))
       (clear-info :function :type name))))
 
-;;; Return the fdefn-fun of NAME's fdefinition including any encapsulations.
-;;; LOOKUP-FN, defaulting to FIND-FDEFN, specifies how to lookup the fdefn.
-;;; As a special case it can be given as SYMBOL-FDEFN which is slightly quicker.
-;;; This is the core of the implementation of the standard FDEFINITION function,
-;;; but as we've defined FDEFINITION, that strips encapsulations.
-(defmacro %coerce-name-to-fun (name &optional (lookup-fn 'find-fdefn)
-                                    strictly-functionp)
-  ;; Whoa! We were getting a warning from the *host* here -
-  ;;   "Abbreviated type declaration: (BOOLEAN SB-IMPL::STRICTLY-FUNCTIONP)."
-  ;; I guess it's because we hand it a lambda and it doesn't like our style?
-  (declare (type boolean strictly-functionp))
-  `(let* ((name ,name) (fdefn (,lookup-fn name)) f)
-     (if (and fdefn
-              (setq f (fdefn-fun (truly-the fdefn fdefn)))
-                ;; If STRICTLY-FUNCTIONP is true, we make sure not to return an error
-                ;; trampoline. This extra check ensures that full calls such as
-                ;; (MAPCAR 'OR '()) signal an error that OR isn't a function.
-                ;; This accords with the non-requirement that macros store strictly
-                ;; a function in the symbol that names them. In many implementations,
-                ;; (FUNCTIONP (SYMBOL-FUNCTION 'OR)) => NIL. We want to pretend that.
-              ,@(if strictly-functionp '((not (macro/special-guard-fun-p f)))))
-         f
-         (retry-%coerce-name-to-fun name ,strictly-functionp))))
-
-;;; If %COERCE-NAME-TO-FUN fails, continue here.
-;;; LOOKUP-FN, being more about speed than semantics, is irrelevant.
-;;; Once we're forced down the slow path, it doesn't matter whether the fdefn
-;;; lookup considers generalized function names (which require a hash-table)
-;;; versus optimizing for just symbols (by using SYMBOL-INFO).
-;;;
-;;; Furthermore we explicitly allow any function name when retrying,
-;;; even if the erring caller was SYMBOL-FUNCTION. It is consistent
-;;; that both #'(SETF MYNEWFUN) and '(SETF MYNEWFUN) are permitted
-;;; as the object to use in the USE-VALUE restart.
-(defun retry-%coerce-name-to-fun (name strictly-functionp)
-  (setq name (restart-case (error 'undefined-function :name name)
+;;; Return the fdefn-fun of NAME's fdefinition including any
+;;; encapsulations.  This is the core of the implementation of the standard
+;;; FDEFINITION function, but as we've defined FDEFINITION, that
+;;; strips encapsulations.
+(defun %coerce-name-to-fun (name)
+  (typecase name
+    ((and symbol (not null))
+     (let ((fun (%symbol-function name)))
+       (when (and fun (not (macro/special-guard-fun-p fun)))
+         (return-from %coerce-name-to-fun fun))))
+    (cons
+     (binding* ((fdefn (find-fdefn name) :exit-if-null)
+                (fun (fdefn-fun fdefn) :exit-if-null))
+       (return-from %coerce-name-to-fun fun))))
+  ;; We explicitly allow any function name when retrying,
+  ;; even if the erring caller was SYMBOL-FUNCTION. It is consistent
+  ;; that both #'(SETF MYNEWFUN) and '(SETF MYNEWFUN) are permitted
+  ;; as the object to use in the USE-VALUE restart.
+  (setq name (restart-case (if (legal-fun-name-p name)
+                               (error 'undefined-function :name name)
+                               (legal-fun-name-or-type-error name))
                (continue ()
                  :report (lambda (stream)
                            (format stream "Retry using ~s." name))
@@ -194,15 +169,9 @@
                            (format stream "Use specified function"))
                  :interactive read-evaluated-form
                  (if (functionp value)
-                     (return-from retry-%coerce-name-to-fun value)
+                     (return-from %coerce-name-to-fun value)
                      value))))
-  (let ((fdefn (find-fdefn name)))
-    (when fdefn
-      (let ((f (fdefn-fun (truly-the fdefn fdefn))))
-        (when (and f (or (not strictly-functionp)
-                         (not (macro/special-guard-fun-p f))))
-          (return-from retry-%coerce-name-to-fun f)))))
-  (retry-%coerce-name-to-fun name strictly-functionp))
+  (%coerce-name-to-fun name))
 
 ;; Coerce CALLABLE (a function-designator) to a FUNCTION.
 ;; The compiler emits this when someone tries to FUNCALL something.
@@ -216,16 +185,21 @@
 ;;    if a symbol does not satisfy FBOUNDP.
 (defun %coerce-callable-to-fun (callable)
   (declare (explicit-check))
-  (etypecase callable
-    (function callable)
-    (symbol (%coerce-name-to-fun callable symbol-fdefn t))))
+  (typecase callable
+    (function
+     (return-from %coerce-callable-to-fun callable))
+    ((and symbol (not null)) ; NIL can't be fboundp. Quicker test this way.
+     (let ((fun (%symbol-function callable)))
+       (when (and fun (not (macro/special-guard-fun-p fun)))
+         (return-from %coerce-callable-to-fun fun))))
+    ;; If NIL, it's not technically a type-error, so instead hit the error
+    ;; in %coerce-name-to-fun which has a restart.
+    (null)
+    (t (error 'type-error :expected-type '(or symbol function) :datum callable)))
+  (%coerce-name-to-fun callable))
 
 ;;; Behaves just like %COERCE-CALLABLE-TO-FUN but has an ir2-convert optimizer.
-(defun %coerce-callable-for-call (callable)
-  (declare (explicit-check))
-  (etypecase callable
-    (function callable)
-    (symbol (%coerce-name-to-fun callable symbol-fdefn t))))
+(setf (symbol-function '%coerce-callable-for-call) (symbol-function '%coerce-callable-to-fun))
 
 
 ;;;; definition encapsulation
@@ -233,104 +207,102 @@
 (defstruct (encapsulation-info (:constructor make-encapsulation-info
                                              (type definition))
                                (:copier nil))
-  ;; This is definition's encapsulation type. The encapsulated
-  ;; definition is in the previous ENCAPSULATION-INFO element or
-  ;; installed as the global definition of some function name.
-  type
-  ;; the previous, encapsulated definition. This used to be installed
-  ;; as a global definition for some function name, but it was
-  ;; replaced by an encapsulation of type TYPE.
-  (definition nil :type function))
+  (type nil :type symbol)
+  ;; the underlying definition prior to getting wrapped in a closure
+  (definition nil :type function)
+  (specialized-xep nil :type (or null function)))
 (declaim (freeze-type encapsulation-info))
+
+;;; Find the encapsulation info that has been closed over.
+(defun encapsulation-info (fun)
+  (truly-the (or encapsulation-info null)
+    (when (closurep fun)
+      (find-if-in-closure #'encapsulation-info-p fun))))
+
+(flet ((name->fun (name)
+         (typecase name
+           (symbol (%symbol-function name))
+           (t (binding* ((fdefn (find-fdefn name) :exit-if-null))
+                (fdefn-fun fdefn)))))
+       (has-encap (fun type &aux predecessor)
+         (do ((info (encapsulation-info fun)
+                    (encapsulation-info (encapsulation-info-definition info))))
+             ((null info) (values nil nil))
+           (if (eq (encapsulation-info-type info) type)
+               (return (values info predecessor))
+               (setq predecessor info)))))
+
+;;; Does NAME have an encapsulation of the given TYPE?
+(defun encapsulated-p (name type)
+  (declare (symbol type))
+  (let ((fun (name->fun name)))
+    (if (typep fun 'generic-function)
+        (encapsulated-generic-function-p fun type)
+        (values (has-encap fun type)))))
 
 ;;; Replace the definition of NAME with a function that calls FUNCTION
 ;;; with the original function and its arguments.
 ;;; TYPE is whatever you would like to associate with this
 ;;; encapsulation for identification in case you need multiple
-;;; encapsulations of the same name.
+;;; encapsulations of the same function name.
+;;; For non-generic functions only: if encapsulation TYPE already exists,
+;;; it will be replaced by a new encapsulation in an order-preserving manner,
+;;; otherwise the new encapsulation goes to the front of the chain.
 (defun encapsulate (name type function)
-  (let* ((fdefn (find-fdefn name))
-         (underlying-fun (sb-c:safe-fdefn-fun fdefn)))
-    (when (macro/special-guard-fun-p underlying-fun)
+  (let ((underlying-fun (name->fun name)))
+    ;; No error is signaled when encapsulating a nonexistent function, however
+    ;; the wrapper will receive as its first arg a function that signals an error.
+    (when (or (and underlying-fun (macro/special-guard-fun-p underlying-fun))
+              (not name))
       (error "~S can not be encapsulated" name))
     (when (typep underlying-fun 'generic-function)
       (return-from encapsulate
         (encapsulate-generic-function underlying-fun type function)))
-    ;; We must bind and close over INFO. Consider the case where we
-    ;; encapsulate (the second) an encapsulated (the first)
-    ;; definition, and later someone unencapsulates the encapsulated
-    ;; (first) definition. We don't want our encapsulation (second) to
-    ;; bind basic-definition to the encapsulated (first) definition
-    ;; when it no longer exists. When unencapsulating, we make sure to
-    ;; clobber the appropriate INFO structure to allow
-    ;; basic-definition to be bound to the next definition instead of
-    ;; an encapsulation that no longer exists.
-    (let ((info (make-encapsulation-info type underlying-fun)))
-      (setf (fdefn-fun fdefn)
-            (named-lambda encapsulation (&rest args)
-              (apply function (encapsulation-info-definition info)
-                     args))))))
+    (multiple-value-bind (existing predecessor) (has-encap underlying-fun type)
+      ;; If TYPE existed, the new DEFINITION comes from the existing
+      (let* ((info (if (not existing)
+                       (make-encapsulation-info
+                        type
+                        (or underlying-fun
+                            (lambda (&rest args)
+                              (declare (sb-c::lambda-list ($undef$)))
+                              (declare (ignore args))
+                              (error "~S is undefined" name))))
+                       (copy-structure existing)))
+             (specialized-xep (info :function :specialized-xep name))
+             (closure (named-lambda encapsulation (&rest args)
+                        (apply function (encapsulation-info-definition info)
+                               args))))
+        (when specialized-xep
+          (let* ((xep-name
+                   `(specialized-xep ,name ,@specialized-xep))
+                 (xep-fun (name->fun xep-name)))
+            (when xep-fun
+              (setf (encapsulation-info-specialized-xep info) xep-fun)
+              (remove-specialized-xep name nil))))
+        (if predecessor
+            ;; Become the successor of the existing predecessor
+            (setf (encapsulation-info-definition predecessor) closure)
+            ;; Was first in chain or didn't exist
+            (fset name closure))))))
 
-;;; Find the encapsulation info that has been closed over.
-(defun encapsulation-info (fun)
-  (when (closurep fun)
-    (find-if-in-closure #'encapsulation-info-p fun)))
-
-;;; When removing an encapsulation, we must remember that
-;;; encapsulating definitions close over a reference to the
-;;; ENCAPSULATION-INFO that describes the encapsulating definition.
-;;; When you find an info with the target type, the previous info in
-;;; the chain has the ensulating definition of that type. We take the
-;;; encapsulated definition from the info with the target type, and we
-;;; store it in the previous info structure whose encapsulating
-;;; definition it describes looks to this previous info structure for
-;;; a definition to bind (see ENCAPSULATE). When removing the first
-;;; info structure, we do something conceptually equal, but
-;;; mechanically it is different.
 (defun unencapsulate (name type)
-  "Removes NAME's most recent encapsulation of the specified TYPE."
-  (let* ((fdefn (find-fdefn name))
-         (encap-info (encapsulation-info (fdefn-fun fdefn))))
-    (declare (type (or encapsulation-info null) encap-info))
-    (when (and fdefn (typep (fdefn-fun fdefn) 'generic-function))
-      (return-from unencapsulate
-        (unencapsulate-generic-function (fdefn-fun fdefn) type)))
-    (cond ((not encap-info)
-           ;; It disappeared on us, so don't worry about it.
-           )
-          ((eq (encapsulation-info-type encap-info) type)
-           ;; It's the first one, so change the fdefn object.
-           (setf (fdefn-fun fdefn)
-                 (encapsulation-info-definition encap-info)))
-          (t
-           ;; It must be an interior one, so find it.
-           (loop
-             (let ((next-info (encapsulation-info
-                               (encapsulation-info-definition encap-info))))
-               (unless next-info
-                 ;; Not there, so don't worry about it.
-                 (return))
-               (when (eq (encapsulation-info-type next-info) type)
-                 ;; This is it, so unlink us.
-                 (setf (encapsulation-info-definition encap-info)
-                       (encapsulation-info-definition next-info))
-                 (return))
-               (setf encap-info next-info))))))
-  t)
+  "Removes NAME's encapsulation of the specified TYPE if such exists."
+  (let ((fun (name->fun name)))
+    (if (typep fun 'generic-function)
+        (unencapsulate-generic-function fun type)
+        (multiple-value-bind (existing predecessor) (has-encap fun type)
+          (when existing
+            (let* ((next (encapsulation-info-definition existing))
+                   (specialized-xep (encapsulation-info-specialized-xep existing)))
+              (cond (predecessor
+                     (setf (encapsulation-info-definition predecessor) next))
+                    ;; It's the first one, so change the fdefn object.
+                    ((equal (%fun-lambda-list next) '($undef$)) (fmakunbound name))
+                    (t (fset name next)))
+              (when specialized-xep
+                (fset (%fun-name specialized-xep) specialized-xep)))))))))
 
-;;; Does NAME have an encapsulation of the given TYPE?
-(defun encapsulated-p (name type)
-  (let ((fdefn (find-fdefn name)))
-    (when (and fdefn (typep (fdefn-fun fdefn) 'generic-function))
-      (return-from encapsulated-p
-        (encapsulated-generic-function-p (fdefn-fun fdefn) type)))
-    (do ((encap-info (encapsulation-info (fdefn-fun fdefn))
-                     (encapsulation-info
-                      (encapsulation-info-definition encap-info))))
-        ((null encap-info) nil)
-      (declare (type (or encapsulation-info null) encap-info))
-      (when (eq (encapsulation-info-type encap-info) type)
-        (return t)))))
 
 ;;;; FDEFINITION
 
@@ -366,14 +338,18 @@
    encapsulations and to return the innermost encapsulated definition.
    This is SETF'able."
   (declare (explicit-check))
-  (let ((fun (%coerce-name-to-fun name)))
+  ;; %COERCE-NAME-TO-FUN signals an error for macros and special operators,
+  ;; but FDEFINITION should not, so pick off symbols using %SYMBOL-FUNCTION.
+  (strip-encapsulation (or (and (symbolp name) (%symbol-function name))
+                           (%coerce-name-to-fun name))))
+(defun strip-encapsulation (fun)
     (loop
      (let ((encap-info (encapsulation-info fun)))
        (if encap-info
            (setf fun (encapsulation-info-definition encap-info))
-           (return fun))))))
+           (return fun)))))
 
-(defvar *setf-fdefinition-hook* nil
+(define-load-time-global *setf-fdefinition-hook* nil
   "A list of functions that (SETF FDEFINITION) invokes before storing the
    new value. The functions take the function name and the new value.")
 
@@ -387,69 +363,81 @@
            :format-control "~S is not acceptable to ~S."
            :format-arguments (list object setter))))
 
-(defun %set-fdefinition (name new-value)
-  "Set NAME's global function definition."
+(defun remove-specialized-xep (name &optional (clear-info t))
+  (let ((xep (info :function :specialized-xep name)))
+    (when xep
+      (let* ((xep-name
+               `(specialized-xep ,name ,@xep))
+             (fdefn (find-fdefn xep-name)))
+        (when fdefn
+          (fset fdefn
+                (compile nil (make-specialized-xep-stub name xep xep-name))))
+        (when clear-info
+          (clear-info :function :specialized-xep name)
+          (undefine-fun-name xep-name))))))
+
+(defun setf-fdefinition (new-value name clear-specialized-xep)
   (declare (type function new-value) (optimize (safety 1)))
   (declare (explicit-check))
   (err-if-unacceptable-function new-value '(setf fdefinition))
+  (setq new-value (strip-encapsulation new-value))
   (with-single-package-locked-error (:symbol name "setting fdefinition of ~A")
     (maybe-clobber-ftype name new-value)
 
     ;; Check for hash-table stuff. Woe onto him that mixes encapsulation
     ;; with this.
-    (when (and (symbolp name) (fboundp name))
-      (let ((old (symbol-function name)))
-        (when (boundp '*setf-fdefinition-hook*)
-          (dolist (spec *user-hash-table-tests*)
-            (cond ((eq old (second spec))
-                   ;; test-function
-                   (setf (second spec) new-value))
-                  ((eq old (third spec))
-                   ;; hash-function
-                   (setf (third spec) new-value)))))))
+    (when (symbolp name)
+      (let ((old (%symbol-function name)))
+        (dolist (spec *user-hash-table-tests*)
+          (cond ((eq old (second spec))
+                 ;; test-function
+                 (setf (second spec) new-value))
+                ((eq old (third spec))
+                 ;; hash-function
+                 (setf (third spec) new-value))))))
 
-    ;; FIXME: This is a good hook to have, but we should probably
-    ;; reserve it for users.
     (let ((fdefn (find-or-create-fdefn name)))
-      ;; *SETF-FDEFINITION-HOOK* won't be bound when initially running
-      ;; top level forms in the kernel core startup.
-      (when (boundp '*setf-fdefinition-hook*)
-        (dolist (f *setf-fdefinition-hook*)
-          (declare (type function f))
-          (funcall f name new-value)))
-
+      (dolist (f *setf-fdefinition-hook*)
+        (declare (type function f))
+        (funcall f name new-value))
+      (when clear-specialized-xep
+        (remove-specialized-xep name))
+      ;; fdefn may be a symbol if #+linkage-space. fdefn-fun vop is fine with that
       (let ((encap-info (encapsulation-info (fdefn-fun fdefn))))
         (cond (encap-info
                (loop
                 (let ((more-info
-                       (encapsulation-info
-                        (encapsulation-info-definition encap-info))))
+                        (encapsulation-info
+                         (encapsulation-info-definition encap-info))))
                   (if more-info
                       (setf encap-info more-info)
-                      (return
-                        (setf (encapsulation-info-definition encap-info)
-                              new-value))))))
+                      (return (setf (encapsulation-info-definition encap-info)
+                                    new-value))))))
               (t
-               (setf (fdefn-fun fdefn) new-value)))))))
+               (fset fdefn new-value)))))))
+
+(defun (setf fdefinition) (new-value name)
+  "Set NAME's global function definition."
+  (declare (type function new-value) (optimize (safety 1)))
+  (declare (explicit-check))
+  (setf-fdefinition new-value name t))
 
 ;;;; FBOUNDP and FMAKUNBOUND
 
 (defun fboundp (name)
   "Return true if name has a global function definition."
   (declare (explicit-check))
-  (awhen (find-fdefn name) (fdefn-fun it)))
+  #+linkage-space (fdefn-fun (if (symbolp name) name (find-fdefn name)))
+  #-linkage-space (awhen (find-fdefn name) (fdefn-fun it)))
 
 (defun fmakunbound (name)
   "Make NAME have no global function definition."
   (declare (explicit-check))
   (with-single-package-locked-error
       (:symbol name "removing the function or macro definition of ~A")
-    (let ((fdefn (find-fdefn name)))
-      (when fdefn
-        #+immobile-code
-        (when (sb-vm::fdefn-has-static-callers fdefn)
-          (sb-vm::remove-static-links fdefn))
-        (fdefn-makunbound fdefn)))
+    #+linkage-space (acond ((symbolp name) (fset name 0))
+                           ((find-fdefn name) (fset it 0)))
+    #-linkage-space (awhen (find-fdefn name) (fdefn-makunbound it))
     (undefine-fun-name name)
     name))
 
@@ -464,8 +452,8 @@
 ;;; https://fgiesen.wordpress.com/2015/02/22/triangular-numbers-mod-2n/
 ;;; contains a proof that triangular numbers mod 2^N visit every cell.
 
-;;; The intent here - which may be impossible to realize - was to allow GC
-;;; methods whose name is not reachable.  I couldn't get it to do the right thing.
+;;; The intent here - which may be impossible to realize - was to allow garbage-collection
+;;; of FDEFNs whose name is not reachable.  I couldn't get it to do the right thing.
 ;;; e.g. (defmethod foo (x (y cons)) ...) creates mappings:
 ;;; (SB-PCL::FAST-METHOD FOO (T CONS)) -> #<SB-KERNEL:FDEFN (SB-PCL::FAST-METHOD FOO (T CONS))>
 ;;; (SB-PCL::SLOW-METHOD FOO (T CONS)) -> #<SB-KERNEL:FDEFN (SB-PCL::SLOW-METHOD FOO (T CONS))>

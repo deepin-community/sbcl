@@ -16,44 +16,37 @@
 (defconstant sb-assem:assem-scheduler-p nil)
 (defconstant sb-assem:+inst-alignment-bytes+ 1)
 
-(defconstant +backend-fasl-file-implementation+ :x86-64)
-(defconstant-eqx +fixup-kinds+ #(:absolute :relative :absolute64)
-  #'equalp)
+(defconstant sb-fasl:+backend-fasl-file-implementation+ :x86-64)
+(defconstant-eqx +fixup-kinds+ #(:abs32 :*abs32 :rel32 :absolute) #'equalp)
 
-;;; KLUDGE: It would seem natural to set this by asking our C runtime
-;;; code for it, but mostly we need it for GENESIS, which doesn't in
-;;; general have our C runtime code running to ask, so instead we set
-;;; it by hand. -- WHN 2001-04-15
-;;;
-;;; Actually any information that we can retrieve C-side would be
-;;; useless in SBCL, since it's possible for otherwise binary
-;;; compatible systems to return different values for getpagesize().
-;;; -- JES, 2007-01-06
+;;; :FOREIGN fixup modifier. NIL + fixup = address of indirection word within linkage entry
+#-immobile-space (defconstant +nil-indirect+ 1)
+
+;;; This size is supposed to indicate something about the actual granularity
+;;; at which you can map memory.  We just hardwire it, but that may or may not
+;;; be necessary any more.
 (defconstant +backend-page-bytes+ #+win32 65536 #-win32 32768)
 
-;;; The size in bytes of GENCGC cards, i.e. the granularity at which
-;;; writes to old generations are logged.  With mprotect-based write
-;;; barriers, this must be a multiple of the OS page size.
-(defconstant gencgc-card-bytes +backend-page-bytes+)
+;;; The size in bytes of GENCGC pages. A page is the smallest amount of memory
+;;; that a thread can claim for a thread-local region, and also determines
+;;; the granularity at which we can find the start of a sequence of objects.
+(defconstant gencgc-page-bytes 32768)
+;;; The divisor relative to page-bytes which computes the granularity
+;;; at which writes to old generations are logged.
+#+soft-card-marks (defconstant cards-per-page
+                               #+mark-region-gc (/ gencgc-page-bytes 128)
+                               #-mark-region-gc 32)
 ;;; The minimum size of new allocation regions.  While it doesn't
 ;;; currently make a lot of sense to have a card size lower than
 ;;; the alloc granularity, it will, once we are smarter about finding
 ;;; the start of objects.
 (defconstant gencgc-alloc-granularity 0)
-;;; The minimum size at which we release address ranges to the OS.
-;;; This must be a multiple of the OS page size.
-(defconstant gencgc-release-granularity +backend-page-bytes+)
 ;;; The card size for immobile/low space
 (defconstant immobile-card-bytes 4096)
 
-;;; ### Note: we simultaneously use ``word'' to mean a 32 bit quantity
-;;; and a 16 bit quantity depending on context. This is because Intel
-;;; insists on calling 16 bit things words and 32 bit things
-;;; double-words (or dwords). Therefore, in the instruction definition
-;;; and register specs, we use the Intel convention. But whenever we
-;;; are talking about stuff the rest of the lisp system might be
-;;; interested in, we use ``word'' to mean the size of a descriptor
-;;; object, which is 64 bits.
+;;; ### Note: 'lispword' always means 8 bytes, and 'word' usually means
+;;; the same as 'lispword', except in the assembler and disassembler,
+;;; where 'word' means 2 bytes to match AMD/Intel terminology.
 
 ;;;; machine architecture parameters
 
@@ -85,36 +78,86 @@
 
 ;;;; description of the target address space
 
-;;; where to put the different spaces.
+;;;   Linkage Tables|        | <--        Static Space        ---> |
+;;;  +--------------+--------|--------------|-------+--------------+--------+-
+;;;  |      |       | resv'd |              | asm   | T   | word-  |        |
+;;;  | Lisp | Alien | for    | other        | code  |---- |  sized | Safept | GC card
+;;;  |      |       | future | static       | jmp   |---- | consts | Trap   | table
+;;;  | 4 MB |  1 MB | use    | data         | table | NIL | ...    | Page   |
+;;;  +--------------+--------+----------------------*--------------+--------+-
+;;;                                   ^ freeptr
 
-;;; Currently the read-only and static spaces must be located in low
-;;; memory (certainly under the 4GB limit, very probably under 2GB
-;;; limit). This is due to the inability of using immediate values of
-;;; more than 32 bits (31 bits if you take sign extension into
-;;; account) in any other instructions except MOV. Removing this limit
-;;; would be possible, but probably not worth the time and code bloat
-;;; it would cause. -- JES, 2005-12-11
+;;;   R12 (GC-card-table-reg) = NIL
+;;;   R12 + 64 - lowtag_of(NIL) = GC cards
+
+;;; If the safepoint page is present, then the cards are shifted up by 4k.
+;;; It makes sense that the safepoint page is a shorter distance from NIL.
+;;; i.e. the constant offset from NIL to reach the safepoint page fits in 1 byte,
+;;; while the offset to the card table does not fit in 1 byte.
+;;; There are typically 10x more safepoint instructions inserted than there
+;;; are barrier instructions. So whether you measure execution or just code size,
+;;; it's better to encode the safepoint trap more compactly.
+
+(defconstant-eqx +static-space-trailer-constants+
+  #(lisp-linkage-table ; This should be first - elftool hardwires it
+    alien-linkage-table
+    function-layout
+    msan-xor-constant
+    text-space-addr
+    text-card-count
+    text-card-marks
+    cpu-feature-bits)
+  #'equalp)
+(defconstant n-static-trailer-constants (length +static-space-trailer-constants+))
+
+(defconstant nil-static-space-end-offs
+  ;; 6 words (48 bytes) plus room for trailer constants minus NIL's lowtag.
+  (- (* (+ 6 n-static-trailer-constants) 8)
+     7)) ; LIST-POINTER-LOWTAG (which is not defined yet)
+(defconstant nil-cardtable-disp (+ nil-static-space-end-offs
+                                   #+sb-safepoint +backend-page-bytes+)) ; stupidly excessive
+
+(define-symbol-macro static-space-end (+ nil-value nil-static-space-end-offs))
 
 #+(or linux darwin)
-(!gencgc-space-setup #x50000000
-                     :read-only-space-size #+metaspace #.(* 2 1024 1024)
-                                           #-metaspace 0
-                     :fixedobj-space-size #.(* 40 1024 1024)
-                     :varyobj-space-size #.(* 130 1024 1024)
-                     :dynamic-space-start #x1000000000)
+(gc-space-setup #x520000000000
+                     :read-only-space-size 0
+                     :fixedobj-space-start #x50000000
+                     :fixedobj-space-size #.(* 60 1024 1024)
+                     :text-space-size #.(* 160 1024 1024)
+                     :text-space-start #xB800000000
+                     :dynamic-space-start #x1200000000)
 
 ;;; The default dynamic space size is lower on OpenBSD to allow SBCL to
-;;; run under the default 512M data size limit.
+;;; run under the default 1G data size limit.
 
 #-(or linux darwin)
-(!gencgc-space-setup #x20000000
-                     #-win32 :read-only-space-size #-win32 0
-                     :dynamic-space-start #x1000000000
-                     #+openbsd :dynamic-space-size #+openbsd #x1bcf0000)
+(gc-space-setup #x50000000
+                     :read-only-space-size 0
+                     :fixedobj-space-start #x20000000
+                     :fixedobj-space-size #.(* 60 1024 1024)
+                     :text-space-size #.(* 130 1024 1024)
+                     :text-space-start #x1000000000
+                     :dynamic-space-start #x1100000000
+                     #+openbsd :dynamic-space-size #+openbsd #x2fff0000)
 
-(defconstant linkage-table-growth-direction :up)
-(defconstant linkage-table-entry-size 16)
+;;; The purpose of permgen is to allow apples-to-apples comparison of mutator performance
+;;; under mark-region-gc. Without permgen we would give up the ability to encode layouts
+;;; and symbols as machine instruction operands. Permgen is not garbage-collected,
+;;; hence the name.
+#+permgen
+(progn
+  (defconstant permgen-space-size 33554432) ; 32MiB
+  (defparameter permgen-space-start #x50100000))
 
+(defconstant alien-linkage-table-growth-direction :up)
+(defconstant alien-linkage-table-entry-size 16)
+
+#+sb-xc-host
+(progn (defparameter alien-linkage-space-start
+         (- (or #+immobile-space text-space-start static-space-start) alien-linkage-space-size))
+       (defparameter lisp-linkage-space-addr
+         (- alien-linkage-space-start (* 8 (ash 1 n-linkage-index-bits)))))
 
 (defenum (:start 8)
   halt-trap
@@ -124,7 +167,6 @@
   fun-end-breakpoint-trap
   single-step-around-trap
   single-step-before-trap
-  undefined-function-trap
   invalid-arg-count-trap
   memory-fault-emulation-trap
   #+sb-safepoint global-safepoint-trap
@@ -136,65 +178,47 @@
 
 ;;;; static symbols
 
-;;; These symbols are loaded into static space directly after NIL so
-;;; that the system can compute their address by adding a constant
-;;; amount to NIL.
-;;;
-;;; The fdefn objects for the static functions are loaded into static
-;;; space directly after the static symbols. That way, the raw-addr
-;;; can be loaded directly out of them by indirecting relative to NIL.
-;;;
-;;; we could profitably keep these in registers on x86-64 now we have
-;;; r8-r15 as well
-;;;     Note these spaces grow from low to high addresses.
 (defvar *binding-stack-pointer*)
+;;; These symbols reside in low static space and referenced off NULL-TN
+(defconstant-eqx +static-symbols+
+ `#(,@+common-static-symbols+
+    ;; I had trouble making alien_stack_pointer use the thread slot for #-sb-thread
+    ;; because WITH-ALIEN binds SB-C:*ALIEN-STACK-POINTER* in an ordinary LET.
+    ;; That being so, it has to use the #-sb-thread mechanism of placing the new value
+    ;; in the symbol's value slot for compatibility with UNBIND and all else.
+    #-sb-thread *alien-stack-pointer*    ; a thread slot if #+sb-thread
+    ;; Asm code assembled by DEFINE-ALIEN-CALLABLE resides in static space and looks up
+    ;; the address of the C helper via the SYMBOL-VALUE slot of this Lisp symbol.
+    callback-wrapper-trampoline)
+  #'equalp)
+
+;; No static-fdefns are actually needed, but #() here causes the
+;; "recursion in known function" error to occur in ltn
+(defconstant-eqx +static-fdefns+ `#(,@common-static-fdefns) #'equalp)
 
 ;;; Bit indices into *CPU-FEATURE-BITS*
 (defconstant cpu-has-ymm-registers   0)
 (defconstant cpu-has-popcnt          1)
 
-(defconstant-eqx +static-symbols+
- `#(,@+common-static-symbols+
-    #+(and immobile-space (not sb-thread)) function-layout
-    #-sb-thread *alien-stack-pointer*    ; a thread slot if #+sb-thread
-     ;; interrupt handling
-    #-sb-thread *pseudo-atomic-bits*     ; ditto
-    #-sb-thread *binding-stack-pointer* ; ditto
-    *cpu-feature-bits*)
-  #'equalp)
-
-(defconstant-eqx +static-fdefns+
-  #(length
-    two-arg-+
-    two-arg--
-    two-arg-*
-    two-arg-/
-    two-arg-<
-    two-arg->
-    two-arg-=
-    eql
-    %negate
-    two-arg-and
-    two-arg-ior
-    two-arg-xor
-    two-arg-gcd
-    two-arg-lcm
-    ensure-symbol-hash
-    sb-impl::install-hash-table-lock
-    update-object-layout
-    %coerce-callable-to-fun)
-  #'equalp)
-
 #+sb-simd-pack
-(defglobal *simd-pack-element-types* '(integer single-float double-float))
-
-(defconstant undefined-fdefn-header
-  ;; This constant is constructed as follows: Take the INT opcode
-  ;; plus the undefined-fun trap byte, then the bytes of the 'disp' field
-  ;; of the JMP instruction that would overwrite the INT instruction.
-  ;;   INT3 <trap-code> = CC **
-  ;;   JMP [RIP+16]     = FF 25 10 00 00 00 00
-  ;; When assigning a function we'll change the first two bytes to 0xFF 0x25.
-  ;; The 'disp' field will aready be correct.
-  (logior (ash undefined-function-trap 8)
-          (+ #x100000 (or #+int4-breakpoints #xCE #xCC))))
+(progn
+  (defconstant-eqx +simd-pack-element-types+
+      (coerce
+       (hash-cons
+        '(single-float double-float
+          (unsigned-byte 8) (unsigned-byte 16) (unsigned-byte 32) (unsigned-byte 64)
+          (signed-byte 8) (signed-byte 16) (signed-byte 32) (signed-byte 64)))
+       'vector)
+    #'equalp)
+  (defconstant sb-kernel::+simd-pack-wild+
+    (ldb (byte (length +simd-pack-element-types+) 0) -1))
+  (defconstant-eqx +simd-pack-128-primtypes+
+      #(simd-pack-single simd-pack-double
+        simd-pack-ub8 simd-pack-ub16 simd-pack-ub32 simd-pack-ub64
+        simd-pack-sb8 simd-pack-sb16 simd-pack-sb32 simd-pack-sb64)
+    #'equalp)
+  (defconstant-eqx +simd-pack-256-primtypes+
+      #(simd-pack-256-single simd-pack-256-double
+        simd-pack-256-ub8 simd-pack-256-ub16 simd-pack-256-ub32 simd-pack-256-ub64
+        simd-pack-256-sb8 simd-pack-256-sb16 simd-pack-256-sb32 simd-pack-256-sb64)
+    #'equalp))

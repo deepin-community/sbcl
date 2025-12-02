@@ -46,6 +46,7 @@
  ;; This comes early because it's useful for debugging everywhere.
  ("src/code/show" :c-headers)
  ("src/compiler/early-constantp" :c-headers)
+ ("src/compiler/vop-existsp" :c-headers)
  ("src/code/defsetfs" :not-host)
 
   ;; Declare all target special variables defined by ANSI
@@ -55,7 +56,6 @@
  ;; host and target very early.
  ("src/code/primordial-extensions" :c-headers)
  ("src/code/cold-init-helper-macros" :c-headers)
- ("src/code/early-defmethod" :not-host)
 
  ;; ASAP we replace the host's backquote reader with our own, to avoid leaking
  ;; details of the host into the target. This is not a concern in make-host-2
@@ -87,7 +87,6 @@
  ("src/code/cross-byte"  :c-headers :not-target)
  ("src/code/cross-misc"  :c-headers :not-target)
  ("src/code/cross-char"  :c-headers :not-target)
- ("src/code/cross-float" :c-headers :not-target)
  ("src/code/cross-io"    :not-target)
  ("src/code/cross-condition" :not-target)
 
@@ -98,8 +97,6 @@
 
  ("src/code/defbangtype" :c-headers)
  ("src/code/early-constants" :c-headers)
-
- ("src/compiler/vop-existsp" :c-headers)
 
  ;; comes early so that stuff can reason about function names
  ("src/code/function-names" :c-headers)
@@ -128,9 +125,7 @@
 
  ("src/code/ansi-stream" :not-host)
  ("src/code/restart" :not-host)
- ("src/code/early-print" :not-host)
  ("src/code/early-pprint" :not-host)
- ("src/code/early-impl" :not-host)
 
  ;; Needed before the first use of WITH-SINGLE-PACKAGE-LOCKED-ERROR.
  ("src/code/early-package" :not-host)
@@ -138,6 +133,9 @@
  ("src/code/early-raw-slots" :c-headers)
 
  ("src/code/maphash" :not-host)
+ ("src/code/sysmacs" :not-host)
+ ("src/code/hashset" :c-headers)
+ ("src/code/string-hash" :c-headers)
  ("src/code/xset" :c-headers) ; for representation of MEMBER type
  ;; This needs DEF!STRUCT, and is itself needed early so that structure
  ;; accessors and inline functions defined here can be compiled inline
@@ -149,8 +147,8 @@
  ("src/compiler/early-c" :c-headers)
  ("src/pcl/slot-name")
 
- ("src/code/sysmacs" :not-host)
  ("src/code/early-classoid" :c-headers)
+ ("src/code/initial-method" :not-host)
 
  ("src/compiler/generic/pinned-objects" :not-host)
  ("src/compiler/generic/layout-ids" :c-headers)
@@ -163,15 +161,15 @@
 
  ("src/code/debug-var-io")
 
- ("src/code/early-float")
-
- ("src/code/huffman")
+ ("src/code/number-dispatch" :c-headers)
+ ("src/code/float" :c-headers)
+ ("src/code/cross-float-reader" :c-headers :not-target)
+ ("src/code/cross-float" :c-headers :not-target)
 
  ;; 32-bit implementation of GET-INTERNAL-REAL-TIME needs some thread slots
  ("src/code/early-time" :c-headers)
 
  ("src/code/misc" :c-headers)
- ("src/code/early-defclass")
  ("src/code/target-error" :not-host)
  ("src/code/target-extensions" :not-host)
 
@@ -180,9 +178,8 @@
  ;;; convenient to stick them here)
 
  ("src/compiler/parse-lambda-list" :c-headers)
- ("src/compiler/fun-info" :c-headers)
- ("src/compiler/constantp" :c-headers)
  ("src/compiler/macros" :c-headers)
+ ("src/compiler/fun-info" :c-headers)
  ("src/compiler/generic/vm-macs" :c-headers)
  ("src/compiler/policies")
 
@@ -190,9 +187,9 @@
  ("src/compiler/info-vector" :c-headers)
  ("src/compiler/globaldb" :c-headers)
  ("src/compiler/generic/objdef" :c-headers)
+ ("src/code/lockfree-list" :c-headers)
 
  ("src/compiler/generic/vm-array" :c-headers)
- ("src/code/string-hash" :c-headers)
  ("src/code/primordial-type" :c-headers)
  ("src/code/specializable-array" :not-target)
 
@@ -220,12 +217,10 @@
  ;; DEFINE-STORAGE-CLASS, needed by target/vm.lisp
  ("src/compiler/meta-vmdef" :c-headers)
 
- ("src/compiler/fixup") ; for DEFSTRUCT FIXUP, needed by generic/core
- ("src/compiler/generic/core") ; for CORE-OBJECT-P, needed by x86-64/vm
-
  ;; for e.g. DESCRIPTOR-REG, needed by primtype.lisp
  ("src/compiler/{arch}/vm" :c-headers)
 
+ ("src/code/cross-sxhash" :c-headers :not-target)
  ("src/code/alieneval" :c-headers)
  ;; This is generated automatically by grovel_headers.c, i.e. it's not
  ;; under source control.
@@ -233,16 +228,16 @@
  ("src/code/target-alieneval" :not-host)
  ("src/code/target-c-call"    :not-host)
 
+ ("src/code/misc-aliens" :not-host)
+ #+(or x86-64 system-tlabs) ("src/code/arena" :not-host)
  ("src/code/weak"             :not-host)
  ("src/code/array"            :not-host)
 
  ("src/code/list"   :not-host)
  ("src/code/seq"    :not-host) ; "code/seq" should come after "code/list".
- ("src/code/fdefinition"    :not-host)
  ("src/code/coerce" :not-host)
 
  ;; This needs DEFINE-ALIEN-ROUTINE from target-alieneval.
- ("src/code/misc-aliens" :not-host)
  ("src/code/thread" :not-host #-sb-devel :block-compile) ; provides *CURRENT-THREAD* for target-signal
 
  ;; RANDOM-LAYOUT-CLOS-HASH (in 'class') uses RANDOM, the transform for which
@@ -256,14 +251,17 @@
  ;; around the compilation of "code/class". Why?
  ("src/code/class" :c-headers)
  ("src/pcl/pre-warm")
+ ("src/code/pathname" :not-host)
  ("src/code/target-sxhash" :not-host) ; needs most-fooative-foo-float constants
 
  ("src/code/debug-info" :c-headers)
 
- ("src/code/source-location")
+ ("src/code/source-location" :c-headers)
 
  ("src/compiler/proclaim" :c-headers)
- ("src/compiler/deftype" :c-headers)     ; on host for SB-XC:DEFTYPE
+
+ ("src/compiler/constantp" :c-headers)
+ ("src/code/deftype" :c-headers)     ; on host for SB-XC:DEFTYPE
  ("src/code/type" :c-headers)
  ("src/compiler/generic/vm-type" :c-headers)
  ("src/code/pred" :not-host)
@@ -284,7 +282,6 @@
  ;; and SPECIALIZE-ARRAY-TYPE, defined in "compiler/generic/vm-type",
  ;; and PROCLAIM, defined in "src/compiler/proclaim"
  ("src/code/defstruct"  :c-headers)
- ("src/code/target-defstruct" :not-host)
 
  ;; ALIEN-VALUE has to be defined as a class (done by DEFSTRUCT
  ;; machinery) before we can set its superclasses here.
@@ -307,7 +304,6 @@
  ("src/code/random")
  ("src/code/hash-table" :c-headers)
  ("src/code/readtable")
- ("src/code/pathname" :not-host)
  ("src/code/host-pprint")
 
  ("src/compiler/knownfun")
@@ -321,18 +317,16 @@
 
  ("src/compiler/bit-util")
 
- ("src/code/linkage-table"   :not-host)
  ("src/code/foreign"         :not-host)
  ("src/code/unix"            :not-host)
  ("src/code/symbol"          :not-host)
  ("src/code/bignum"          :not-host #-(or bignum-assertions sb-devel) :block-compile)
- ("src/code/number-dispatch" :not-host)
- ("src/code/float-inf-nan"   :not-host)
  ("src/code/numbers"         :not-host)
  ("src/code/float-trap"      :not-host)
- ("src/code/float"           :not-host)
+ ("src/code/target-float"    :not-host)
  ("src/code/irrat"           :not-host)
 
+ ("src/code/alloc"           :not-host) ; for ALLOCATE-SYSTEM-MEMORY in make-buffer
  ("src/code/fd-stream"       :not-host)
  ("src/code/target-char"     :not-host)
  ("src/code/stream"          :not-host)
@@ -342,20 +336,22 @@
 
  ("src/code/format-directive")
 
- ("src/code/host-c-call")
+ ("src/code/c-call")
 
  #+os-provides-dlopen ("src/code/foreign-load" :not-host)
  #+(and os-provides-dlopen (not win32)) ("src/code/unix-foreign-load" :not-host)
  #+(and os-provides-dlopen win32) ("src/code/win32-foreign-load" :not-host)
 
- ("src/code/fop") ; needs macros from code/load.lisp
+ #+sb-dyncount ("src/compiler/dyncount")
+ #+sb-dyncount ("src/code/dyncount")
 
  ("src/compiler/disassem")
  ("src/compiler/assem")
 
- ;; Compiling this requires fop definitions from code/fop.lisp and
+ ("src/compiler/codegen")
+ ;; Compiling this requires fop definitions from code/load.lisp.
  ("src/compiler/dump")
- ("src/compiler/target-dump" :not-host) ; needs stuff from compiler/dump.lisp
+ ("src/compiler/generic/core" :not-host)
 
  ("src/compiler/ir1report") ; for COMPILER-ERROR-CONTEXT
  ("src/compiler/main") ; needs DEFSTRUCT FASL-OUTPUT from dump.lisp
@@ -370,11 +366,9 @@
  ("src/compiler/ir1opt")
  ("src/compiler/loop")
 
- ("src/compiler/ir1final")
  ("src/compiler/constraint")
  ("src/compiler/equality-constraints")
- ("src/compiler/array-tran")
- ("src/compiler/seqtran")
+ ("src/compiler/constraint-back")
  ("src/compiler/saptran")
  ("src/compiler/modarith")
  ("src/compiler/sxhash")
@@ -382,15 +376,14 @@
  ("src/compiler/bitops-derive-type")
 
  ("src/compiler/dfo")
- ("src/compiler/dce")
  ("src/compiler/checkgen")
 
  ("src/compiler/tn")
  ("src/compiler/life")
 
  ("src/compiler/debug-dump")
+ ("src/compiler/generic/static-syms" :c-headers)
  ("src/compiler/generic/utils" :c-headers)
- ("src/compiler/fopcompile")
 
  ("src/assembly/assemfile" :not-target)
 
@@ -406,39 +399,12 @@
  #+sb-simd-pack ("src/compiler/{arch}/simd-pack")
  #+sb-simd-pack-256 ("src/compiler/{arch}/simd-pack-256")
  ("src/compiler/{arch}/sap")
- ("src/compiler/{arch}/system")
  ("src/compiler/{arch}/char")
+ ("src/compiler/{arch}/system")
  ("src/compiler/{arch}/memory")
- ("src/compiler/{arch}/arith")
- ("src/compiler/{arch}/pred")
-
- ;; this file defines the INTERVAL struct which is also used in 'srctran'
- ("src/compiler/float-tran")
- ;; This is a terrible name for a file that contains type derivers
- ;; and IR1 transforms. Maybe split it up into more appropriately named pieces.
- ("src/compiler/srctran")
- ("src/compiler/generic/vm-tran")
- ("src/compiler/generic/type-vops")
- ("src/compiler/{arch}/type-vops")
- ("src/compiler/typetran")
- ("src/compiler/generic/vm-typetran")
- ("src/code/cross-modular"  :not-target)
-
- ("src/compiler/{arch}/subprim")
- ("src/compiler/{arch}/debug")
  ("src/compiler/{arch}/c-call")
- ("src/compiler/{arch}/cell")
- ("src/compiler/{arch}/values")
- ("src/compiler/{arch}/alloc")
- ("src/compiler/{arch}/call")
- ("src/compiler/{arch}/nlx")
- ("src/compiler/generic/late-nlx")
- ("src/compiler/{arch}/show")
- ("src/compiler/{arch}/array")
- ("src/compiler/generic/type-error")
- ("src/compiler/physenvanal")
 
- ;; KLUDGE: The assembly files need to be compiled twice: once as
+ ;; The assembly files need to be compiled twice: once as
  ;; normal lisp files, and once by sb-c:assemble-file.  We use a
  ;; different suffix / "file type" for the :assem versions to make
  ;; sure we don't scribble over anything we shouldn't.
@@ -450,10 +416,45 @@
  ;; assembly files are all loaded by genesis before any compiled files.
  ("src/assembly/master" :assem :not-host)
 
+ ("src/compiler/float-tran")
+ ("src/compiler/array-tran")
+ ("src/compiler/generic/vm-tran")
+ ("src/compiler/type-vop-macros")
+ ("src/compiler/{arch}/arith")
+ ("src/compiler/{arch}/pred")
+ ("src/compiler/{arch}/type-vops")
+
+ ("src/compiler/generic/type-vops")
+ ("src/compiler/ir1final")
+
+ ("src/compiler/{arch}/alloc")
+ ("src/compiler/{arch}/values")
+
+ ;; This is a terrible name for a file that contains type derivers
+ ;; and IR1 transforms. Maybe split it up into more appropriately named pieces.
+ ("src/compiler/srctran")
+ ("src/compiler/seqtran")
+ ("src/compiler/typetran")
+ ("src/compiler/generic/vm-typetran")
+ ("src/code/cross-modular"  :not-target)
+
+ ("src/compiler/{arch}/subprim")
+ ("src/compiler/{arch}/debug")
+ ("src/compiler/{arch}/cell")
+ #+(and x86-64 sb-thread) ("src/compiler/{arch}/tls")
+ ("src/compiler/{arch}/call")
+ ("src/compiler/{arch}/nlx")
+ ("src/compiler/generic/late-nlx")
+ ("src/compiler/{arch}/show")
+ ("src/compiler/{arch}/array")
+ ("src/compiler/generic/type-error")
+ ("src/compiler/envanal")
+
  ("src/compiler/pseudo-vops")
 
  ("src/compiler/aliencomp")
 
+ ("src/compiler/coverage")
  ("src/compiler/ltv")
  ("src/compiler/gtn")
  ("src/compiler/ltn")
@@ -469,11 +470,7 @@
  ("src/compiler/ir2opt")
  ("src/compiler/pack")
  ("src/compiler/pack-iterative")
- ("src/compiler/codegen")
  ("src/compiler/debug")
-
- #+sb-dyncount ("src/compiler/dyncount")
- #+sb-dyncount ("src/code/dyncount")
 
  ("src/code/format-time" :not-host)
 
@@ -486,23 +483,18 @@
  ;; compiled as part of the compiler
 
  ("src/code/macroexpand")
- ("src/code/target-unicode" :not-host)
- ("src/code/mipsstrops"     :not-host)
- ("src/code/string"         :not-host)
  ("src/code/funutils"       :not-host)
 
  #+win32 ("src/code/win32" :not-host)
  #+android ("src/code/android-os" :not-host)
  #+sunos ("src/code/sunos-os" :not-host)
  #+bsd   ("src/code/bsd-os"   :not-host)
- #+linux ("src/code/linux-os" :not-host)
+ #+(and linux (not android)) ("src/code/linux-os" :not-host)
  #+haiku ("src/code/haiku-os" :not-host)
  #+win32 ("src/code/win32-os" :not-host)
 
  ("src/code/share-vm" :not-host)
 
- ;; KLUDGE: I'd prefer to have this done with a "code/target" softlink
- ;; instead of a bunch of reader macros. -- WHN 19990308
  #+sparc ("src/code/sparc-vm" :not-host)
  #+x86   ("src/code/x86-vm"   :not-host)
  #+x86-64("src/code/x86-64-vm"   :not-host)
@@ -512,17 +504,24 @@
  #+arm64 ("src/code/arm64-vm" :not-host)
  #+riscv ("src/code/riscv-vm" :not-host)
 
+ #+(or arm64 x86-64)
+ ("src/code/simd-fndb")
+ #+x86-64
+ ("src/code/x86-64-simd"   :not-host)
+ #+arm64
+ ("src/code/arm64-simd"   :not-host)
+ ("src/code/unicode-norm" :not-host)
+ ("src/code/mipsstrops"     :not-host)
+ ("src/code/string"         :not-host)
+
  ("src/code/target-signal-common" :not-host)
  #+unix ("src/code/target-signal" :not-host) ; needs OS-CONTEXT-T from share-vm
  #+win32 ("src/code/target-exception" :not-host)
  ("src/code/serve-event" :not-host)
 
  ("src/code/late-extensions") ; needs condition system
- ("src/compiler/generic/target-core" :not-host) ; uses stuff from
-                                                ;   "compiler/generic/core"
 
- ("src/code/alloc"             :not-host) ; needs foo-SPACE-START
- #+metaspace ("src/code/metaspace" :not-host)
+ ("src/code/brothertree" :c-headers)
  ("src/code/simple-fun"        :not-host) ; function slot accessors
  ("src/code/eval"              :not-host) ; uses INFO, wants compiler macro
  ("src/code/toplevel"          :not-host)
@@ -531,13 +530,17 @@
  ("src/code/bignum-random"     :not-host) ; needs "code/random" and
                                           ;   "code/bignum"
  ("src/code/target-hash-table" :not-host) ; needs "code/hash-table"
- ("src/code/query"  :not-host)
+ #+linkage-space ("src/code/linkage-space" :not-host)
+ ("src/code/fdefinition"       :not-host)
  ("src/code/sort"  :not-host)
+ ("src/code/target-lflist" :not-host)
+ ("src/code/solist" :not-host)
  ("src/code/final" :not-host)
- ("src/code/pprint" :not-host) ; defines WITH-PRETTY-STREAM needed by 'print'
  ("src/code/reader" :not-host) ; needs "code/readtable"
  ("src/code/print" :not-host)
+ ("src/code/pprint" :not-host)
 
+ ("src/code/target-defstruct"  :not-host)
  ("src/code/target-stream"     :not-host) ; needs WHITESPACEP from "code/reader"
  ("src/code/target-pathname"   :not-host)
  #-win32 ("src/code/unix-pathname"     :not-host)
@@ -545,19 +548,20 @@
  ("src/code/filesys"           :not-host) ; needs HOST from "code/pathname"
 
  ("src/code/target-misc"       :not-host) ; dribble-stream, used by "save"
- ("src/code/sharpm"            :not-host) ; uses stuff from "code/reader"
 
  ("src/code/early-step")                  ; target-thread needs *STEP-OUT*
 
- ("src/code/gc"                :not-host)
- ("src/code/avltree"           :not-host)
+ ("src/code/avltree"           :c-headers)
  ("src/code/target-thread"     :not-host)
- ("src/code/timer" :not-host)
 
  ("src/code/error-error" :not-host) ; needs WITH-STANDARD-IO-SYNTAX macro
  ;; defines SB-DI:DO-DEBUG-FUN-BLOCKS, needed by target-disassem.lisp
  ("src/code/debug-int" :not-host)
+ ("src/code/gc"                :not-host)
+
  ("src/code/interr" :not-host)
+
+ ("src/code/sharpm"            :not-host) ; uses stuff from "code/reader"
 
  ("src/code/target-load" :not-host) ; for *assembler-routines*, needed by target-disassem
 
@@ -572,24 +576,33 @@
  ("src/code/external-formats/enc-basic" :not-host)
  #+sb-unicode ("src/code/external-formats/enc-ucs" :not-host) ; win32 needs this
 
- #+sb-eval ("src/code/full-eval"   :not-host) ; uses INFO, ARG-COUNT-ERROR
-
  ("src/code/bit-bash"    :not-host) ; needs %NEGATE from assembly/{arch}/arith
 
  #-(or x86 x86-64) ("src/compiler/generic/sanctify" :not-host)
+
+ ;;; PCL things. This stuff used to happen in the warm load, but now
+ ;;; as PCL gets more integrated into the system, we'd like to
+ ;;; bootstrap things like classes at the same time as the rest of the
+ ;;; type system.
+ ("src/pcl/walk")
+ ("src/pcl/low" :not-host)
+ ("src/pcl/macros" :not-host)
+ ("src/pcl/ecd" :not-host)
+ ("src/pcl/compiler-support" :not-host)
+ ("src/pcl/defs" :not-host)
+ ("src/pcl/wrapper" :not-host)
+ ("src/pcl/class-init" :not-host)
 
  ("src/code/cold-init" :not-host) ; needs (SETF EXTERN-ALIEN) macroexpansion
 
  ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
  ;; target macros and DECLAIMs installed at build-the-cross-compiler time
 
- ;; FIXME: here? earlier?  can probably be as late as possible.  Also
- ;; maybe call it FORCE-DELAYED-PROCLAIMS?
- ("src/compiler/late-proclaim")
-
  ("src/code/setf")
  ("src/code/macros")
  ("src/code/loop")
+ ("src/pcl/defclass")
+ ("src/code/early-defmethod")
 
  ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
  ;; other target-code-building stuff which can't be processed until
@@ -598,29 +611,18 @@
  ("src/code/format") ; needs SB-XC:DEFMACRO
  ("src/code/target-format" :not-host)
 
- ("src/code/late-globaldb" :not-host)
- ("src/code/redblack" :not-host)
- ;; This file, which must be last, contains sanity-checks of the cross-compile.
- ;; The inputs and outputs of certain functions (currently just SXHASH) are stored
- ;; in global symbols. Relying on the fact that data are easily dumped as constants
- ;; (assuming we don't have a genesis bug), the forms in this file can audit
- ;; whether things came out right.
- ("src/code/last-file" :not-host))
+ ("src/code/late-globaldb" :not-host))
 
 ;;; make-target-2 build steps
-(("src/code/early-ntrace" ; lets PCL hook into tracing
-  "src/code/room" ; for MAP-ALLOCATED-OBJECTS
-  #+immobile-code "src/code/immobile-space" ; needs src/code/room
-  ;; Delay (re)defining WARN until after remove-static-links works.
-  ;; The definition in cold-error is good enough for self-build.
+(("src/code/room" ; for MAP-ALLOCATED-OBJECTS
+  #+x86-64 "src/code/text-space" ; needs src/code/room
   "src/code/warm-error"
+  ;; Redefine some functions that contributed to far too numerous
+  ;; xperfecthash entries due to variation by build configuration.
+  "src/compiler/generic/static-syms"
+ #+(and sb-futex (or arm64 x86-64)) "src/code/rwlock"
   "src/code/icf"
-  ;; We re-nickname SB-SEQUENCE as SEQUENCE now.
-  ;; It could be done in genesis, but not earlier,
-  ;; since the host has a package of that name.
-  "src/code/defpackage"
-  "src/code/target-lflist"
-  "src/pcl/walk") ; needs DEFPACKAGE
+  "src/code/defpackage")
 
  #+sb-fasteval
  ("src/interpreter/macros"
@@ -630,10 +632,13 @@
   "src/interpreter/special-forms"
   "src/interpreter/eval"
   "src/interpreter/debug")
+ ("src/code/huffman"
+  "src/code/target-unicode")
 
- ;; For an easy core size decreases by 3.5% put :UNICODE-LITE in features to exclude
- ;; a few external-formats that you'll probably never need.
- ;; Even better would be if they were all demand-loadable.
+ ;; For an easy core size decrease by 3.5% put :UNICODE-LITE in
+ ;; features to exclude a few external-formats that you'll probably
+ ;; never need.  Even better would be if they were all
+ ;; demand-loadable.
  #+sb-unicode ("src/code/external-formats/enc-utf")
  #-unicode-lite ("src/code/external-formats/enc-ebcdic")
  #+(and sb-unicode (not unicode-lite))
@@ -650,21 +655,19 @@
 
  ("src/code/stubs")
 
+ #+sb-devel
+ ("src/code/cold-init-helper-macros")
+
  ;; CLOS, derived from the PCL reference implementation
  ;;
  ;; This PCL build order is based on a particular
  ;; (arbitrary) linearization of the declared build
  ;; order dependencies from the old PCL defsys.lisp
  ;; dependency database.
- ("src/pcl/low"
-  "src/pcl/macros"
-  "src/pcl/compiler-support"
-  "src/pcl/defclass"
-  "src/pcl/defs"
-  "src/pcl/fngen"
-  "src/pcl/wrapper"
+ ("src/pcl/fngen"
   "src/pcl/cache"
   "src/pcl/dlisp"
+  "src/pcl/dlisp2"
   "src/pcl/boot"
   "src/pcl/vector"
   "src/pcl/slots-boot"
@@ -683,13 +686,14 @@
   "src/pcl/fixup"
   "src/pcl/call-next-method"
   "src/pcl/defcombin"
-  "src/pcl/ctypes"
   "src/pcl/env"
   "src/pcl/documentation"
   "src/pcl/print-object"
   "src/pcl/precom1"
   "src/pcl/precom2"
   "src/code/ntrace")
+
+  #+sb-eval ("src/code/full-eval")
 
  ("src/code/setf-funs"
   ;; miscellaneous functionality which depends on CLOS
@@ -718,8 +722,10 @@
   "src/code/alien-callback"
   "src/code/run-program"
   #+win32 "src/code/warm-mswin"
-  #+gencgc "src/code/traceroot"
+  "src/code/traceroot"
 
+  "src/code/query"
+  "src/code/timer"
   "src/code/repack-xref"
   #+cheneygc "src/code/purify"
   "src/code/module"

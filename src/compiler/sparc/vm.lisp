@@ -34,19 +34,12 @@
                  `(eval-when (:compile-toplevel :load-toplevel :execute)
                    (defconstant ,offset-sym ,offset)
                    (setf (svref *register-names* ,offset-sym)
-                        ,(symbol-name name)))))
-
-           (defregset (name &rest regs)
-                `(eval-when (:compile-toplevel :load-toplevel :execute)
-                  (defparameter ,name
-                    (list ,@(mapcar (lambda (name)
-                                      (symbolicate name "-OFFSET"))
-                                    regs))))))
+                        ,(symbol-name name))))))
   ;; c.f. src/runtime/sparc-lispregs.h
 
   ;; Globals.  These are difficult to extract from a sigcontext.
   (defreg zero 0)                               ; %g0
-  (defreg alloc 1)                              ; %g1
+  (defreg thread 1)                             ; %g1
   (defreg null 2)                               ; %g2
   (defreg csp 3)                                ; %g3
   (defreg cfp 4)                                ; %g4
@@ -272,14 +265,12 @@
                (let ((offset-sym (symbolicate name "-OFFSET"))
                      (tn-sym (symbolicate name "-TN")))
                  `(defparameter ,tn-sym
-                   (make-random-tn :kind :normal
-                    :sc (sc-or-lose ',sc)
-                    :offset ,offset-sym)))))
+                   (make-random-tn (sc-or-lose ',sc) ,offset-sym)))))
   (defregtn zero any-reg)
   (defregtn null descriptor-reg)
   (defregtn code descriptor-reg)
   (defregtn lip descriptor-reg)
-  (defregtn alloc any-reg)
+  (defregtn thread any-reg)
 
   (defregtn nargs any-reg)
   (defregtn bsp any-reg)
@@ -302,7 +293,10 @@
     (symbol
      (if (static-symbol-p value)
          immediate-sc-number
-         nil))))
+         nil))
+    (structure-object
+     (when (eq value sb-lockless:+tail+)
+       immediate-sc-number))))
 
 (defun boxed-immediate-sc-p (sc)
   (or (eql sc zero-sc-number)
@@ -331,11 +325,9 @@
 
 
 ;;; a list of TN's describing the register arguments
-(defparameter *register-arg-tns*
+(define-load-time-global *register-arg-tns*
   (mapcar (lambda (n)
-            (make-random-tn :kind :normal
-                              :sc (sc-or-lose 'descriptor-reg)
-                              :offset n))
+            (make-random-tn (sc-or-lose 'descriptor-reg) n))
           *register-arg-offsets*))
 
 ;;; This is used by the debugger.
@@ -356,10 +348,6 @@
       (non-descriptor-stack (format nil "NS~D" offset))
       (constant (format nil "Const~D" offset))
       (immediate-constant "Immed"))))
-
-(defun combination-implementation-style (node)
-  (declare (type sb-c::combination node) (ignore node))
-  (values :default nil))
 
 (defun primitive-type-indirect-cell-type (ptype)
   (declare (ignore ptype))

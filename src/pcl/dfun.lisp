@@ -145,7 +145,8 @@ Except see also BREAK-VICIOUS-METACIRCLE.  -- CSR, 2003-05-28
                            (and (not (eq gf-name 'slot-value-using-class))
                                 (not (equal gf-name
                                             '(setf slot-value-using-class)))
-                                (not (eq gf-name 'slot-boundp-using-class)))))
+                                (not (eq gf-name 'slot-boundp-using-class))
+                                (not (eq gf-name 'slot-makunbound-using-class)))))
                 (update-dfun gf)))
             (setf (second args-entry) constructor)
             (setf (third args-entry) system)
@@ -201,15 +202,16 @@ Except see also BREAK-VICIOUS-METACIRCLE.  -- CSR, 2003-05-28
                 (slot-definition-location slot)))))
     (setf *standard-slot-locations* new)))
 
-(defun maybe-update-standard-slot-locations (class)
-  (when (and (eq **boot-state** 'complete)
-             (memq (class-name class) +standard-classes+))
-    (compute-standard-slot-locations)))
-
 (defun standard-slot-value (object slot-name class)
   (declare (notinline standard-instance-access
                       funcallable-standard-instance-access))
-  (let ((location (gethash (cons class slot-name) *standard-slot-locations*)))
+  ;; I'm sure there's a super easy way to feed the mix of the CLASS and SLOT-NAME
+  ;; hashes into a perfect hash fun, but this function seems never to be called except
+  ;; by MOP some tests. Therefore I don't care to improve it beyond the avoidance
+  ;; of 1 cons operation.
+  (let* ((key (cons class slot-name))
+         (location (gethash key *standard-slot-locations*)))
+    (declare (dynamic-extent key))
     (if location
         (let ((value (if (funcallable-instance-p object)
                          (funcallable-standard-instance-access object location)
@@ -366,7 +368,7 @@ Except see also BREAK-VICIOUS-METACIRCLE.  -- CSR, 2003-05-28
 
 (defun accessor-miss-function (gf dfun-info)
   (ecase (dfun-info-accessor-type dfun-info)
-    ((reader boundp)
+    ((reader boundp makunbound)
      (lambda (arg)
        (accessor-miss gf nil arg dfun-info)))
     (writer
@@ -379,6 +381,7 @@ Except see also BREAK-VICIOUS-METACIRCLE.  -- CSR, 2003-05-28
   (let ((emit (ecase type
                 (reader 'emit-one-class-reader)
                 (boundp 'emit-one-class-boundp)
+                (makunbound 'emit-one-class-makunbound)
                 (writer 'emit-one-class-writer)))
         (dfun-info (one-class-dfun-info type index wrapper)))
     (values
@@ -392,6 +395,7 @@ Except see also BREAK-VICIOUS-METACIRCLE.  -- CSR, 2003-05-28
   (let ((emit (ecase type
                 (reader 'emit-two-class-reader)
                 (boundp 'emit-two-class-boundp)
+                (makunbound 'emit-two-class-makunbound)
                 (writer 'emit-two-class-writer)))
         (dfun-info (two-class-dfun-info type index w0 w1)))
     (values
@@ -406,6 +410,7 @@ Except see also BREAK-VICIOUS-METACIRCLE.  -- CSR, 2003-05-28
   (let* ((emit (ecase type
                  (reader 'emit-one-index-readers)
                  (boundp 'emit-one-index-boundps)
+                 (makunbound 'emit-one-index-makunbounds)
                  (writer 'emit-one-index-writers)))
          (cache (or cache (make-cache :key-count 1 :value nil :size 4)))
          (dfun-info (one-index-dfun-info type index cache)))
@@ -422,6 +427,7 @@ Except see also BREAK-VICIOUS-METACIRCLE.  -- CSR, 2003-05-28
   (let* ((emit (ecase type
                  (reader 'emit-n-n-readers)
                  (boundp 'emit-n-n-boundps)
+                 (makunbound 'emit-n-n-makunbounds)
                  (writer 'emit-n-n-writers)))
          (cache (or cache (make-cache :key-count 1 :value t :size 2)))
          (dfun-info (n-n-dfun-info type cache)))
@@ -717,13 +723,15 @@ Except see also BREAK-VICIOUS-METACIRCLE.  -- CSR, 2003-05-28
         ,@body))
     ,(if type
          ;; Munge the EMF so that INVOKE-EMF can do the right thing:
-         ;; BOUNDP gets a structure, WRITER the logical not of the
-         ;; index, so that READER can use the raw index.
+         ;; BOUNDP and MAKUNBOUND get a structure, WRITER the logical
+         ;; not of the index, so that READER can use the raw index.
          ;;
          ;; FIXME: could the NEMF not be a CONS (for :CLASS-allocated
          ;; slots?)
          `(if (integerp ,nemf)
               (case ,type
+                (makunbound
+                 (invoke-emf (make-fast-instance-boundp :index (lognot ,nemf)) ,args))
                 (boundp (invoke-emf (make-fast-instance-boundp :index ,nemf) ,args))
                 (reader (invoke-emf ,nemf ,args))
                 (writer (invoke-emf (lognot ,nemf) ,args)))
@@ -772,12 +780,16 @@ Except see also BREAK-VICIOUS-METACIRCLE.  -- CSR, 2003-05-28
                   (let* ((class (class-of instance))
                          (class-name (!bootstrap-get-slot 'class class 'name)))
                     (not (unbound-marker-p
-                             (!bootstrap-get-slot class-name
-                                                  instance slot-name))))))
+                          (!bootstrap-get-slot class-name instance slot-name))))))
       (writer #'(lambda (new-value instance)
                   (let* ((class (class-of instance))
                          (class-name (!bootstrap-get-slot 'class class 'name)))
-                    (!bootstrap-set-slot class-name instance slot-name new-value)))))))
+                    (!bootstrap-set-slot class-name instance slot-name new-value))))
+      (makunbound #'(lambda (instance)
+                      (let* ((class (class-of instance))
+                             (class-name (!bootstrap-get-slot 'class class 'name)))
+                        (!bootstrap-set-slot class-name instance slot-name +slot-unbound+)
+                        instance))))))
 
 (defun initial-dfun (gf args)
   (dfun-miss (gf args wrappers invalidp nemf ntype nindex)
@@ -816,15 +828,6 @@ Except see also BREAK-VICIOUS-METACIRCLE.  -- CSR, 2003-05-28
           ((every (lambda (method)
                     (if (consp method)
                         (let ((class (early-method-class method)))
-                          (or (eq class *the-class-standard-boundp-method*)
-                              (eq class *the-class-global-boundp-method*)))
-                        (or (standard-boundp-method-p method)
-                            (global-boundp-method-p method))))
-                  methods)
-           'boundp)
-          ((every (lambda (method)
-                    (if (consp method)
-                        (let ((class (early-method-class method)))
                           (or (eq class *the-class-standard-writer-method*)
                               (eq class *the-class-global-writer-method*)))
                         (and
@@ -834,7 +837,21 @@ Except see also BREAK-VICIOUS-METACIRCLE.  -- CSR, 2003-05-28
                                (slot-definition-class
                                 (accessor-method-slot-definition method)))))))
                   methods)
-           'writer))))
+           'writer)
+          ((every (lambda (method)
+                    (if (consp method)
+                        (let ((class (early-method-class method)))
+                          (eq class *the-class-global-boundp-method*))
+                        (global-boundp-method-p method)))
+                  methods)
+           'boundp)
+          ((every (lambda (method)
+                    (if (consp method)
+                        (let ((class (early-method-class method)))
+                          (eq class *the-class-global-makunbound-method*))
+                        (global-makunbound-method-p method)))
+                  methods)
+           'makunbound))))
 
 (defun make-final-accessor-dfun (gf type &optional classes-list new-class)
   (let ((table (make-hash-table :test #'eq)))
@@ -894,7 +911,7 @@ Except see also BREAK-VICIOUS-METACIRCLE.  -- CSR, 2003-05-28
          (otype (dfun-info-accessor-type dfun-info))
          oindex ow0 ow1 cache
          (args (ecase otype
-                 ((reader boundp) (list object))
+                 ((reader boundp makunbound) (list object))
                  (writer (list new object)))))
     (dfun-miss (gf args wrappers invalidp nemf ntype nindex)
       ;; The following lexical functions change the state of the
@@ -1102,10 +1119,17 @@ Except see also BREAK-VICIOUS-METACIRCLE.  -- CSR, 2003-05-28
               (index (standard-slot-value/eslotd slotd 'location))
               (type (gf-info-simple-accessor-type arg-info)))
           (when (and method
-                     (subtypep (ecase accessor-type
-                                 ((reader) (car classes))
-                                 ((writer) (cadr classes)))
-                               class))
+                     (let ((method-class (ecase accessor-type
+                                           ((reader) (car classes))
+                                           ((writer) (cadr classes)))))
+                       (or (eq method-class class)
+                           ;; SUBTYPEP doesn't work because it calls the CLASS-WRAPPER GF.
+                           (block nil
+                             (sb-kernel::do-subclassoids ((subclassoid layout)
+                                                          (layout-classoid (standard-slot-value/class class 'wrapper)))
+                               (declare (ignore layout))
+                               (when (eq method-class (classoid-pcl-class subclassoid))
+                                 (return t)))))))
             (return-from break-vicious-metacircle
               (values index (list method) type index)))))))
   (error "~@<vicious metacircle:  The computation of an ~
@@ -1177,14 +1201,14 @@ Except see also BREAK-VICIOUS-METACIRCLE.  -- CSR, 2003-05-28
   (declare (ignore gf))
   (let* ((accessor-type (gf-info-simple-accessor-type arg-info))
          (accessor-class (case accessor-type
-                           ((reader boundp) (car classes))
+                           ((reader boundp makunbound) (car classes))
                            (writer (cadr classes)))))
     (accessor-values-internal accessor-type accessor-class methods)))
 
 (defun accessor-values1 (gf accessor-type accessor-class)
   (let* ((type `(class-eq ,accessor-class))
          (types (ecase accessor-type
-                  ((reader boundp) `(,type))
+                  ((reader boundp makunbound) `(,type))
                   (writer `(t ,type))))
          (methods (compute-applicable-methods-using-types gf types)))
     (accessor-values-internal accessor-type accessor-class methods)))
@@ -1240,7 +1264,7 @@ Except see also BREAK-VICIOUS-METACIRCLE.  -- CSR, 2003-05-28
                                (early-method-specializers method t)
                                (method-specializers method)))
              (specl (ecase type
-                      ((reader boundp) (car specializers))
+                      ((reader boundp makunbound) (car specializers))
                       (writer (cadr specializers))))
              (specl-cpl (if early-p
                             (early-class-precedence-list specl)
@@ -1625,17 +1649,19 @@ Except see also BREAK-VICIOUS-METACIRCLE.  -- CSR, 2003-05-28
                                             all-applicable-p
                                             (all-sorted-p t)
                                             function-p)
-   (if (null methods)
+  (if (null methods)
       (lambda (method-alist wrappers)
         (declare (ignore method-alist wrappers))
         (lambda (&rest args)
           (call-no-applicable-method gf args)))
       (let* ((key (car methods))
              (cache
-              (if (listp key) ; early method
-                  (sixth key) ; See !EARLY-MAKE-A-METHOD
-                  (or (method-em-cache key)
-                      (setf (method-em-cache key) (cons nil nil))))))
+               (if (listp key)          ; early method
+                   (sixth key)          ; See !EARLY-MAKE-A-METHOD
+                   (or (method-em-cache key)
+                       (setf (method-em-cache key)
+                             (sb-thread:barrier (:write)
+                               (cons nil nil)))))))
         (if (and (null (cdr methods)) all-applicable-p ; the most common case
                  (null method-alist-p) wrappers-p (not function-p))
             (or (car cache)
@@ -1650,34 +1676,47 @@ Except see also BREAK-VICIOUS-METACIRCLE.  -- CSR, 2003-05-28
                   (let ((value (get-secondary-dispatch-function2
                                 gf methods types method-alist-p wrappers-p
                                 all-applicable-p all-sorted-p function-p)))
-                    (push (cons akey value) (cdr cache))
+                    (setf (cdr cache)
+                          (sb-thread:barrier (:write)
+                            (cons (cons akey value) (cdr cache))))
                     value)))))))
 
 (defun get-secondary-dispatch-function2 (gf methods types method-alist-p
                                          wrappers-p all-applicable-p
                                          all-sorted-p function-p)
-  (cond
-    ((not (and all-applicable-p all-sorted-p (not function-p)))
-     (let ((net (generate-discrimination-net
-                 gf methods types all-sorted-p)))
-       (compute-secondary-dispatch-function1 gf net function-p)))
-    ((eq **boot-state** 'complete)
-     (let* ((combin (generic-function-method-combination gf))
-            (effective (compute-effective-method gf combin methods)))
-       (make-effective-method-function1
-        gf effective method-alist-p wrappers-p)))
-    ((eq (generic-function-name gf) 'make-specializer-form-using-class)
-     ;; FIXME: instead of the above form, this should be
-     ;; (eq (generic-function-method-combination gf) *or-method-combination*)
-     ;; but that does not work for reasons I (JM) do not understand.
-     (let* ((combin (generic-function-method-combination gf))
-            (effective (short-compute-effective-method gf combin methods)))
-       (make-effective-method-function1
-        gf effective method-alist-p wrappers-p)))
-    (t
-     (let ((effective (standard-compute-effective-method gf nil methods)))
-       (make-effective-method-function1
-        gf effective method-alist-p wrappers-p)))))
+  (flet ((maybe-wrap (effective)
+           (if (gf-requires-emf-keyword-checks gf)
+               (multiple-value-bind (valid-keys keyargs-start)
+                   (compute-applicable-keywords gf methods)
+                 (wrap-with-applicable-keyword-check effective valid-keys keyargs-start))
+               effective)))
+    (cond
+      ((not (and all-applicable-p all-sorted-p (not function-p)))
+       (let ((net (generate-discrimination-net
+                   gf methods types all-sorted-p)))
+         (compute-secondary-dispatch-function1 gf net function-p)))
+      ((eq **boot-state** 'complete)
+       (let ((combin (generic-function-method-combination gf)))
+         (if (null (compute-primary-methods gf combin methods))
+             (lambda (method-alist wrappers)
+               (declare (ignore method-alist wrappers))
+               (lambda (&rest args)
+                 (call-no-primary-method gf args)))
+             (let ((effective (maybe-wrap (compute-effective-method gf combin methods))))
+               (make-effective-method-function1
+                gf effective method-alist-p wrappers-p)))))
+      ((eq (generic-function-name gf) 'make-specializer-form-using-class)
+       ;; FIXME: instead of the above form, this should be
+       ;; (eq (generic-function-method-combination gf) *or-method-combination*)
+       ;; but that does not work for reasons I (JM) do not understand.
+       (let* ((combin (generic-function-method-combination gf))
+              (effective (maybe-wrap (short-compute-effective-method gf combin methods))))
+         (make-effective-method-function1
+          gf effective method-alist-p wrappers-p)))
+      (t
+       (let ((effective (maybe-wrap (standard-compute-effective-method gf nil methods))))
+         (make-effective-method-function1
+          gf effective method-alist-p wrappers-p))))))
 
 (defun get-effective-method-function (gf methods
                                          &optional method-alist wrappers)

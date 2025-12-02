@@ -38,22 +38,19 @@
 
 ;;; Compute the address of the catch block from its TN, then store into the
 ;;; block the current Fp, Env, Unwind-Protect, and the entry PC.
-#+sb-thread
 (progn
   ;; MOVAPD instruction faults if not properly aligned
-  (assert (evenp (/ (info :variable :wired-tls '*binding-stack-pointer*) n-word-bytes)))
-  (assert (= (- (info :variable :wired-tls '*current-catch-block*)
-                (info :variable :wired-tls '*binding-stack-pointer*))
-             n-word-bytes))
+  (assert (evenp thread-binding-stack-pointer-slot))
+  (assert (= (- thread-current-catch-block-slot thread-binding-stack-pointer-slot) 1))
   (assert (= (- unwind-block-current-catch-slot unwind-block-bsp-slot) 1)))
 
 (define-vop (make-unwind-block)
   (:args (tn))
   (:info entry-label)
   (:temporary (:sc unsigned-reg) temp)
-  #+sb-thread
   (:temporary (:sc complex-double-reg) xmm-temp)
   (:results (block :scs (any-reg)))
+  (:vop-var vop)
   (:generator 22
     (inst lea block (unwind-block-ea tn))
     (load-tl-symbol-value temp *current-unwind-protect-block*)
@@ -61,16 +58,8 @@
     (storew rbp-tn block unwind-block-cfp-slot)
     (inst lea temp (rip-relative-ea entry-label))
     (storew temp block unwind-block-entry-pc-slot)
-    #+sb-thread
-    (let ((bsp (info :variable :wired-tls '*binding-stack-pointer*)))
-      (inst movapd xmm-temp (thread-tls-ea bsp))
-      (inst movupd (ea (* unwind-block-bsp-slot n-word-bytes) block) xmm-temp))
-    #-sb-thread
-    (progn
-      (load-binding-stack-pointer temp)
-      (storew temp block unwind-block-bsp-slot)
-      (load-tl-symbol-value temp *current-catch-block*)
-      (storew temp block unwind-block-current-catch-slot))))
+    (inst movapd xmm-temp (thread-slot-ea thread-binding-stack-pointer-slot))
+    (inst movupd (object-slot-ea block unwind-block-bsp-slot 0) xmm-temp)))
 
 ;;; like MAKE-UNWIND-BLOCK, except that we also store in the specified
 ;;; tag, and link the block into the CURRENT-CATCH list
@@ -80,8 +69,8 @@
   (:info entry-label)
   (:results (block :scs (any-reg)))
   (:temporary (:sc descriptor-reg) temp)
-  #+sb-thread
   (:temporary (:sc complex-double-reg) xmm-temp)
+  (:vop-var vop)
   (:generator 44
     (inst lea block (catch-block-ea tn))
     (load-tl-symbol-value temp *current-unwind-protect-block*)
@@ -90,20 +79,9 @@
     (inst lea temp (rip-relative-ea entry-label))
     (storew temp block catch-block-entry-pc-slot)
     (storew tag block catch-block-tag-slot)
-    #+sb-thread
-    (let ((bsp #1=(info :variable :wired-tls '*binding-stack-pointer*)))
-      #.(assert (and (= (- (info :variable :wired-tls '*current-catch-block*) #1#) n-word-bytes)
-                     (= (- catch-block-previous-catch-slot catch-block-bsp-slot) 1)))
-      (inst movapd xmm-temp (thread-tls-ea bsp))
-      (inst movupd (ea (* catch-block-bsp-slot n-word-bytes) block) xmm-temp)
-      (store-tl-symbol-value block *current-catch-block*))
-    #-sb-thread
-    (progn
-      (load-tl-symbol-value temp *current-catch-block*)
-      (storew temp block catch-block-previous-catch-slot)
-      (store-tl-symbol-value block *current-catch-block*)
-      (load-binding-stack-pointer temp)
-      (storew temp block catch-block-bsp-slot))))
+    (inst movapd xmm-temp (thread-slot-ea thread-binding-stack-pointer-slot))
+    (inst movupd (object-slot-ea block catch-block-bsp-slot 0) xmm-temp)
+    (store-tl-symbol-value block *current-catch-block*)))
 
 ;;; Just set the current unwind-protect to UWP. This instantiates an
 ;;; unwind block as an unwind-protect.
@@ -117,8 +95,7 @@
   (:temporary (:sc unsigned-reg) block)
   (:policy :fast-safe)
   (:generator 17
-    (inst mov block (catch-block-ea current-block
-                                    catch-block-previous-catch-slot))
+    (inst mov block (catch-block-ea current-block catch-block-previous-catch-slot))
     (store-tl-symbol-value block *current-catch-block*)))
 
 (define-vop (%unwind-protect-breakup)
@@ -126,8 +103,7 @@
   (:temporary (:sc unsigned-reg) block)
   (:policy :fast-safe)
   (:generator 17
-     (inst mov block (unwind-block-ea current-block
-                                      unwind-block-uwp-slot))
+     (inst mov block (unwind-block-ea current-block unwind-block-uwp-slot))
      (store-tl-symbol-value block *current-unwind-protect-block*)))
 
 ;;;; NLX entry VOPs
@@ -148,7 +124,7 @@
     (cond ((zerop nvals))
           ((= nvals 1)
            (let ((no-values (gen-label)))
-             (inst mov (tn-ref-tn values) nil-value)
+             (inst mov (tn-ref-tn values) null-tn)
              (inst test rcx-tn rcx-tn)
              (inst jmp :z no-values)
              (loadw (tn-ref-tn values) start -1)
@@ -182,8 +158,21 @@
                    (emit-label (car default))
                    (when (cddr default)
                      (inst push rdx-tn))
-                   (inst mov (second default) nil-value))
+                   (inst mov (second default) null-tn))
                  (inst jmp defaulting-done))))))
+    (inst mov rsp-tn sp)))
+
+(define-vop (nlx-entry-single)
+  (:args (sp)
+         (start))
+  (:results (res :from :load))
+  (:info label)
+  (:save-p :force-to-stack)
+  (:vop-var vop)
+  (:generator 30
+    (emit-label label)
+    (note-this-location vop :non-local-entry)
+    (inst mov res start)
     (inst mov rsp-tn sp)))
 
 (define-vop (nlx-entry-multiple)
@@ -200,7 +189,7 @@
   (:results (result :scs (any-reg))
             (num :scs (any-reg control-stack)))
   (:save-p :force-to-stack)
-  (:args-var top-tn-ref)
+  (:arg-refs top-tn-ref)
   (:vop-var vop)
   (:generator 30
     ;; The 'top' arg contains the %esp value saved at the time the
@@ -298,5 +287,4 @@
     (pushw rbp-tn (frame-word-offset return-pc-save-offset))
 
     ;; Call it
-    (inst jmp (ea (- (* closure-fun-slot n-word-bytes) fun-pointer-lowtag)
-                  block))))
+    (inst jmp (object-slot-ea block closure-fun-slot fun-pointer-lowtag))))

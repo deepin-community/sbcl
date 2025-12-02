@@ -66,8 +66,6 @@
     ;; This code has to pathological cases: NO-TLS-VALUE-MARKER
     ;; or UNBOUND-MARKER as NEW: in either case we would end up
     ;; doing possible damage with CMPXCHG -- so don't do that!
-    (let ((unbound (generate-error-code vop 'unbound-symbol-error symbol))
-          (check (gen-label)))
       (move eax old)
       #+sb-thread
       (progn
@@ -75,17 +73,17 @@
         ;; Thread-local area, no LOCK needed.
         (with-tls-ea (EA :base tls :base-already-live-p t)
           (inst cmpxchg EA new :maybe-fs))
-        (inst cmp eax no-tls-value-marker-widetag)
+        (inst cmp eax no-tls-value-marker)
         (inst jmp :ne check)
         (move eax old))
       (inst cmpxchg (make-ea :dword :base symbol
                              :disp (- (* symbol-value-slot n-word-bytes)
                                       other-pointer-lowtag))
             new :lock)
-      (emit-label check)
+      CHECK
       (move result eax)
       (inst cmp result unbound-marker-widetag)
-      (inst jmp :e unbound))))
+      (inst jmp :e (generate-error-code vop 'unbound-symbol-error symbol))))
 
 (define-vop (%set-symbol-global-value cell-set)
   (:variant symbol-value-slot other-pointer-lowtag))
@@ -93,11 +91,11 @@
 (define-vop (fast-symbol-global-value cell-ref)
   (:variant symbol-value-slot other-pointer-lowtag)
   (:policy :fast)
-  (:translate sym-global-val))
+  (:translate symbol-global-value))
 
 (define-vop (symbol-global-value)
   (:policy :fast-safe)
-  (:translate sym-global-val)
+  (:translate symbol-global-value)
   (:args (object :scs (descriptor-reg) :to (:result 1)))
   (:results (value :scs (descriptor-reg any-reg)))
   (:vop-var vop)
@@ -115,41 +113,34 @@
            (value :scs (descriptor-reg any-reg)))
     (:temporary (:sc descriptor-reg) tls)
     (:generator 4
-      (let ((global-val (gen-label))
-            (done (gen-label)))
         (loadw tls symbol symbol-tls-index-slot other-pointer-lowtag)
         (with-tls-ea (EA :base tls :base-already-live-p t)
-          (inst cmp EA no-tls-value-marker-widetag :maybe-fs)
+          (inst cmp EA no-tls-value-marker :maybe-fs)
           (inst jmp :z global-val)
           (inst mov EA value :maybe-fs))
         (inst jmp done)
-        (emit-label global-val)
+        GLOBAL-VAL
         (storew value symbol symbol-value-slot other-pointer-lowtag)
-        (emit-label done))))
+        DONE))
 
-  ;; With Symbol-Value, we check that the value isn't the trap object. So
-  ;; Symbol-Value of NIL is NIL.
+  ;; With Symbol-Value, we check that the value isn't the trap object.
   (define-vop (symbol-value)
-    (:translate symeval)
+    (:translate symbol-value)
     (:policy :fast-safe)
     (:args (object :scs (descriptor-reg) :to (:result 1)))
     (:results (value :scs (descriptor-reg any-reg)))
     (:vop-var vop)
     (:save-p :compute-only)
     (:generator 9
-      (let* ((check-unbound-label (gen-label))
-             (err-lab (generate-error-code vop 'unbound-symbol-error object))
-             (ret-lab (gen-label)))
         (loadw value object symbol-tls-index-slot other-pointer-lowtag)
         (with-tls-ea (EA :base value :base-already-live-p t)
           (inst mov value EA :maybe-fs))
-        (inst cmp value no-tls-value-marker-widetag)
+        (inst cmp value no-tls-value-marker)
         (inst jmp :ne check-unbound-label)
         (loadw value object symbol-value-slot other-pointer-lowtag)
-        (emit-label check-unbound-label)
+        CHECK-UNBOUND-LABEL
         (inst cmp value unbound-marker-widetag)
-        (inst jmp :e err-lab)
-        (emit-label ret-lab))))
+        (inst jmp :e (generate-error-code vop 'unbound-symbol-error object))))
 
   (define-vop (fast-symbol-value symbol-value)
     ;; KLUDGE: not really fast, in fact, because we're going to have to
@@ -158,23 +149,22 @@
     ;; unbound", which is used in the implementation of COPY-SYMBOL.  --
     ;; CSR, 2003-04-22
     (:policy :fast)
-    (:translate symeval)
+    (:translate symbol-value)
     (:generator 8
-      (let ((ret-lab (gen-label)))
         (loadw value object symbol-tls-index-slot other-pointer-lowtag)
         (with-tls-ea (EA :base value :base-already-live-p t)
           (inst mov value EA :maybe-fs))
-        (inst cmp value no-tls-value-marker-widetag)
-        (inst jmp :ne ret-lab)
+        (inst cmp value no-tls-value-marker)
+        (inst jmp :ne done)
         (loadw value object symbol-value-slot other-pointer-lowtag)
-        (emit-label ret-lab)))))
+        DONE)))
 
 #-sb-thread
 (progn
   (define-vop (symbol-value symbol-global-value)
-    (:translate symeval))
+    (:translate symbol-value))
   (define-vop (fast-symbol-value fast-symbol-global-value)
-    (:translate symeval))
+    (:translate symbol-value))
   (define-vop (set %set-symbol-global-value)))
 
 #+sb-thread
@@ -185,15 +175,14 @@
   (:conditional :ne)
   (:temporary (:sc descriptor-reg #+nil(:from (:argument 0))) value)
   (:generator 9
-    (let ((check-unbound-label (gen-label)))
       (loadw value object symbol-tls-index-slot other-pointer-lowtag)
       (with-tls-ea (EA :base value :base-already-live-p t)
         (inst mov value EA :maybe-fs))
-      (inst cmp value no-tls-value-marker-widetag)
+      (inst cmp value no-tls-value-marker)
       (inst jmp :ne check-unbound-label)
       (loadw value object symbol-value-slot other-pointer-lowtag)
-      (emit-label check-unbound-label)
-      (inst cmp value unbound-marker-widetag))))
+      CHECK-UNBOUND-LABEL
+      (inst cmp value unbound-marker-widetag)))
 
 #-sb-thread
 (define-vop (boundp)
@@ -206,27 +195,25 @@
                                        other-pointer-lowtag)
           unbound-marker-widetag)))
 
-
 (define-vop (symbol-hash)
   (:policy :fast-safe)
   (:translate symbol-hash)
   (:args (symbol :scs (descriptor-reg)))
-  (:results (res :scs (any-reg)))
+  (:results (res :scs (unsigned-reg)))
   (:result-types positive-fixnum)
-  (:args-var args)
   (:generator 2
-    ;; The symbol-hash slot of NIL holds NIL because it is also the
-    ;; car slot, so we have to strip off the two low bits to make sure
-    ;; it is a fixnum.  The lowtag selection magic that is required to
-    ;; ensure this is explained in the comment in objdef.lisp
     (loadw res symbol symbol-hash-slot other-pointer-lowtag)
-    (unless (not-nil-tn-ref-p args)
-      (inst and res (lognot #b11)))))
+    ;; include the low 3 random bits but ensure res is a HASH-CODE
+    (inst and res (ldb (byte sb-vm:n-positive-fixnum-bits 0) -1))))
+
+(define-vop (symbol-name-hash symbol-hash)
+  (:translate symbol-name-hash)
+  (:generator 1
+    (loadw res symbol symbol-hash-slot other-pointer-lowtag)
+    ;; shift out the low 3 random bits
+    (inst shr res 3)))
 
 ;;;; fdefinition (FDEFN) objects
-
-(define-vop (fdefn-fun cell-ref)        ; /pfw - alpha
-  (:variant fdefn-fun-slot other-pointer-lowtag))
 
 (define-vop (safe-fdefn-fun)
   (:translate safe-fdefn-fun)
@@ -243,11 +230,9 @@
 
 (define-vop (set-fdefn-fun)
   (:policy :fast-safe)
-  (:translate (setf fdefn-fun))
-  (:args (function :scs (descriptor-reg) :target result)
+  (:args (function :scs (descriptor-reg))
          (fdefn :scs (descriptor-reg)))
   (:temporary (:sc unsigned-reg) raw)
-  (:results (result :scs (descriptor-reg)))
   (:generator 38
     (inst mov raw (make-fixup 'closure-tramp :assembly-routine))
     (inst cmp (make-ea :byte :base function :disp (- fun-pointer-lowtag))
@@ -256,8 +241,7 @@
           (make-ea :dword :base function
                    :disp (- (* simple-fun-self-slot n-word-bytes) fun-pointer-lowtag)))
     (storew function fdefn fdefn-fun-slot other-pointer-lowtag)
-    (storew raw fdefn fdefn-raw-addr-slot other-pointer-lowtag)
-    (move result function)))
+    (storew raw fdefn fdefn-raw-addr-slot other-pointer-lowtag)))
 
 (define-vop (fdefn-makunbound)
   (:policy :fast-safe)
@@ -370,7 +354,7 @@
     (inst jmp :z skip)
     ;; Bind stack debug sentinels have the unbound marker in the symbol slot
     (inst cmp symbol unbound-marker-widetag)
-    (inst jmp :eq skip)
+    (inst jmp :e skip)
     (loadw value bsp binding-value-slot)
     #-sb-thread (storew value symbol symbol-value-slot other-pointer-lowtag)
     #+sb-thread (with-tls-ea (EA :base symbol :base-already-live-p t)
@@ -391,9 +375,8 @@
   closure-info-offset fun-pointer-lowtag
   (any-reg descriptor-reg) * %closure-index-ref)
 
-(define-full-setter set-funcallable-instance-info *
-  funcallable-instance-info-offset fun-pointer-lowtag
-  (any-reg descriptor-reg) * %set-funcallable-instance-info)
+(define-full-setter %closure-index-set * closure-info-offset fun-pointer-lowtag
+  (any-reg descriptor-reg) * %closure-index-set)
 
 (define-full-reffer funcallable-instance-info *
   funcallable-instance-info-offset fun-pointer-lowtag
@@ -409,7 +392,8 @@
 (define-vop (closure-init)
   (:args (object :scs (descriptor-reg))
          (value :scs (descriptor-reg any-reg)))
-  (:info offset)
+  (:info offset dx)
+  (:ignore dx)
   (:generator 4
     (storew value object (+ closure-info-offset offset) fun-pointer-lowtag)))
 
@@ -420,9 +404,6 @@
     (storew ebp-tn object (+ closure-info-offset offset) fun-pointer-lowtag)))
 
 ;;;; value cell hackery
-
-(define-vop (value-cell-ref cell-ref)
-  (:variant value-cell-value-slot other-pointer-lowtag))
 
 (define-vop (value-cell-set cell-set)
   (:variant value-cell-value-slot other-pointer-lowtag))
@@ -456,6 +437,11 @@
 (define-full-compare-and-swap %raw-instance-cas/word instance
   instance-slots-offset instance-pointer-lowtag
   (unsigned-reg) unsigned-num %raw-instance-cas/word)
+
+(define-full-compare-and-swap %raw-instance-cas/signed-word instance
+  instance-slots-offset instance-pointer-lowtag
+  (signed-reg) signed-num %raw-instance-cas/signed-word)
+
 
 ;;;; code object frobbing
 
@@ -466,18 +452,36 @@
   (:translate code-header-set)
   (:policy :fast-safe)
   (:args (object :scs (descriptor-reg))
-         (index :scs (unsigned-reg))
+         (index :scs (any-reg))
          (value :scs (any-reg descriptor-reg)))
-  (:arg-types * unsigned-num *)
-  (:temporary (:sc unsigned-reg :offset eax-offset) eax) ; for the asm routine
-  (:temporary (:sc unsigned-reg :offset edx-offset) edx)
-  (:temporary (:sc unsigned-reg :offset edi-offset) edi)
-  (:ignore eax edx edi)
+  (:arg-types * tagged-num *)
+  (:temporary (:sc unsigned-reg) table card)
   (:generator 10
-    (inst push value)
-    (inst push index)
-    (inst push object)
-    (inst call (make-fixup 'code-header-set :assembly-routine))))
+    ;; Find card mark table base. If the linkage entry contained the
+    ;; *value* of gc_card_mark pointer, we could eliminate one deref.
+    ;; Putting it in a statc symbol would also work, but this vop is
+    ;; not performance-critical by any stretch of the imagination.
+    (inst mov table (make-ea :dword :disp (make-fixup "gc_card_mark" :foreign-dataref)))
+    (inst mov table (make-ea :dword :base table))
+    (pseudo-atomic ()
+      (let ((do-not-mark (gen-label)))
+        (inst cmp object (+ static-space-start static-space-size)) ; = static-space-end
+        (inst jmp :b DO-NOT-MARK)
+        ;; Compute card mark index and touch the mark byte
+        (inst mov card object)
+        (inst shr card gencgc-card-shift)
+        (inst and card (make-fixup nil :card-table-index-mask))
+        (inst mov (make-ea :byte :base table :index card) 1) ; CARD_MARKED
+        (emit-label DO-NOT-MARK)
+        ;; set 'written' flag in the code header
+        ;; this doesn't need to use :LOCK because the only other writer
+        ;; would be a GCing thread, but we're pseudo-atomic here.
+        ;; If two threads actually did write the byte, then they would write
+        ;; the same value, and that works fine.
+        (inst or (make-ea :byte :base object :disp (- 3 other-pointer-lowtag)) #x40)
+        ;; store
+        (inst mov (make-ea :dword :base object :index index :disp (- other-pointer-lowtag))
+              value)))))
 
 ;;;; raw instance slot accessors
 

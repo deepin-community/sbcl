@@ -48,7 +48,7 @@
 (defun call-with-backtrace (cont test-function &key details)
   (flet ((capture-it (condition)
            (let (backtrace)
-             (sb-debug::map-backtrace
+             (sb-debug:map-backtrace
               (lambda (frame)
                 (multiple-value-bind (name args info)
                     (sb-debug::frame-call frame)
@@ -222,7 +222,7 @@
                                    (error "foo"))))
            (with-timeout 0.1
              (sb-thread:condition-wait q m)))))
-     `((sb-thread:condition-wait ,q ,m :timeout nil)))))
+     `((sb-thread::%condition-wait ,q ,m t nil nil nil nil nil nil)))))
 
 ;;; Division by zero was a common error on PPC. It depended on the
 ;;; return function either being before INTEGER-/-INTEGER in memory,
@@ -251,20 +251,20 @@
   (with-test (:name (:backtrace :divide-by-zero :bug-346)
                     :skipped-on :interpreter)
     (assert-backtrace (lambda () (test #'optimized))
-                      `((sb-kernel::integer-/-integer 42 &rest)
+                      `((/ 42 &rest)
                         ((flet test :in ,*p*) ,#'optimized))))
 
   (with-test (:name (:backtrace :divide-by-zero :bug-356)
                     :skipped-on :interpreter)
     (assert-backtrace (lambda () (test #'not-optimized))
-                      `((sb-kernel::integer-/-integer 42 &rest)
+                      `((/ 42 &rest)
                         ((flet not-optimized :in ,*p*))
                         ((flet test :in ,*p*) ,#'not-optimized)))))
 
 (defun throw-test ()
   (throw 'no-such-tag t))
 (with-test (:name (:backtrace :throw :no-such-tag)
-                  :fails-on (and :sparc :linux))
+                  :fails-on (or :mips (and :sparc :linux)))
   (assert-backtrace #'throw-test '((throw-test))))
 
 (funcall (checked-compile
@@ -288,6 +288,7 @@
                             &optional (two-arg
                                        (find-symbol (format nil "TWO-ARG-~A" fun)
                                                     "SB-KERNEL")))
+             (declare (ignorable predicate))
              (let ((test-name (make-symbol (format nil "TEST-~A" fun))))
                `(flet ((,test-name (x y)
                          ;; make sure it's not in tail position
@@ -345,7 +346,8 @@
           ;; no lambda-list saved
           (defun ,(intern (format nil "BT.~A.3" n)) ,ll
             (declare (optimize (debug 0)))
-            ,@body)))
+            (let (*) ;; disable tail calls enabled by debug-0
+              ,@body))))
      :allow-style-warnings t)))
 
 (defbt 1 (&key key)
@@ -549,7 +551,7 @@
   (gf-dispatch-test/gf 1 1)
   ;; Wrong argument count
   (assert-backtrace (lambda () (gf-dispatch-test/f 42))
-                    '(((sb-pcl::gf-dispatch gf-dispatch-test/gf) 42))))
+                    '((gf-dispatch-test/gf 42))))
 
 (defgeneric gf-default-only-test/gf (x y)
   (:method (x y) (+ x y)))
@@ -671,7 +673,7 @@
                                 c
                                 (return (cdar (sb-debug:list-backtrace :count 1))))))
                (apply fun args))))
-      ((fun t) (list t *unavailable-argument* *unavailable-argument*) :test #'equalp)
-      ((fun t 1) (list t 1 *unavailable-argument*) :test #'equalp)
+      ((fun t) (list t) :test #'equalp)
+      ((fun t 1) (list t 1) :test #'equalp)
       ((fun t 1 2) (list t 1 2) :test #'equalp)
       ((fun 1 2 3) (values 1 2 3)))))

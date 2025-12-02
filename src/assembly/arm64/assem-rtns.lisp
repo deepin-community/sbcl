@@ -7,11 +7,10 @@
     (return-multiple
      (:return-style :none))
 
-    ;; These four are really arguments.
+    ;; These are really arguments.
     ((:temp nvals any-reg nargs-offset)
      (:temp vals any-reg nl1-offset)
-     (:temp old-fp any-reg nl2-offset)
-     (:temp lra interior-reg lr-offset)
+     (:temp lra non-descriptor-reg lr-offset)
 
      ;; These are just needed to facilitate the transfer
      (:temp count any-reg nl3-offset)
@@ -64,11 +63,108 @@
 
   ;; Deallocate the unused stack space.
   (move ocfp-tn cfp-tn)
-  (move cfp-tn old-fp)
-  (inst add csp-tn ocfp-tn (lsl nvals (- word-shift n-fixnum-tag-bits)))
+  (inst add csp-tn cfp-tn (lsl nvals (- word-shift n-fixnum-tag-bits)))
 
   ;; Return.
-  (lisp-return lra :multiple-values))
+  (lisp-return lra :multiple-values t))
+
+(define-assembly-routine
+    (return-values-list
+     (:return-style :none)
+     (:vop-var vop)
+     (:vop-prefix
+      (let ((cur-nfp (current-nfp-tn vop)))
+        (when cur-nfp
+          (inst add nsp-tn cur-nfp (add-sub-immediate
+                                    (bytes-needed-for-non-descriptor-stack-frame)))))))
+
+    ;; These four are really arguments.
+    ((:arg list descriptor-reg r5-offset)
+     (:temp count any-reg nargs-offset)
+     (:temp temp descriptor-reg r6-offset)
+     (:temp ndescr non-descriptor-reg nl0-offset)
+
+     (:temp lr non-descriptor-reg lr-offset)
+     (:temp r0 descriptor-reg r0-offset)
+     (:temp r1 descriptor-reg r1-offset)
+     (:temp r2 descriptor-reg r2-offset)
+     (:temp r3 descriptor-reg r3-offset))
+  (flet ((check (label)
+           (assemble ()
+             (%test-lowtag list temp skip nil list-pointer-lowtag)
+             (cerror-call nil 'bogus-arg-to-values-list-error list)
+             (inst b label)
+             skip)))
+    (assemble ()
+      (move ocfp-tn cfp-tn)
+      (loadw-pair cfp-tn ocfp-save-offset lr lra-save-offset cfp-tn)
+      (%test-lowtag list ndescr ZERO-VALUES-ERROR t list-pointer-lowtag)
+      (inst cmp list null-tn)
+      (inst b :eq ZERO-VALUES)
+
+      (loadw r0 list cons-car-slot list-pointer-lowtag)
+      (loadw list list cons-cdr-slot list-pointer-lowtag)
+      (inst cmp list null-tn)
+      (inst b :ne CONTINUE)
+
+      ONE-VALUE
+      (move csp-tn ocfp-tn)
+      (lisp-return lr :single-value)
+      CONTINUE
+      (check ONE-VALUE)
+
+      (inst mov count (fixnumize 2))
+      (loadw r1 list cons-car-slot list-pointer-lowtag)
+      (loadw list list cons-cdr-slot list-pointer-lowtag)
+      (inst cmp list null-tn)
+      (inst b :eq TWO-VALUES)
+      (check TWO-VALUES)
+
+      (inst mov count (fixnumize 3))
+      (loadw r2 list cons-car-slot list-pointer-lowtag)
+      (loadw list list cons-cdr-slot list-pointer-lowtag)
+      (inst cmp list null-tn)
+      (inst b :eq THREE-VALUES)
+      (check THREE-VALUES)
+
+      (inst mov count (fixnumize 4))
+      (loadw r3 list cons-car-slot list-pointer-lowtag)
+      (loadw list list cons-cdr-slot list-pointer-lowtag)
+      (inst cmp list null-tn)
+      (inst b :eq FOUR-VALUES)
+      (check FOUR-VALUES)
+
+      (inst add csp-tn ocfp-tn (* n-word-bytes 4))
+
+      LOOP
+      (inst add count count (fixnumize 1))
+      (loadw temp list cons-car-slot list-pointer-lowtag)
+      (loadw list list cons-cdr-slot list-pointer-lowtag)
+      (inst str temp (@ csp-tn n-word-bytes :post-index))
+      (check DONE)
+      (inst cmp list null-tn)
+      (inst b :ne LOOP)
+
+      DONE
+      (lisp-return lr :multiple-values)
+
+      ZERO-VALUES-ERROR
+      (cerror-call nil 'bogus-arg-to-values-list-error list)
+      ZERO-VALUES
+      (inst mov count 0)
+      (inst mov r0 null-tn)
+      (inst mov r1 null-tn)
+
+      TWO-VALUES
+      (inst mov r2 null-tn)
+      (inst mov r3 null-tn)
+
+      THREE-VALUES
+      (inst mov r3 null-tn)
+
+      FOUR-VALUES
+      (inst add csp-tn ocfp-tn (lsl count (- word-shift n-fixnum-tag-bits)))
+      (lisp-return lr :multiple-values))))
 
 ;;;; tail-call-variable.
 (defun prepare-for-tail-call-variable (nargs args count dest temp r0 r1 r2 r3)
@@ -127,7 +223,7 @@
      (:temp dest any-reg nl2-offset) ;; Not live concurrent with ARGS.
      (:temp count any-reg nl3-offset)
      (:temp temp descriptor-reg r9-offset)
-     (:temp lip interior-reg lr-offset)
+     (:temp lr non-descriptor-reg lr-offset)
 
      ;; These are needed so we can get at the register args.
      (:temp r0 descriptor-reg r0-offset)
@@ -136,8 +232,8 @@
      (:temp r3 descriptor-reg r3-offset))
 
   (prepare-for-tail-call-variable nargs args count dest temp r0 r1 r2 r3)
-  (loadw temp lexenv closure-fun-slot fun-pointer-lowtag)
-  (lisp-jump temp lip))
+  (loadw lr lexenv closure-fun-slot fun-pointer-lowtag)
+  (lisp-jump lr))
 
 #+sb-assembling
 (define-assembly-routine
@@ -155,7 +251,7 @@
      (:temp dest any-reg nl2-offset) ;; Not live concurrent with ARGS.
      (:temp count any-reg nl3-offset)
      (:temp temp descriptor-reg r9-offset)
-     (:temp lip interior-reg lr-offset)
+     (:temp lr non-descriptor-reg lr-offset)
 
      ;; These are needed so we can get at the register args.
      (:temp r0 descriptor-reg r0-offset)
@@ -166,21 +262,16 @@
   (prepare-for-tail-call-variable nargs args count dest temp r0 r1 r2 r3)
   (inst and tmp-tn lexenv lowtag-mask)
   (inst cmp tmp-tn fun-pointer-lowtag)
-  (inst b :eq call)
-  (inst b (make-fixup 'tail-call-symbol :assembly-routine))
-  call
-  (loadw temp lexenv closure-fun-slot fun-pointer-lowtag)
-  (lisp-jump temp lip))
+  (inst b :ne (make-fixup 'tail-call-symbol :assembly-routine))
+  (loadw lr lexenv closure-fun-slot fun-pointer-lowtag)
+  (lisp-jump lr))
 
 #+sb-assembling
 (define-assembly-routine (call-symbol
                           (:return-style :none)
                           (:export tail-call-symbol))
     ((:temp fun (any-reg descriptor-reg) lexenv-offset)
-     (:temp length (any-reg descriptor-reg) nl0-offset)
-     (:temp vector (any-reg descriptor-reg) r7-offset)
-     (:temp temp (any-reg descriptor-reg) nl1-offset)
-     (:temp temp2 (any-reg descriptor-reg) nl2-offset))
+     (:temp temp (any-reg descriptor-reg) nl1-offset))
   (inst str lr-tn (@ cfp-tn 8))
   TAIL-CALL-SYMBOL
   (inst and temp fun lowtag-mask)
@@ -191,41 +282,29 @@
   (inst cmp temp symbol-widetag)
   (inst b :ne not-callable)
 
-  (load-symbol-info-vector vector fun temp)
-
-  ;; info-vector-fdefn
-  (inst cmp vector null-tn)
-  (inst b :eq undefined)
-
-  (inst ldr temp (@ vector (- (* 2 n-word-bytes) other-pointer-lowtag)))
-  (inst and temp temp (fixnumize (1- (ash 1 (* info-number-bits 2)))))
-  (inst movz temp2 (fixnumize (1+ (ash +fdefn-info-num+ info-number-bits))))
-  (inst cmp temp temp2)
-  (inst b :lt undefined)
-
-  (inst ldr length (@ vector
-                      (- (ash vector-length-slot word-shift) other-pointer-lowtag)))
-
-  (inst lsl length length (- word-shift n-fixnum-tag-bits))
-  (inst sub length length (- other-pointer-lowtag 8))
-  (inst ldr fun (@ vector length))
+  (loadw temp fun symbol-fdefn-slot other-pointer-lowtag)
+  (inst cbz temp (make-fixup 'undefined-tramp :assembly-routine))
+  (move fun temp)
   (loadw lr-tn fun fdefn-raw-addr-slot other-pointer-lowtag)
   (inst add lr-tn lr-tn 4)
   (inst br lr-tn)
-  UNDEFINED
-  (inst b (make-fixup 'undefined-tramp :assembly-routine))
   NOT-CALLABLE
   (inst cmp fun null-tn) ;; NIL doesn't have SYMBOL-WIDETAG
-  (inst b :eq undefined)
-
-  (emit-error-break nil error-trap (error-number-or-lose 'sb-kernel::object-not-callable-error)
-                    (list fun)))
+  (inst b :eq (make-fixup 'undefined-tramp :assembly-routine))
+  (cerror-call nil 'sb-kernel::object-not-callable-error fun)
+  (inst and temp fun lowtag-mask)
+  (inst cmp temp fun-pointer-lowtag)
+  (inst b :ne TAIL-CALL-SYMBOL)
+  (loadw lr-tn fun closure-fun-slot fun-pointer-lowtag)
+  (inst add lr-tn lr-tn 4)
+  (inst br lr-tn))
 
 
 ;;;; Non-local exit noise.
 
 (define-assembly-routine (throw
-                          (:return-style :none))
+                          (:return-style :full-call-no-return)
+                          (:save-p :compute-only))
     ((:arg target descriptor-reg r0-offset)
      (:arg start any-reg r9-offset)
      (:arg count any-reg nargs-offset)
@@ -237,19 +316,7 @@
 
   LOOP
 
-  (let ((error (gen-label)))
-    (assemble (:elsewhere)
-      (emit-label error)
-
-      ;; Fake up a stack frame so that backtraces come out right.
-      (inst mov ocfp-tn cfp-tn)
-      (inst mov cfp-tn csp-tn)
-      (inst stp ocfp-tn lr-tn (@ csp-tn 16 :post-index))
-
-      (emit-error-break nil error-trap
-                        (error-number-or-lose 'unseen-throw-tag-error)
-                        (list target)))
-    (inst cbz catch error))
+  (inst cbz catch (generate-error-code nil 'unseen-throw-tag-error target))
 
   (loadw-pair tmp-tn catch-block-previous-catch-slot tag catch-block-tag-slot catch)
   (inst cmp tag target)
@@ -263,21 +330,21 @@
 (define-assembly-routine (unwind
                           (:translate %unwind)
                           (:policy :fast-safe)
-                          (:return-style :none))
+                          (:return-style :full-call-no-return)
+                          (:save-p :compute-only))
     ((:arg block (any-reg descriptor-reg) r0-offset)
      (:arg start (any-reg descriptor-reg) r9-offset)
      (:arg count (any-reg descriptor-reg) nargs-offset)
      (:temp ocfp any-reg ocfp-offset)
      (:temp cur-uwp any-reg nl2-offset)
-     (:temp lip interior-reg lr-offset)
+     (:temp lr non-descriptor-reg lr-offset)
      (:temp next-uwp any-reg nl3-offset)
      ;; for unbind-to-here
      (:temp where any-reg r1-offset)
      (:temp symbol descriptor-reg r2-offset)
      (:temp value descriptor-reg r3-offset))
   AGAIN
-  (let ((error (generate-error-code nil 'invalid-unwind-error)))
-    (inst cbz block error))
+  (inst cbz block (generate-error-code nil 'invalid-unwind-error))
   (load-tl-symbol-value cur-uwp *current-unwind-protect-block*)
   (loadw ocfp block unwind-block-uwp-slot)
   (inst cmp cur-uwp ocfp)
@@ -300,13 +367,16 @@
   (loadw next-uwp cur-uwp unwind-block-uwp-slot)
   (store-tl-symbol-value next-uwp *current-unwind-protect-block*)
 
-  (loadw-pair cfp-tn unwind-block-cfp-slot lip unwind-block-entry-pc-slot cur-uwp)
+  (loadw-pair cfp-tn unwind-block-cfp-slot lr unwind-block-entry-pc-slot cur-uwp)
   (loadw next-uwp cur-uwp unwind-block-current-catch-slot)
   (store-tl-symbol-value next-uwp *current-catch-block*)
-  (loadw-pair (make-random-tn :kind :normal :sc (sc-or-lose 'any-reg) :offset nfp-offset)
+  (loadw-pair (make-random-tn (sc-or-lose 'any-reg) nfp-offset)
               unwind-block-nfp-slot next-uwp unwind-block-nsp-slot cur-uwp)
   (inst mov-sp nsp-tn next-uwp)
-  (inst br lip)
+
+  ;; Since THROW is called with BLR for better backtraces use BLR here
+  ;; too, the branch predictor doesn't like unpaired BLR+RET.
+  (inst blr lr)
   RET
   (inst ldr count (@ csp-tn -8 :pre-index))
   (inst ldp block start (@ csp-tn -16 :pre-index))
@@ -315,15 +385,16 @@
   DO-EXIT
   (loadw where block unwind-block-bsp-slot)
   (unbind-to-here where symbol value tmp-tn)
-  (loadw-pair cfp-tn unwind-block-cfp-slot lip unwind-block-entry-pc-slot block)
+  (loadw-pair cfp-tn unwind-block-cfp-slot lr unwind-block-entry-pc-slot block)
   (loadw next-uwp block unwind-block-current-catch-slot)
   (store-tl-symbol-value next-uwp *current-catch-block*)
-  (loadw-pair (make-random-tn :kind :normal :sc (sc-or-lose 'any-reg) :offset nfp-offset)
+  (loadw-pair (make-random-tn (sc-or-lose 'any-reg) nfp-offset)
               unwind-block-nfp-slot next-uwp unwind-block-nsp-slot block)
   (inst mov-sp nsp-tn next-uwp)
 
-  (inst br lip))
+  (inst blr lr))
 
+#-sb-assembling
 (define-vop ()
   (:translate %continue-unwind)
   (:policy :fast-safe)

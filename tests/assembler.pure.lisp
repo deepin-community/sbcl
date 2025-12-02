@@ -75,7 +75,7 @@
   (flet ((test-movnti (dst src expect)
            (test-assemble `(movnti ,dst ,src) expect)))
     (test-movnti (ea 57 rdi-tn) eax "0FC34739         MOVNTI [RDI+57], EAX")
-    (test-movnti (ea rax-tn) r12-tn "4C0FC320         MOVNTI [RAX], R12")))
+    (test-movnti (ea rax-tn) r11-tn "4C0FC318         MOVNTI [RAX], R11")))
 
 (test-util:with-test (:name :assemble-crc32 :skipped-on (not :x86-64))
   ;; Destination size = :DWORD
@@ -250,26 +250,6 @@
     (assert (search "LOCK OR FS:[#x20100400], R8B"
                     (get-output-stream-string s)))))
 
-;;; This seems to be testing that we can find fdefns in static space
-;;; which I guess was broken.  immobile-code has no fdefns in static space.
-(test-util:with-test (:name :disassemble-static-fdefn
-            :skipped-on (or (not :x86-64) :immobile-code))
-  (assert (< (get-lisp-obj-address (sb-kernel::find-fdefn 'sb-impl::sub-gc))
-             sb-vm:static-space-end))
-  ;; Cause SUB-GC to become un-statically-linked
-  (progn (trace sb-impl::sub-gc) (untrace))
-  (let ((lines
-         (test-util:split-string (with-output-to-string (s)
-                         (disassemble 'sb-impl::gc :stream s))
-                       #\Newline))
-        (found))
-    ;; Check that find-called-object looked in static space for FDEFNs
-    (dolist (line lines)
-      (when (and (search "CALL" line)
-                 (search " SUB-GC" line))
-        (setq found t)))
-    (assert found)))
-
 (test-util:with-test (:name :cast-reg-to-size :skipped-on (not :x86-64))
   (test-assemble `(mov :byte ,rsi-tn ,rdi-tn)
                  "408AF7           MOV SIL, DIL")
@@ -297,3 +277,63 @@
                  "8AF5             MOV DH, CH")
   ;; can not use legacy high byte reg in a REX-prefixed instruction
   (check-does-not-assemble `(movsx (:byte :qword) ,rax-tn (,rbx-tn . :high-byte))))
+
+(defun try (inst)
+  (let ((segment (sb-assem:make-segment)))
+    (sb-assem:assemble (segment 'nil)
+        (apply #'sb-assem:inst* (car inst) (cdr inst)))
+    (let* ((buf (sb-assem:segment-buffer segment))
+           (string
+             (with-output-to-string (stream)
+               (with-pinned-objects (buf)
+                 (let ((sb-disassem:*disassem-location-column-width* 0))
+                   (sb-disassem:disassemble-memory
+                    (sap-int (vector-sap buf))
+                    (sb-assem::segment-current-posn segment)
+                    :stream stream)))))
+           (line (string-left-trim'(#\; #\ )
+                                  (subseq string (1+ (position #\newline string))
+                                          (1- (length string)))))) ; chop final newline
+      (declare (ignorable line))
+      ;;(print line)
+      )))
+
+#+x86-64
+(test-util:with-test (:name :muldiv)
+  ;; This just assserts that we can assemble. It doesn't check
+  ;; against the expected encoding or disassembly.
+  (dolist (size '(:byte :word :dword :qword nil))
+    (dolist (op '(mul div idiv))
+      (if size
+          (try `(,op ,size ,rbx-tn))
+          (try `(,op ,rbx-tn))))))
+
+#+x86-64
+(test-util:with-test (:name :imul)
+  (dolist (reg `(,r9-tn)) ;
+    ;; 1-operand form yielding a double-width result into rAX:rDX
+    (dolist (size '(:byte :word :dword :qword))
+      (try `(imul ,size ,reg))
+      (try `(imul ,size ,(ea reg)))
+      (try `(imul ,size ,(ea #x1000))))
+    (try `(imul ,reg)) ; default to :QWORD
+    ;; 2-operand form. There is no :BYTE size
+    (dolist (size '(:word :dword :qword))
+      (try `(imul ,size ,reg ,reg))
+      (try `(imul ,size ,reg ,(ea reg)))
+      (try `(imul ,size ,reg ,(ea #x1000))))
+    (try `(imul ,reg ,r10-tn)) ; default to :QWORD
+    ;; 3-operand form with 8-bit signed imm
+    (try `(imul :word ,rbx-tn ,(ea rdx-tn) -128))
+    (try `(imul :dword ,rbx-tn ,(ea rdx-tn) -128))
+    (try `(imul :qword ,rbx-tn ,(ea rdx-tn) -128))
+    ;; 3-operand form with 16-bit signed imm
+    (try `(imul :word ,rbx-tn ,(ea rdx-tn) -32768))
+    ;; 3-operand form with 32-bit signed imm
+    (try `(imul :dword ,rbx-tn ,(ea rdx-tn) #xbaba))
+    (try `(imul :qword ,rbx-tn ,(ea rdx-tn) #xbaba))))
+
+(test-util:with-test (:name :mxcsr-loadstore :skipped-on (not :x86-64))
+  ;; This just assserts that we can assemble
+  (try `(ldmxcsr ,(ea rax-tn)))
+  (try `(stmxcsr ,(ea rax-tn))))

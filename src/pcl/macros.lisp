@@ -26,8 +26,9 @@
 
 (in-package "SB-PCL")
 
-(defglobal *optimize-speed*
-  '(optimize (speed 3) (safety 0) (sb-ext:inhibit-warnings 3) (debug 0)))
+(eval-when (:compile-toplevel :load-toplevel)
+(defparameter *optimize-speed*
+  '(optimize (speed 3) (safety 0) (sb-ext:inhibit-warnings 3) (debug 0))))
 
 (declaim (declaration
           ;; These nonstandard declarations seem to be used privately
@@ -48,25 +49,6 @@
 ;;;; FIND-CLASS
 ;;;;
 ;;;; This is documented in the CLOS specification.
-
-(define-condition illegal-class-name-error (error)
-  ((name :initarg :name :reader illegal-class-name-error-name))
-  (:default-initargs :name (missing-arg))
-  (:report (lambda (condition stream)
-             (format stream "~@<~S is not a legal class name.~@:>"
-                     (illegal-class-name-error-name condition)))))
-
-(declaim (inline legal-class-name-p check-class-name))
-(defun legal-class-name-p (thing)
-  (symbolp thing))
-
-(defun check-class-name (thing &optional (allow-nil t))
-  ;; Apparently, FIND-CLASS and (SETF FIND-CLASS) accept any symbol,
-  ;; but DEFCLASS only accepts non-NIL symbols.
-  (if (or (not (legal-class-name-p thing))
-          (and (null thing) (not allow-nil)))
-      (error 'illegal-class-name-error :name thing)
-      thing))
 
 (define-condition class-not-found-error (sb-kernel::cell-error)
   ((sb-kernel::name :type (satisfies legal-class-name-p)))
@@ -142,14 +124,37 @@
          (aver (constantp slot-name env))
          `(funcall #',(funcall gf-nameize (constant-form-value slot-name env))
                    ,@newval ,object)))
-  (defmacro accessor-slot-boundp (object slot-name &environment env)
+  (defun accessor-slot-boundp (object slot-name)
+    (slot-boundp object slot-name))
+  (define-compiler-macro accessor-slot-boundp (object slot-name &environment env)
+    (aver (constantp slot-name env))
+    `(slot-boundp ,object ',(constant-form-value slot-name env)))
+  (defmacro %accessor-slot-boundp (object slot-name &environment env)
     (call-gf 'slot-boundp-name object slot-name env))
 
-  (defmacro accessor-slot-value (object slot-name &environment env)
+  (defun accessor-slot-makunbound (object slot-name)
+    (slot-makunbound object slot-name))
+  (define-compiler-macro accessor-slot-makunbound (object slot-name &environment env)
+    (aver (constantp slot-name env))
+    `(slot-makunbound ,object ',(constant-form-value slot-name env)))
+  (defmacro %accessor-slot-makunbound (object slot-name &environment env)
+    (call-gf 'slot-makunbound-name object slot-name env))
+
+  (defun accessor-slot-value (object slot-name)
+    (slot-value object slot-name))
+  (define-compiler-macro accessor-slot-value (object slot-name &environment env)
+    (aver (constantp slot-name env))
+    `(slot-value ,object ',(constant-form-value slot-name env)))
+  (defmacro %accessor-slot-value (object slot-name &environment env)
     `(truly-the (values t &optional)
                 ,(call-gf 'slot-reader-name object slot-name env)))
 
-  (defmacro accessor-set-slot-value (object slot-name new-value &environment env)
+  (defun accessor-set-slot-value (object slot-name new-value)
+    (setf (slot-value object slot-name) new-value))
+  (define-compiler-macro accessor-set-slot-value (object slot-name new-value &environment env)
+    (aver (constantp slot-name env))
+    `(set-slot-value ,object ',(constant-form-value slot-name env) ,new-value))
+  (defmacro %accessor-set-slot-value (object slot-name new-value &environment env)
     ;; Expand NEW-VALUE before deciding not to bind a temp var for OBJECT,
     ;; which should be eval'd first. We skip the binding if either new-value
     ;; is constant or a plain variable. This is still subtly wrong if NEW-VALUE
@@ -160,14 +165,7 @@
                                 (bind `((,object-var ,object))))
                            (setf object object-var)
                            bind)))
-          ;; What's going on by not assuming that #'(SETF x) returns NEW-VALUE?
-          ;; It seems wrong to return anything other than what the SETF fun
-          ;; yielded. By analogy, when the SETF macro changes (SETF (F x) v)
-          ;; into (funcall #'(setf F) ...), it does not insert any code to
-          ;; enforce V as the overall value. So we do we do that here???
-          (form `(let ((.new-value. ,new-value))
-                   ,(call-gf 'slot-writer-name object slot-name env '(.new-value.))
-                   .new-value.)))
+          (form (call-gf 'slot-writer-name object slot-name env (list new-value))))
       (if bind-object
           `(let ,bind-object ,form)
           form))))

@@ -1,0 +1,43 @@
+From: Sean Whitton <spwhitton@spwhitton.name>
+Date: Tue, 11 Nov 2025 15:25:59 +0000
+Subject: Skip chill.impure.lisp tests under autopkgtest
+
+---
+ tests/chill.impure.lisp | 11 ++++++++---
+ 1 file changed, 8 insertions(+), 3 deletions(-)
+
+diff --git a/tests/chill.impure.lisp b/tests/chill.impure.lisp
+index 44a8b4a..4d555f7 100644
+--- a/tests/chill.impure.lisp
++++ b/tests/chill.impure.lisp
+@@ -1,6 +1,10 @@
+ #+parallel-test-runner (setq run-tests::*allowed-inputs* :any)
+ 
+-(with-test (:name (:chill :loads-quietly))
++;; Skip these tests under autopkgtest because the package won't be built so
++;; stuff-groveled-from-headers.lisp won't be available.
++(when (posix-getenv "AUTOPKGTEST_TMP") (push :autopkgtest *features*))
++
++(with-test (:name (:chill :loads-quietly) :skipped-on :autopkgtest)
+   (handler-bind (#-sb-devel (warning (lambda (c) (error "Caught warning: ~A" c))))
+     (load "../src/cold/chill.lisp")))
+ 
+@@ -27,7 +31,8 @@
+          (when (eql o eof)
+            (return)))))))
+ 
+-(with-test (:name (:chill :read-xc-files))
++#-autopkgtest
++(with-test (:name (:chill :read-xc-files) :skipped-on :autopkgtest)
+   (flet ((try-replacing (stem this that)
+            (let ((position (search this stem)))
+              (when position
+@@ -44,7 +49,7 @@
+                            stem)))
+             (read-file name)))))))
+ 
+-(with-test (:name (:chill :read-target-2-files))
++(with-test (:name (:chill :read-target-2-files) :skipped-on :autopkgtest)
+   (let ((target-2-stems-lists (cdr *build-order-data*)))
+     (dolist (stems-list target-2-stems-lists)
+       (dolist (stem stems-list)

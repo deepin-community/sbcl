@@ -422,7 +422,10 @@
                   :skipped-on :ubsan)
   ;; 1-bit fixnum tags make array limits overflow the word length
   ;; when converted to bytes
-  (when (= sb-vm:n-fixnum-tag-bits 1)
+  (when (and (= sb-vm:n-fixnum-tag-bits 1)
+             (<= (- most-positive-fixnum
+                    array-total-size-limit)
+                 2))
     (multiple-value-bind (fun failure-p warnings)
         (checked-compile
          '(lambda ()
@@ -523,9 +526,7 @@
 
 (with-test (:name (make-array :transform :fill-pointer nil))
   (flet ((test (form)
-           (let ((fun (checked-compile `(lambda () ,form))))
-             (assert (not (ctu:find-named-callees
-                           fun :name 'sb-kernel:%make-array))))))
+           (assert (not (ctu:ir1-named-calls `(lambda () ,form))))))
     (test '(make-array 3      :fill-pointer nil))
     (test '(make-array 3      :fill-pointer nil))
     (test '(make-array 3      :fill-pointer t))
@@ -534,9 +535,9 @@
     (test '(make-array '(3 3) :fill-pointer nil))))
 
 (with-test (:name (make-array :transform :adjustable :fill-pointer))
-  (let ((fun (checked-compile '(lambda (fp)
-                                (make-array 3 :adjustable t :fill-pointer fp)))))
-    (assert (not (ctu:find-named-callees fun :name 'sb-kernel:%make-array)))
+  (multiple-value-bind (calls fun)
+      (ctu:ir1-named-calls '(lambda (fp) (make-array 3 :adjustable t :fill-pointer fp)))
+    (assert (not (member 'sb-kernel:%make-array calls)))
     (assert (= (length (funcall fun t)) 3))
     (assert (array-has-fill-pointer-p (funcall fun t)))
     (assert (= (length (funcall fun 2)) 2))
@@ -548,18 +549,20 @@
 
 (with-test (:name (make-array :transform :non-constant-fill-pointer))
   ;; Known adjustable with any fill-pointer can be inlined
-  (let ((fun (checked-compile '(lambda (n fillp)
+  (multiple-value-bind (calls fun)
+      (ctu:ir1-named-calls '(lambda (n fillp)
                                  (make-array (the (mod 20) n)
-                                             :adjustable t :fill-pointer fillp)))))
-    (assert (not (ctu:find-named-callees fun :name 'sb-kernel:%make-array)))
+                                             :adjustable t :fill-pointer fillp)))
+    (assert (not (member 'sb-kernel:%make-array calls)))
     (let ((a (funcall fun 10 3)))
       (assert (= (length a) 3))
       (assert (= (array-dimension a 0) 10))))
   ;; Non-adjustable w/ non-constant numeric fill-pointer can be inlined
-  (let ((fun (checked-compile '(lambda (n)
+  (multiple-value-bind (calls fun)
+      (ctu:ir1-named-calls '(lambda (n)
                                  (make-array (the (mod 20) n)
-                                             :fill-pointer (floor n 2))))))
-    (assert (not (ctu:find-named-callees fun :name 'sb-kernel:%make-array)))
+                                             :fill-pointer (floor n 2))))
+    (assert (not (member 'sb-kernel:%make-array calls)))
     (let ((a (funcall fun 10)))
       (assert (= (length a) 5))
       (assert (= (array-dimension a 0) 10)))))
@@ -670,3 +673,359 @@
       (assert (eq (aref b 3) 'd))
       (assert (eq (aref b 4) 'e))
       (assert (eq (aref b 5) 'e)))))
+
+(with-test (:name :test-array-dimensions-other-pointer-check)
+  (checked-compile-and-assert
+      ()
+      `(lambda (a)
+         (typep a '(simple-array t (2 1))))
+    ((1) nil)
+    ((#2A((1) (1))) t)))
+
+(with-test (:name :typep-constant-%array-data-folding)
+  (checked-compile-and-assert
+      ()
+      `(lambda ()
+         (typep "abcd" '(simple-array t 2)))
+    (() nil)))
+
+(with-test (:name :vector-push-extend-specialized)
+  (let ((extend (checked-compile `(lambda (e a)
+                                    (vector-push-extend e a)
+                                    a))))
+    (loop for saetp across sb-vm:*specialized-array-element-type-properties*
+          for type = (sb-vm:saetp-specifier saetp)
+          when type
+          do
+          (let* ((value (sb-vm:saetp-initial-element-default saetp))
+                 (value (if (characterp value)
+                            (code-char (1+ (char-code value)))
+                            (1+ value))))
+            (assert (eql (aref (funcall extend value (make-array 1 :element-type type
+                                                                   :adjustable t
+                                                                   :fill-pointer t))
+                               1)
+                         value))))))
+
+(with-test (:name :intersection-type-complexp)
+  (assert (equal (caddr (sb-kernel:%simple-fun-type
+                         (checked-compile `(lambda (x)
+                                             (declare ((and (simple-array * (10))
+                                                            (not simple-vector))
+                                                       x))
+                                             (length x)))))
+                 `(values (integer 10 10) &optional))))
+
+(with-test (:name :vector-length-intersection-types)
+  (assert (equal (caddr (sb-kernel:%simple-fun-type
+                         (checked-compile `(lambda (x)
+                                             (declare ((and (or (simple-array * (11))
+                                                                (simple-array * (12)))
+                                                            (not simple-vector))
+                                                       x))
+                                             (length x)))))
+                 `(values (integer 11 12) &optional))))
+
+(with-test (:name :aref-dimension-checking)
+  (checked-compile-and-assert
+      (:optimize :safe)
+      `(lambda (x)
+         (aref x 0))
+    ((#2A((1 2) (3 4))) (condition 'type-error))))
+
+(with-test (:name :aref-constant-type-derive)
+  (flet ((test (form type)
+           (assert
+            (type-specifiers-equal
+             (caddr
+              (sb-kernel:%simple-fun-type
+               (checked-compile
+                `(lambda (a)
+                   ,form))))
+             `(values ,type &optional)))))
+    (test `(aref #(1 2 3) a)
+          '(integer 1 3))
+    (test `(svref #(1 2 3.0) a)
+          '(or (integer 1 2) single-float))
+    (test `(aref ,(make-array 3 :fill-pointer 2 :initial-contents #(1 2 3.0)) a)
+          '(or (integer 1 2) single-float))))
+
+(with-test (:name :make-array-initial-contents-zero-dimensions)
+  (checked-compile-and-assert
+      (:optimize :safe)
+      `(lambda (d)
+         (make-array d :initial-contents 1))
+    ((nil) #0a1 :test #'equalp)))
+
+(with-test (:name :negative-fill-pointer)
+  (checked-compile-and-assert
+   (:optimize :safe)
+   `(lambda (a f)
+      (setf (fill-pointer a) f))
+   (((make-array 0 :fill-pointer 0) -1) (condition 'type-error))))
+
+(with-test (:name :large-index
+            :skipped-on (not :64-bit))
+  (checked-compile
+   `(lambda ()
+      (make-array
+       (1+ (ash 1 32))
+       :element-type 'base-char
+       :initial-element #\a)))
+  (checked-compile
+   `(lambda (x a)
+      (setf (sbit x (ash 1 34)) a)))
+  (checked-compile
+   `(lambda (fn)
+      (let ((s (make-string 536870910)))
+        (declare (dynamic-extent s))
+        (funcall fn s))))
+  (checked-compile
+   `(lambda (fn)
+      (let ((s (make-string 536870910 :element-type 'base-char)))
+        (declare (dynamic-extent s))
+        (funcall fn s)))))
+
+(with-test (:name :hairy-aref-check-bounds)
+  (assert (= (count 'sb-kernel:%check-bound
+                    (ctu:ir1-named-calls
+                     `(lambda (x)
+                        (declare (vector x))
+                        (aref x 0))
+                     nil))
+             0)))
+
+(with-test (:name :setf-aref-simple-vector-from-new-value)
+  (assert (not
+           (ctu:ir1-named-calls
+            `(lambda (x)
+               (declare ((simple-array * (*)) x))
+               (setf (aref x 0) 'm))))))
+
+(with-test (:name :typep-displaced)
+  (checked-compile-and-assert
+      ()
+      `(lambda (a)
+         (typep a '(vector double-float)))
+    (((make-array 1 :element-type 'double-float :displaced-to (make-array '(1 1) :element-type 'double-float))) t))
+  (checked-compile-and-assert
+      ()
+      `(lambda (a)
+         (typep a '(vector t 2)))
+    (((make-array 2 :displaced-to (make-array '(2 1)))) t)))
+
+(defun aindex (i array) (aref array i))
+(defun 2d-aindex (i array) (aref array i i))
+(defun seqindex (i seq) (elt seq i))
+
+(with-test (:name :array-index-error-wording)
+  ;; message contains a "should be ... below"
+  (macrolet ((try (form)
+               `(handler-case ,form
+                  (:no-error (x) (error "Got ~S instead an error" x))
+                  (condition (c)
+                    (let ((str (princ-to-string c)))
+                      (assert (search "Invalid index" str))
+                      (assert (search "should be" str)))))))
+    (try (aindex 5 #(1)))
+    (try (2d-aindex 5 (make-array '(10 1))))
+    (try (seqindex 5 #(1)))
+    (try (seqindex 5 (make-array 9 :fill-pointer 1))))
+  ;; message does not contains a "should be"
+  (macrolet ((try (form)
+               `(handler-case ,form
+                  (:no-error (x) (error "Got ~S instead of an error" x))
+                  (condition (c)
+                    (let ((str (princ-to-string c)))
+                      (assert (search "Invalid index" str))
+                      (assert (not (search "should be" str)))
+                      (assert (not (search "below 0" str))))))))
+    (try (aindex 5 #()))
+    (try (2d-aindex 5 (make-array '(10 0))))
+    (try (seqindex 5 #()))
+    (try (seqindex 5 (make-array 9 :fill-pointer 0)))))
+
+(with-test (:name :fill-pointer-derive-type)
+  (assert-type
+   (lambda (n)
+     (make-array n :element-type 'character :fill-pointer 0))
+   (and (vector character) (not simple-array)))
+  (assert-type
+   (lambda (n f)
+     (make-array n :element-type 'character :fill-pointer f))
+   (array character)))
+
+(with-test (:name :backquote-transform)
+  (assert (nth-value 2
+                     (checked-compile
+                      `(lambda (a)
+                         (make-array `(,a (+ 1 2))))
+                      :allow-warnings t))))
+
+(with-test (:name :data-vector-ref-with-offset-unsigned)
+  (checked-compile
+   `(lambda (b)
+      (declare (type (integer * 2) b))
+      (aref #*11101100 (the (satisfies eval) b))))
+  (checked-compile
+   `(lambda (v n)
+      (declare ((simple-vector 8) v)
+               ((integer -4 -1) n))
+      (aref v (+ n 4)))))
+
+(with-test (:name :make-array-non-simple-type)
+  (assert-type
+   (lambda (x e)
+     (make-array 10
+                 :element-type e
+                 :fill-pointer (1- x)))
+   (and vector (not simple-array)))
+  (assert-type
+   (lambda (a)
+     (make-array (array-total-size a)
+                 :displaced-to a))
+   (and (vector t) (not simple-array))))
+
+(with-test (:name :storage-vector-type)
+  (assert-type
+   (lambda (x)
+     (sb-ext:array-storage-vector (the string x)))
+   simple-string))
+
+(with-test (:name :make-array-element-type)
+  (assert-type
+   (lambda (a)
+     (declare (string a))
+     (make-array 3 :element-type (array-element-type a)))
+   (simple-string 3))
+  (assert-type
+   (lambda (a)
+     (make-array 2 :element-type (the (member character base-char) a)))
+   (simple-string 2))
+  (assert-type
+   (lambda (x)
+     (make-array '(1 1)
+                 :element-type 'single-float
+                 :initial-contents x))
+   (simple-array single-float (1 1)))
+  (assert-type
+   (lambda (n)
+    (make-array (list n n)
+                :element-type 'single-float
+                :initial-contents '((1.0))))
+   (simple-array single-float (* *))))
+
+(with-test (:name :multidimensional-access-no-bounds-checks)
+  (assert (= (count 'sb-kernel:%check-bound
+                    (ctu:ir1-named-calls
+                     '(lambda (array i j)
+                       (array-row-major-index array i j))
+                     nil))
+             2))
+  (assert (= (count 'sb-kernel:%check-bound
+                    (ctu:ir1-named-calls
+                     '(lambda (array i j)
+                       (declare (optimize (sb-c:insert-array-bounds-checks 0)))
+                       (array-row-major-index array i j))
+                     nil))
+             0))
+  (assert (= (count 'sb-kernel:%check-bound
+                    (ctu:ir1-named-calls
+                     '(lambda (v)
+                       (declare ((simple-array t (4 4)) v))
+                       (aref v 3 2))
+                     nil))
+             0)))
+
+(with-test (:name :make-simple-array-not-displaced)
+  (assert (not (array-displacement (funcall (checked-compile `(lambda (d) (make-array d))) '(1 2))))))
+
+(with-test (:name :data-vector-pop-fill-pointer-check)
+  (checked-compile-and-assert
+   (:optimize :safe)
+   `(lambda (array)
+      (declare ((array t) array))
+      (vector-pop array))
+   (((make-array 5)) (condition 'type-error))
+   (((make-array 5 :adjustable t)) (condition 'type-error))
+   (((make-array '(5 5))) (condition 'type-error))
+   (((make-array '(5 5) :adjustable t)) (condition 'type-error))
+   (((make-array 5 :fill-pointer t :initial-element 3)) 3)))
+
+(with-test (:name :make-array+array-dimensions)
+  (assert-type
+   (lambda (x)
+     (declare ((simple-array t (1 2)) x))
+     (make-array (array-dimensions x)))
+   (simple-array t (1 2)))
+  (assert-type
+   (lambda (x)
+     (declare ((or (array single-float (1 2))
+                   (array double-float (1 2))) x))
+     (make-array (array-dimensions x) :element-type 'fixnum))
+   (simple-array fixnum (* *)))
+  (assert-type
+   (lambda (x e)
+     (declare ((array * (*)) x))
+     (make-array (array-dimensions x) :element-type e))
+   (simple-array * (*)))
+  (assert-type
+   (lambda (n e)
+     (make-array (list n) :element-type e))
+   (simple-array * (*)))
+  (assert-type
+   (lambda (n e)
+     (make-array (cons n nil) :element-type e))
+   (simple-array * (*)))
+  (assert-type
+   (lambda (e)
+     (make-array (list* 10 nil) :element-type e))
+   (simple-array * (10))))
+
+(with-test (:name :make-array-list-adjustable)
+  (assert-type
+   (lambda (a b)
+     (make-array (list a b) :adjustable t))
+   (and (array t (* *)) (not simple-array)))
+  (assert-type
+   (lambda (a b)
+     (make-array (list a b) :adjustable nil))
+   (simple-array t (* *)))
+  (checked-compile-and-assert
+      ()
+      `(lambda (a b s)
+         (make-array (list a b) :initial-contents s :adjustable t))
+    ((2 2 '((1 2) (3 4))) #2a((1 2) (3 4)) :test #'equalp))
+  ;; (assert-type
+  ;;  (lambda (a b n)
+  ;;    (make-array (list a b) :adjustable n))
+  ;;  (array t (* *)))
+  )
+
+(with-test (:name :make-array-list-derive-type)
+  (assert-type
+   (lambda (a b p)
+     (make-array (list a b) :displaced-to p))
+   (array t (* *)))
+  (assert-type
+   (lambda (a b p)
+     (make-array (list* a b nil) :displaced-to p))
+   (array t (* *))))
+
+(with-test (:name :make-array-member-element-type)
+  (assert-type
+   (lambda (d)
+     (make-array 1 :element-type (if d
+                                     'double-float
+                                     'single-float)))
+   (or (simple-array double-float (1)) (simple-array single-float (1))))
+  (assert-type
+   (lambda (a n)
+     (declare ((or (array single-float) (array double-float)) a))
+     (setf (aref a 0) n))
+   float)
+  (assert-type
+   (lambda (d)
+     (make-array 2 :element-type (if d 'a 'b)))
+   (simple-array * (2))
+   :allow-style-warnings t))

@@ -17,7 +17,7 @@
 
 ;;; The debugger doesn't have any native knowledge of the interpreter
 (when (eq sb-ext:*evaluator-mode* :interpret)
-  (sb-ext:exit :code 104))
+  (invoke-restart 'run-tests::skip-file))
 
 #+(or x86 x86-64)
 (with-test (:name :legal-bpt-lra-object)
@@ -67,9 +67,41 @@
             ,@body)
        (ignore-errors (untrace ,name)))))
 
+(defun call-collecting-traces (fn trace-arguments)
+  (let ((traces nil))
+    (flet ((collect (depth what when frame values)
+             (declare (ignore frame))
+             (flet ((ensure-readable (x)
+                      (typecase x
+                        (function (sb-impl::%fun-name x))
+                        (sb-debug::unprintable-object
+                         (sb-debug::unprintable-object-string x))
+                        (t x))))
+               (push (list* depth
+                            (ensure-readable what)
+                            when
+                            (mapcar #'ensure-readable values))
+                     traces))))
+      (unwind-protect
+           (let ((sb-debug:*trace-report-default* #'collect))
+             (eval `(trace ,@trace-arguments))
+             (funcall fn))
+        (ignore-errors (untrace))
+        (assert (null (trace)))))
+    (nreverse traces)))
+
+(defmacro collecting-traces ((&rest trace-arguments) &body body)
+  `(call-collecting-traces (lambda () ,@body) ',trace-arguments))
+
 (defun trace-this (&optional arg)
   (declare (ignore arg))
   'ok)
+
+(defun mv-trace-this (&optional arg)
+  (case arg
+    (2 (values 'ok "hi"))
+    (3 (values 'ok "hi" :foo))
+    (4 (values 'ok "hi" :foo :bar))))
 
 (defun trace-fact (n)
   (if (zerop n)
@@ -105,23 +137,58 @@
                                     (lambda (f &rest stuff)
                                       (declare (ignore f stuff))))))
 
+(defparameter *breakpoint-tracing-expectations*
+  '(:fails-on :arm
+    :broken-on (or :freebsd)))
+
 ;;; bug 379
 (with-test (:name (trace :encapsulate nil)
-            :fails-on (or (and :ppc (not :linux)) :sparc :arm64)
-            :broken-on (or :freebsd))
+                  . #.*breakpoint-tracing-expectations*)
   (let ((output (with-traced-function (trace-this :encapsulate nil)
                   (assert (eq 'ok (trace-this))))))
     (assert (search "TRACE-THIS" output))
     (assert (search "returned OK" output))))
 
+(with-test (:name :breakpoint-trace-multival . #.*breakpoint-tracing-expectations*)
+  (let ((output (with-traced-function (mv-trace-this :encapsulate nil)
+                  (assert (equal (multiple-value-list (mv-trace-this 2))
+                                 '(ok "hi"))))))
+    (assert (search "MV-TRACE-THIS" output))
+    (assert (search "returned OK" output)))
+  (let ((output (with-traced-function (mv-trace-this :encapsulate nil)
+                  (assert (equal (multiple-value-list (mv-trace-this 3))
+                                 '(ok "hi" :foo))))))
+    (assert (search "MV-TRACE-THIS" output))
+    (assert (search "returned OK" output)))
+  (let ((output (with-traced-function (mv-trace-this :encapsulate nil)
+                  (assert (equal (multiple-value-list (mv-trace-this 4))
+                                 '(ok "hi" :foo :bar))))))
+    (assert (search "MV-TRACE-THIS" output))
+    (assert (search "returned OK" output))))
+
 (with-test (:name (trace :encapsulate nil :recursive)
-            :fails-on (or (and :ppc (not :linux)) :sparc :arm64)
-            :broken-on (or :freebsd))
+                  . #.*breakpoint-tracing-expectations*)
   (let ((output (with-traced-function (trace-fact :encapsulate nil)
                   (assert (= 120 (trace-fact 5))))))
     (assert (search "TRACE-FACT" output))
     (assert (search "returned 1" output))
     (assert (search "returned 120" output))))
+
+(with-test (:name (trace :encapsulate nil :recursive :threads)
+            :broken-on (:not :arm64))
+  (with-traced-function (trace-fact :encapsulate nil)
+    (let ((threads '()))
+      (dotimes (repeat 4)
+        (push (sb-thread:make-thread
+               (lambda ()
+                 (let ((output
+                         (with-output-to-string (*trace-output*)
+                           (assert (= 120 (trace-fact 5))))))
+                   (assert (search "TRACE-FACT" output))
+                   (assert (search "returned 1" output))
+                   (assert (search "returned 120" output)) )))
+              threads))
+      (mapc #'sb-thread:join-thread threads))))
 
 (defun trace-and-fmakunbound-this (x)
   x)
@@ -147,6 +214,482 @@
     (assert (string= output (format nil "2~@
                                          1~@
                                          0~%")))))
+
+(defvar *collected-traces*)
+(defun custom-trace-report (depth what when frame values)
+  (push (list* depth what when (sb-di:frame-p frame) values)
+        *collected-traces*))
+
+(with-test (:name (trace :custom-report))
+  (let ((*collected-traces* nil))
+    (let ((output (with-traced-function (trace-fact :report custom-trace-report)
+                    (trace-fact 2))))
+      (assert (zerop (length output)))
+      (assert (equalp (reverse *collected-traces*)
+                      '((0 trace-fact :enter t 2)
+                        (1 trace-fact :enter t 1)
+                        (2 trace-fact :enter t 0)
+                        (2 trace-fact :exit  t 1)
+                        (1 trace-fact :exit  t 1)
+                        (0 trace-fact :exit  t 2)))))))
+
+(with-test (:name (trace :anonymous) . #.*breakpoint-tracing-expectations*)
+  (assert (equalp (call-collecting-traces
+                   (lambda ()
+                     (trace-fact 1))
+                   `(:function ,#'trace-fact :condition (plusp (sb-debug:arg 0))))
+                  '((0 trace-fact :enter 1)
+                    (0 trace-fact :exit 1)))))
+
+(defgeneric trace-gf (x)
+  (:method         ((x float))      (+ x (call-next-method)))
+  (:method :before ((x float))      'bf)
+  (:method :around ((x float))      (call-next-method))
+  (:method :after  ((x float))      'af)
+  (:method         ((x number))     (+ x (call-next-method)))
+  (:method :before ((x number))     'bn)
+  (:method :around ((x number))     (call-next-method))
+  (:method :after  ((x number))     'an)
+  (:method         ((x (eql 21.0))) (call-next-method))
+  (:method         (x)              0))
+
+(with-test (:name (trace :all-methods))
+  (assert (equal (collecting-traces (trace-gf :methods t)
+                   (trace-gf 21.0))
+                 '((0 trace-gf :enter 21.0)
+                   (1 (method trace-gf :around (float))  :enter 21.0)
+                   (2 (method trace-gf :around (number)) :enter 21.0)
+                   (3 (sb-pcl::combined-method trace-gf) :enter 21.0)
+                   (4 (method trace-gf :before (float))  :enter 21.0)
+                   (4 (method trace-gf :before (float))  :exit  bf)
+                   (4 (method trace-gf :before (number)) :enter 21.0)
+                   (4 (method trace-gf :before (number)) :exit  bn)
+                   (4 (method trace-gf ((eql 21.0))) :enter 21.0)
+                   (5 (method trace-gf (float))      :enter 21.0)
+                   (6 (method trace-gf (number))     :enter 21.0)
+                   (7 (method trace-gf (t))          :enter 21.0)
+                   (7 (method trace-gf (t))          :exit 0)
+                   (6 (method trace-gf (number))     :exit 21.0)
+                   (5 (method trace-gf (float))      :exit 42.0)
+                   (4 (method trace-gf ((eql 21.0))) :exit 42.0)
+                   (4 (method trace-gf :after (number))  :enter 21.0)
+                   (4 (method trace-gf :after (number))  :exit  an)
+                   (4 (method trace-gf :after (float))   :enter 21.0)
+                   (4 (method trace-gf :after (float))   :exit  af)
+                   (3 (sb-pcl::combined-method trace-gf) :exit  42.0)
+                   (2 (method trace-gf :around (number)) :exit  42.0)
+                   (1 (method trace-gf :around (float))  :exit  42.0)
+                   (0 trace-gf :exit 42.0)))))
+
+(with-test (:name (trace :methods))
+  (assert (equal (collecting-traces ((method trace-gf :after (float))
+                                     (method trace-gf :around (number))
+                                     (method trace-gf (t)))
+                   (trace-gf 42.0))
+                 '((0 (method trace-gf :around (number)) :enter 42.0)
+                   (1 (method trace-gf (t)) :enter 42.0)
+                   (1 (method trace-gf (t)) :exit 0)
+                   (1 (method trace-gf :after (float)) :enter 42.0)
+                   (1 (method trace-gf :after (float)) :exit af)
+                   (0 (method trace-gf :around (number)) :exit 84.0)))))
+
+(with-test (:name (trace :methods :encapsulate nil)
+                  . #.*breakpoint-tracing-expectations*)
+  (assert (equal (collecting-traces (:encapsulate nil
+                                     (method trace-gf :after (float))
+                                     (method trace-gf :around (number))
+                                     (method trace-gf (t)))
+                   (trace-gf 42.0))
+                 '((0 (sb-pcl::fast-method trace-gf :around (number)) :enter 42.0)
+                   (1 (sb-pcl::fast-method trace-gf (t)) :enter "unused argument")
+                   (1 (sb-pcl::fast-method trace-gf (t)) :exit 0)
+                   (1 (sb-pcl::fast-method trace-gf :after (float)) :enter "unused argument")
+                   (1 (sb-pcl::fast-method trace-gf :after (float)) :exit af)
+                   (0 (sb-pcl::fast-method trace-gf :around (number)) :exit 84.0)))))
+
+(defparameter *expected-trace-gf-number+t-trace*
+  '((0 (method trace-gf :around (number)) :enter 42.0)
+    (1 (method trace-gf (t)) :enter 42.0)
+    (1 (method trace-gf (t)) :exit 0)
+    (0 (method trace-gf :around (number)) :exit 84.0)))
+
+(with-test (:name (trace :methods :untrace-some))
+  (assert (equal (collecting-traces ((method trace-gf :after (float))
+                                     (method trace-gf :around (number))
+                                     (method trace-gf (t)))
+                   (untrace (method trace-gf :after (float)))
+                   (trace-gf 42.0))
+                 *expected-trace-gf-number+t-trace*)))
+
+(with-test (:name (trace :methods :untrace-many))
+  (assert (equal (collecting-traces ((method trace-gf :around (number))
+                                     (method trace-gf (t))
+                                     trace-gf :methods t)
+                   (untrace trace-gf)
+                   (trace-gf 42.0))
+                 *expected-trace-gf-number+t-trace*)))
+
+(with-test (:name (trace :methods :trace-more))
+  (assert (equal (collecting-traces ((method trace-gf (t)))
+                   (eval '(trace (method trace-gf :around (number))))
+                   (trace-gf 42.0))
+                 *expected-trace-gf-number+t-trace*)))
+
+(defgeneric (setf trace-gf) (value)
+  (:method ((x float)) (call-next-method))
+  (:method :before ((x number)) 'before)
+  (:method ((x number)) x))
+
+(with-test (:name (trace :setf-methods))
+  (assert (equal (collecting-traces ((method (setf trace-gf) (float))
+                                     (method (setf trace-gf) (number))
+                                     (method (setf trace-gf) :before (number)))
+                                    (setf (trace-gf) 42.0))
+                 '((0 (method (setf trace-gf) :before (number)) :enter 42.0)
+                   (0 (method (setf trace-gf) :before (number)) :exit before)
+                   (0 (method (setf trace-gf) (float)) :enter 42.0)
+                   (1 (method (setf trace-gf) (number)) :enter 42.0)
+                   (1 (method (setf trace-gf) (number)) :exit 42.0)
+                   (0 (method (setf trace-gf) (float)) :exit 42.0)))))
+
+(defun global-fact (x)
+  (declare (optimize (debug 3))) ; suppress inlining
+  (labels ((fact (x)
+             (flet ((multiply (x y)
+                      (* x y)))
+               (if (zerop x)
+                   1
+                   (multiply x (fact (1- x)))))))
+    (fact x)))
+
+(with-test (:name (trace :labels) . #.*breakpoint-tracing-expectations*)
+  (assert (equal (collecting-traces ((labels fact :in global-fact)
+                                     (flet multiply :in global-fact))
+                   (global-fact 1))
+                 '((0 (labels fact :in global-fact) :enter 1)
+                   (1 (labels fact :in global-fact) :enter 0)
+                   (1 (labels fact :in global-fact) :exit 1)
+                   (1 (flet multiply :in global-fact) :enter 1 1)
+                   (1 (flet multiply :in global-fact) :exit 1)
+                   (0 (labels fact :in global-fact) :exit 1)))))
+
+(defgeneric gfact (x)
+  (:method ((x number))
+    (declare (optimize (debug 3))) ; suppress inlining
+    (flet ((fact (x) (global-fact x)))
+      (fact x))))
+
+(with-test (:name (trace :labels :within-method)
+                  . #.*breakpoint-tracing-expectations*)
+  (assert (equal (collecting-traces ((flet fact :in (method gfact (number))))
+                   (gfact 3))
+                 '((0 (flet fact :in (method gfact (number))) :enter 3)
+                   (0 (flet fact :in (method gfact (number))) :exit 6)))))
+
+(with-test (:name (trace :labels :within-untraced-method)
+                  . #.*breakpoint-tracing-expectations*)
+  (assert (equal (collecting-traces ((method gfact (number))
+                                     (flet fact :in (method gfact (number))))
+                   (untrace (method gfact (number)))
+                   (gfact 3))
+                 '((0 (flet fact :in (method gfact (number))) :enter 3)
+                   (0 (flet fact :in (method gfact (number))) :exit 6)))))
+
+(defun trace-foo ()
+  (declare (optimize (debug 3)))
+  (flet ((body () 'original-foo))
+    (body)))
+
+(defun call-with-trace-foo-redefined (fn)
+  (let ((original (fdefinition 'trace-foo)))
+    ;; the local function will be named (FLET BODY) instead of (FLET
+    ;; BODY :IN TRACE-FOO) unless we use EVAL here.
+    (eval '(defun trace-foo ()
+            (declare (optimize (debug 3)))
+            (flet ((body () 'redefined-foo))
+              (body))))
+    (unwind-protect
+         (funcall fn)
+      (setf (fdefinition 'trace-foo) original))))
+
+(with-test (:name (trace :labels :redefined)
+                  . #.*breakpoint-tracing-expectations*)
+  (assert (equal (collecting-traces ((flet body :in trace-foo))
+                   (trace-foo)
+                   (call-with-trace-foo-redefined 'trace-foo))
+                 '((0 (flet body :in trace-foo) :enter)
+                   (0 (flet body :in trace-foo) :exit original-foo)
+                   (0 (flet body :in trace-foo) :enter)
+                   (0 (flet body :in trace-foo) :exit redefined-foo)))))
+
+(defmethod trace-foo-gf ()
+  (declare (optimize (debug 3)))
+  (flet ((body () 'original-foo))
+    (body)))
+
+(defun call-with-trace-foo-gf-redefined (fn)
+  ;; using ADD-METHOD and REMOVE-METHOD yields outdated DEBUG-FUN
+  ;; info, so work around that using EVAL.
+  (eval '(defmethod trace-foo-gf ()
+          (declare (optimize (debug 3)))
+          (flet ((body () 'redefined-foo))
+            (body))))
+  (unwind-protect
+       (funcall fn)
+    (eval '(defmethod trace-foo-gf ()
+            (declare (optimize (debug 3)))
+            (flet ((body () 'original-foo))
+              (body))))))
+
+(with-test (:name (trace :labels :redefined-method)
+                  . #.*breakpoint-tracing-expectations*)
+  (assert (equal (collecting-traces ((flet body :in (method trace-foo-gf ())))
+                   (trace-foo-gf)
+                   (call-with-trace-foo-gf-redefined 'trace-foo-gf))
+                 '((0 (flet body :in (method trace-foo-gf ())) :enter)
+                   (0 (flet body :in (method trace-foo-gf ())) :exit original-foo)
+                   (0 (flet body :in (method trace-foo-gf ())) :enter)
+                   (0 (flet body :in (method trace-foo-gf ())) :exit redefined-foo)))))
+
+(defun fn-with-cmac (x) x)
+
+(define-compiler-macro fn-with-cmac (x)
+  (declare (ignore x) (optimize (debug 3))) ; suppress flet inlining
+  (flet ((body () 42))
+    (body)))
+
+(with-test (:name (trace :compiler-macro)
+                  . #.*breakpoint-tracing-expectations*)
+  (assert (equal (collecting-traces ((compiler-macro fn-with-cmac))
+                   (compile nil '(lambda () (fn-with-cmac 0))))
+                 '((0 (compiler-macro fn-with-cmac) :enter (fn-with-cmac 0) "unused argument")
+                   (0 (compiler-macro fn-with-cmac) :exit 42)))))
+
+(with-test (:name (trace :flet :within-compiler-macro)
+                  . #.*breakpoint-tracing-expectations*)
+  (assert (equal (collecting-traces ((flet body :in (compiler-macro fn-with-cmac)))
+                   (compile nil '(lambda () (fn-with-cmac 0))))
+                 '((0 (flet body :in (compiler-macro fn-with-cmac)) :enter)
+                   (0 (flet body :in (compiler-macro fn-with-cmac)) :exit 42)))))
+
+(defun fn-known-values-return (x)
+  (flet ((g (x)
+           x))
+    (g x)
+    (g x)
+    (g x)))
+
+(with-test (:name (trace :flet :known-values-return)
+                  . #.*breakpoint-tracing-expectations*)
+  (assert (equal (collecting-traces ((flet g :in fn-known-values-return))
+                   (fn-known-values-return 9))
+                 '((0 (flet g :in fn-known-values-return) :enter 9)
+                   (0 (flet g :in fn-known-values-return) :exit 9)
+                   (0 (flet g :in fn-known-values-return) :enter 9)
+                   (0 (flet g :in fn-known-values-return) :exit 9)
+                   (0 (flet g :in fn-known-values-return) :enter 9)
+                   (0 (flet g :in fn-known-values-return) :exit 9)))))
+
+(defun fn-known-values-return-multiple (x)
+  (flet ((g (x)
+           (values x x x x x x x)))
+    (g x)
+    (g x)
+    (g x)))
+
+(with-test (:name (trace :flet :known-values-return-multiple)
+                  . #.*breakpoint-tracing-expectations*)
+  (assert
+   (equal
+    (collecting-traces ((flet g :in fn-known-values-return-multiple))
+      (fn-known-values-return-multiple 9))
+    '((0 (flet g :in fn-known-values-return-multiple) :enter 9)
+      (0 (flet g :in fn-known-values-return-multiple) :exit 9 9 9 9 9 9 9)
+      (0 (flet g :in fn-known-values-return-multiple) :enter 9)
+      (0 (flet g :in fn-known-values-return-multiple) :exit 9 9 9 9 9 9 9)
+      (0 (flet g :in fn-known-values-return-multiple) :enter 9)
+      (0 (flet g :in fn-known-values-return-multiple) :exit 9 9 9 9 9 9 9)))))
+
+(with-test (:name (trace :flet :within-compiler-macro)
+                  . #.*breakpoint-tracing-expectations*)
+  (assert (equal (collecting-traces ((flet body :in (compiler-macro fn-with-cmac)))
+                                    (compile nil '(lambda () (fn-with-cmac 0))))
+                 '((0 (flet body :in (compiler-macro fn-with-cmac)) :enter)
+                   (0 (flet body :in (compiler-macro fn-with-cmac)) :exit 42)))))
+
+(defun call-with-compiler-macro-redefined (fn)
+  (eval `(define-compiler-macro fn-with-cmac (x)
+           (declare (ignore x) (optimize (debug 3)))
+           (flet ((body () ''redefined))
+             (body))))
+  (unwind-protect
+       (funcall fn)
+    (eval `(define-compiler-macro fn-with-cmac (x)
+             (declare (ignore x) (optimize (debug 3)))
+             (flet ((body () 42))
+               (body))))))
+
+(with-test (:name (trace :compiler-macro :redefined)
+                  . #.*breakpoint-tracing-expectations*)
+  (assert (equal (collecting-traces ((compiler-macro fn-with-cmac)
+                                     (flet body :in (compiler-macro fn-with-cmac)))
+                   (compile nil '(lambda () (fn-with-cmac 0)))
+                   (call-with-compiler-macro-redefined
+                    (lambda () (compile nil '(lambda () (fn-with-cmac 0))))))
+                 '((0 (compiler-macro fn-with-cmac) :enter (fn-with-cmac 0) "unused argument")
+                   (1 (flet body :in (compiler-macro fn-with-cmac)) :enter)
+                   (1 (flet body :in (compiler-macro fn-with-cmac)) :exit 42)
+                   (0 (compiler-macro fn-with-cmac) :exit 42)
+                   (0 (compiler-macro fn-with-cmac) :enter (fn-with-cmac 0) "unused argument")
+                   (1 (flet body :in (compiler-macro fn-with-cmac)) :enter)
+                   (1 (flet body :in (compiler-macro fn-with-cmac)) :exit 'redefined)
+                   (0 (compiler-macro fn-with-cmac) :exit 'redefined)))))
+
+(defun throw-foo ()
+  (throw 'foo 42))
+
+(defun catch-foo ()
+  (catch 'foo (throw-foo)))
+
+(with-test (:name (trace :non-local-exit))
+  (assert (equal (collecting-traces (throw-foo)
+                   (catch-foo))
+                 '((0 throw-foo :enter)
+                   (0 throw-foo :non-local-exit)))))
+
+(with-test (:name (trace :non-local-exit :standard-report))
+  (let ((output (with-traced-function (throw-foo)
+                  (catch-foo))))
+    (assert (search "exited non-locally" output))))
+
+(defun trace-inner-function (x)
+  x)
+
+(defun trace-outer-function (x)
+  (declare (optimize (debug 3))) ; avoid tail call optimization
+  (trace-inner-function x))
+
+(defun test-trace-inner-function (&key encapsulate)
+  (assert (equal (let ((sb-debug:*trace-encapsulate-default* encapsulate))
+                   (collecting-traces (trace-inner-function
+                                       :wherein trace-outer-function)
+                     (trace-outer-function 'outer-value)
+                     (trace-inner-function 'inner-value)))
+                 '((0 trace-inner-function :enter outer-value)
+                   (0 trace-inner-function :exit outer-value)))))
+
+(with-test (:name (trace :wherein :encapsulate t))
+  (test-trace-inner-function :encapsulate t))
+
+(with-test (:name (trace :wherein :encapsulate nil)
+                  . #.*breakpoint-tracing-expectations*)
+  (test-trace-inner-function :encapsulate nil))
+
+(defun test-trace-fact-wherein (&key encapsulate)
+  (assert (equal (let ((sb-debug:*trace-encapsulate-default* encapsulate))
+                   (collecting-traces (trace-fact :wherein trace-fact)
+                     (trace-fact 1)))
+                 '((0 trace-fact :enter 0)
+                   (0 trace-fact :exit 1)))))
+
+(with-test (:name (trace :wherein :recursive :encapsulate t))
+  (test-trace-fact-wherein :encapsulate t))
+
+(with-test (:name (trace :wherein :recursive :encapsulate nil)
+                  . #.*breakpoint-tracing-expectations*)
+  (test-trace-fact-wherein :encapsulate nil))
+
+(defmacro macro-fact (x)
+  (labels ((fact (x) (if (zerop x) 1 (* x (fact (1- x))))))
+    (fact x)))
+
+(with-test (:name (trace :macro)
+                  . #.*breakpoint-tracing-expectations*)
+  (assert (equal (collecting-traces (macro-fact)
+                   (macroexpand-1 '(macro-fact 3)))
+                 '((0 macro-fact :enter (macro-fact 3) "unused argument")
+                   (0 macro-fact :exit 6)))))
+
+(with-test (:name (trace :labels :within-macro)
+                  . #.*breakpoint-tracing-expectations*)
+  (assert (equal (collecting-traces ((labels fact :in macro-fact))
+                   (macroexpand-1 '(macro-fact 0)))
+                 '((0 (labels fact :in macro-fact) :enter 0)
+                   (0 (labels fact :in macro-fact) :exit 1)))))
+
+(defun call-with-macro-fact-redefined (fn)
+  (handler-bind ((sb-kernel:redefinition-with-defmacro #'muffle-warning))
+    (eval `(defmacro macro-fact (x)
+             (declare (ignore x) (optimize (debug 3)))
+             (labels ((fact () 'redefined)) (fact))))
+    (unwind-protect
+         (funcall fn)
+      (eval `(defmacro macro-fact (x)
+               (labels ((fact (x) (if (zerop x) 1 (* x (fact (1- x))))))
+                 (fact x)))))))
+
+(with-test (:name (trace :macro :redefined)
+                  . #.*breakpoint-tracing-expectations*)
+  (assert (equal (collecting-traces (macro-fact
+                                     (labels fact :in macro-fact))
+                   (macroexpand-1 '(macro-fact 0))
+                   (call-with-macro-fact-redefined
+                    (lambda () (macroexpand-1 '(macro-fact 0)))))
+                 '((0 macro-fact :enter (macro-fact 0) "unused argument")
+                   (1 (labels fact :in macro-fact) :enter 0)
+                   (1 (labels fact :in macro-fact) :exit 1) (0 macro-fact :exit 1)
+                   (0 macro-fact :enter (macro-fact 0) "unused argument")
+                   (1 (labels fact :in macro-fact) :enter)
+                   (1 (labels fact :in macro-fact) :exit redefined)
+                   (0 macro-fact :exit redefined)))))
+
+(defun (cas trace-cas) (old new x)
+  (declare (optimize (debug 3)))
+  (flet (((cas body) (o n)
+           (+ o n x)))
+    (cas (body) old new)))
+
+(with-test (:name (trace :cas)
+                  . #.*breakpoint-tracing-expectations*)
+  (assert (equal (collecting-traces ((cas trace-cas)
+                                     (flet (cas body) :in (cas trace-cas)))
+                   (cas (trace-cas 1) 21 20))
+                 '((0 (cas trace-cas) :enter 21 20 1)
+                   (1 (flet (cas body) :in (cas trace-cas)) :enter 21 20)
+                   (1 (flet (cas body) :in (cas trace-cas)) :exit 42)
+                   (0 (cas trace-cas) :exit 42)))))
+
+(defmethod (cas trace-cas-gf) (old new x)
+  (declare (optimize (debug 3)))
+  (flet (((cas body) (o n)
+           (+ o n x)))
+    (cas (body) old new)))
+
+(with-test (:name (trace :cas :generic)
+                  . #.*breakpoint-tracing-expectations*)
+  (assert (equal (collecting-traces ((method (cas trace-cas-gf) (t t t))
+                                     (flet (cas body) :in (method (cas trace-cas-gf) (t t t))))
+                   (cas (trace-cas-gf 1) 21 20))
+                 '((0 (method (cas trace-cas-gf) (t t t)) :enter 21 20 1)
+                   (1 (flet (cas body) :in (method (cas trace-cas-gf) (t t t))) :enter 21 20)
+                   (1 (flet (cas body) :in (method (cas trace-cas-gf) (t t t))) :exit 42)
+                   (0 (method (cas trace-cas-gf) (t t t)) :exit 42)))))
+
+(defun (setf trace-setf) (value x)
+  (declare (optimize (debug 3)))
+  (flet (((setf body) (value)
+           (+ value x)))
+    (setf (body) value)))
+
+(with-test (:name (trace :setf)
+                  . #.*breakpoint-tracing-expectations*)
+  (assert (equal (collecting-traces ((setf trace-setf)
+                                     (flet (setf body) :in (setf trace-setf)))
+                   (setf (trace-setf 11) 31))
+                 '((0 (setf trace-setf) :enter 31 11)
+                   (1 (flet (setf body) :in (setf trace-setf)) :enter 31)
+                   (1 (flet (setf body) :in (setf trace-setf)) :exit 42)
+                   (0 (setf trace-setf) :exit 42)))))
 
 (with-test (:name :bug-414)
   (handler-bind ((warning #'error))
@@ -295,47 +838,55 @@
       (declare (ignore object))
       (assert (not valid-p)))))
 
+;; A hack to get around non-buffering input io with string streams.
+(defvar *ok-p*)
+
 (defun test-debugger (control form &rest targets)
   (let ((out (make-string-output-stream))
-        (oops t))
-    (unwind-protect
-         (progn
-           (with-simple-restart (debugger-test-done! "Debugger Test Done!")
-             (let* ((*debug-io* (make-two-way-stream
-                                 (make-string-input-stream control)
-                                 (make-broadcast-stream out #+nil *standard-output*)))
-                    ;; Initial announcement goes to *ERROR-OUTPUT*
-                    (*error-output* *debug-io*)
-                    (*invoke-debugger-hook* nil))
-               (handler-bind ((error #'invoke-debugger))
-                 (eval form))))
-           (setf oops nil))
-      (when oops
-        (error "Uncontrolled unwind from debugger test.")))
-    ;; For sanity's sake this is outside the *debug-io* rebinding -- otherwise
-    ;; it could swallow our asserts!
-    (with-input-from-string (s (get-output-stream-string out))
-      (loop for line = (read-line s nil)
-            while line
-            do (assert targets nil "Line = ~a" line)
-               #+nil
-               (format *error-output* "Got: ~A~%" line)
-               (let ((match (pop targets)))
-                 (if (eq '* match)
-                     ;; Whatever, till the next line matches.
-                     (let ((text (pop targets)))
-                       #+nil
-                       (format *error-output* "Looking for: ~A~%" text)
-                       (unless (search text line)
-                         (push text targets)
-                         (push match targets)))
-                     (unless (search match line)
-                       (format *error-output* "~&Wanted: ~S~%   Got: ~S~%" match line)
-                       (setf oops t))))))
+        (oops t)
+        (*ok-p* nil))
+    (tagbody
+       (unwind-protect
+            (progn
+              (with-simple-restart (debugger-test-done! "Debugger Test Done!")
+                (let* ((*debug-io* (make-two-way-stream
+                                    (make-string-input-stream control)
+                                    (make-broadcast-stream out #+nil *standard-output*)))
+                       ;; Initial announcement goes to *ERROR-OUTPUT*
+                       (*error-output* *debug-io*)
+                       (*invoke-debugger-hook* nil))
+                  (handler-bind ((error #'invoke-debugger))
+                    (eval form))))
+              (setf oops nil))
+         (when oops
+           (when *ok-p*
+             (go :continue))
+           (error "Uncontrolled unwind from debugger test.")))
+       ;; For sanity's sake this is outside the *debug-io* rebinding -- otherwise
+       ;; it could swallow our asserts!
+       :continue
+       (with-input-from-string (s (get-output-stream-string out))
+         (loop for line = (read-line s nil)
+               while line
+               do (assert targets nil "Line = ~a" line)
+                  #+nil
+                  (format *error-output* "Got: ~A~%" line)
+                  (let ((match (pop targets)))
+                    (if (eq '* match)
+                        ;; Whatever, till the next line matches.
+                        (let ((text (pop targets)))
+                          #+nil
+                          (format *error-output* "Looking for: ~A~%" text)
+                          (unless (search text line)
+                            (push text targets)
+                            (push match targets)))
+                        (unless (search match line)
+                          (format *error-output* "~&Wanted: ~S~%   Got: ~S~%" match line)
+                          (setf oops t)))))))
     ;; Check that we saw everything we wanted
     (when targets
       (error "Missed: ~S" targets))
-    (assert (not oops))))
+    (assert (or (not oops) *ok-p*))))
 
 (with-test (:name (:debugger :source 1))
   (test-debugger
@@ -385,7 +936,7 @@
    "(FUNCALL CONT (1- X) CONT)"
    "1]"))
 
-(with-test (:name (:debugger :bogus-debug-fun :source))
+(with-test (:name (:debugger :bogus-debug-fun :source) :skipped-on :ppc)
   (test-debugger
    "d
     debugger-test-done!"
@@ -395,6 +946,84 @@
    "undefined function"
    '*
    "1]"))
+
+(defun ! (n)
+  (declare (optimize debug))
+  (if (zerop n)
+      1
+      (* n (! (1- n)))))
+
+(with-test (:name (:debugger :list-locations)
+            ;; there's an extra location on arm for some reason.
+            :fails-on :arm)
+  (test-debugger
+   "ll #'!
+    debugger-test-done!"
+   '(break)
+   '*
+   "debugger invoked"
+   '*
+   "0]"
+   "0: (DEFUN ! (N)"
+   "     (DECLARE (OPTIMIZE DEBUG))"
+   "     (IF (ZEROP N)"
+   "         1"
+   "         (* N (! (1- N)))))"
+   "1: (ZEROP N)"
+   "2: (* N (! (1- N)))"
+   "3: (1- N)"
+   "4: (! (1- N))"
+   "5: (* N (! (1- N)))"
+   "6: (DEFUN ! (N)"
+   "     (DECLARE (OPTIMIZE DEBUG))"
+   "     (IF (ZEROP N)"
+   "         1"
+   "         (* N (! (1- N)))))"
+   "7: (IF (ZEROP N)"
+   "       1"
+   "       (* N (! (1- N))))"
+   "0]"))
+
+(with-test (:name (:debugger :breakpoint-and-step)
+            :fails-on (:or :freebsd :arm :riscv))
+  (test-debugger
+   "ll #'!
+    br #.(progn (setq *ok-p* t) 2)"
+   '(break)
+   '*
+   "debugger invoked"
+   '*
+   "(* N (! (1- N)))"
+   '*
+   "(* N (! (1- N)))"
+   '*
+   "(* N (! (1- N)))"
+   '*
+   "(* N (! (1- N)))"
+   '*
+   "1: 2 in !"
+   "added"
+   "0]")
+  (test-debugger
+   "step* 1
+    step* 1
+    debugger-test-done!"
+   `(! 10)
+   '*
+   "*Breakpoint hit*"
+   '*
+   "(! 10)"
+   "   source: (* N (! (1- N)))"
+   "0]"
+   "(! 10)"
+   "   source: (1- N)"
+   "0]"
+   '*
+   "*Breakpoint hit*"
+   '*
+   "(! 9)"
+   "   source: (* N (! (1- N)))"
+   "0]"))
 
 (with-test (:name (disassemble :high-debug-eval))
   (eval `(defun this-will-be-disassembled (x)
@@ -511,7 +1140,7 @@
     (block nil
       (handler-bind ((error (lambda (c)
                               (declare (ignore c))
-                              (sb-debug::map-backtrace
+                              (sb-debug:map-backtrace
                                (lambda (frame)
                                  (let ((sb-debug::*current-frame* frame)
                                        (name (sb-debug::frame-call frame)))
@@ -541,7 +1170,7 @@
     (block nil
       (handler-bind ((error (lambda (c)
                               (declare (ignore c))
-                              (sb-debug::map-backtrace
+                              (sb-debug:map-backtrace
                                (lambda (frame)
                                  (let ((sb-debug::*current-frame* frame)
                                        (name (sb-debug::frame-call frame)))
@@ -567,12 +1196,36 @@
                          (f2))))))))
     (assert (= count 3))))
 
+(with-test (:name :indirect-closure-values.crash)
+  (block nil
+    (handler-bind ((error (lambda (c)
+                            (declare (ignore c))
+                            (sb-debug:map-backtrace
+                             (lambda (frame)
+                               (let ((name (sb-debug::frame-call frame))
+                                     (location (sb-di:frame-code-location frame))
+                                     (d-fun (sb-di:frame-debug-fun frame)))
+                                 (when (eq name 'test)
+                                   (assert (sb-di:debug-var-info-available d-fun))
+                                   (dolist (v (sb-di:ambiguous-debug-vars d-fun ""))
+                                     (assert (not (sb-debug::var-valid-in-frame-p v location frame))))
+                                   (return))))))))
+      (funcall
+       (compile nil
+                `(sb-int:named-lambda test ()
+                   (declare (optimize debug safety))
+                   (signal 'error)
+                   (let ((protos '()))
+                     (mapcar (lambda (x)
+                               (print x))
+                             protos))))))))
+
 (with-test (:name :non-tail-self-call-bad-variables)
   (let ((count 0))
     (block nil
       (handler-bind ((error (lambda (c)
                               (declare (ignore c))
-                              (sb-debug::map-backtrace
+                              (sb-debug:map-backtrace
                                (lambda (frame)
                                  (let ((sb-debug::*current-frame* frame))
                                    (multiple-value-bind (name args)
@@ -595,7 +1248,7 @@
     (block nil
       (handler-bind ((error (lambda (c)
                               (declare (ignore c))
-                              (sb-debug::map-backtrace
+                              (sb-debug:map-backtrace
                                (lambda (frame)
                                  (let ((sb-debug::*current-frame* frame))
                                    (multiple-value-bind (name args)
@@ -622,7 +1275,7 @@
     (block nil
       (handler-bind ((error (lambda (c)
                               (declare (ignore c))
-                              (sb-debug::map-backtrace
+                              (sb-debug:map-backtrace
                                (lambda (frame)
                                  (let ((sb-debug::*current-frame* frame))
                                    (multiple-value-bind (name)
@@ -645,7 +1298,7 @@
     (block nil
       (handler-bind ((error (lambda (c)
                               (declare (ignore c))
-                              (sb-debug::map-backtrace
+                              (sb-debug:map-backtrace
                                (lambda (frame)
                                  (let ((sb-debug::*current-frame* frame))
                                    (multiple-value-bind (name)
@@ -663,8 +1316,7 @@
          '(error))))
     (assert (= count 1))))
 
-(with-test (:name :properly-tagged-p-internal
-            :fails-on (not (or :x86 :x86-64 :arm64)))
+(with-test (:name :properly-tagged-p-internal)
   ;; Pick a code component that has a ton of restarts.
   (let* ((code (sb-kernel:fun-code-header #'sb-impl::update-package-with-variance))
          (n (sb-kernel:code-n-entries code)))
@@ -677,8 +1329,13 @@
                                                    (function int unsigned unsigned))
                                      ptr base)
                       1)))
-          ;; Test that there are exactly n-entries properly tagged interior pointers.
-          (assert (= (loop for ptr from (+ base (* 2 sb-vm:n-word-bytes))
+          ;; For architectures that don't use LRAs, there are exactly 'n-entries'
+          ;; properly tagged interior pointers. For those which do use LRAs,
+          ;; there are at least that many, because we allow pointing to LRAs,
+          ;; but they aren't enumerable so we don't know the actual count.
+          (assert (#+(or x86 x86-64 arm64 riscv) =
+                   #-(or x86 x86-64 arm64 riscv) >
+                     (loop for ptr from (+ base (* 2 sb-vm:n-word-bytes))
                            below limit count (properly-tagged-p ptr))
                      n))
           ;; Verify that the binary search algorithm for simple-fun-index works.
@@ -716,3 +1373,54 @@
 (compile 'll-unknown)
 (with-test (:name :unknown-lambda-list)
   (assert (eq (sb-kernel:%fun-lambda-list #'ll-unknown) :unknown)))
+
+;;;; SB-DEBUG:*STACK-TOP-HINT* management
+
+(defun buggy-handler (c)
+  (declare (ignore c))
+  ;; signal a nondescript condition to avoid triggering WITH-TEST's error
+  ;; handling.
+  (error 'simple-condition :format-control "buggy handler"))
+
+(defun signal-and-handle-with-buggy-handler ()
+  (handler-bind ((program-error #'buggy-handler))
+    (signal 'program-error)))
+
+(defun call-getting-stack-top-on-invoke-debugger (fn)
+  (block nil
+    (let ((*invoke-debugger-hook*
+            (lambda (condition hook)
+              (declare (ignore condition hook))
+              (let ((top (sb-debug::resolve-stack-top-hint)))
+                (return (caar (sb-debug:list-backtrace :from top)))))))
+      (funcall fn))))
+
+(defun ds-bind-when (x)
+  (when x
+    (sb-c::ds-bind-error '(foo) 2 3 '((:macro baz . deftype))))
+  (print "something to prevent tco"))
+
+(with-test (:name (:stack-top-hint :arg-count-error))
+  (assert (eq 'ds-bind-when
+              (block nil
+                (handler-bind ((error
+                                 (lambda (c)
+                                   (declare (ignore c))
+                                   (let ((top (sb-debug::resolve-stack-top-hint)))
+                                     (return (caar (sb-debug:list-backtrace :from top)))))))
+                  (ds-bind-when t))))))
+
+;; If an error occurs within a signal handler, we want to see the handling
+;; frames in the backtrace.
+(with-test (:name (:stack-top-hint :signal))
+  (assert (eq 'buggy-handler
+              (call-getting-stack-top-on-invoke-debugger
+               #'signal-and-handle-with-buggy-handler))))
+
+;; When breaking on signals, we don't need to see the SIGNAL frame or other
+;; frames above that.
+(with-test (:name (:stack-top-hint :signal :break-on-signals))
+  (assert (eq 'signal-and-handle-with-buggy-handler
+              (let ((*break-on-signals* t))
+                (call-getting-stack-top-on-invoke-debugger
+                 #'signal-and-handle-with-buggy-handler)))))

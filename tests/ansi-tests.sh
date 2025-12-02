@@ -7,14 +7,14 @@ fi
 
 cd ansi-test
 rm -fr sandbox/scratch
-../../run-sbcl.sh --lose-on-corruption --disable-ldb \
+../../run-sbcl.sh --disable-ldb --lose-on-corruption \
+                  --no-userinit --no-sysinit \
                   --load gclload1.lsp --load gclload2.lsp \
                   --eval '(setf *default-pathname-defaults* (truename #P"sandbox/"))' \
                   --eval '(in-package :cl-test)' \
                   --eval '(disable-note :nil-vectors-are-strings)' \
                   --eval '(time (do-tests))' \
-                  --eval '(let* ((expected (list* "APROPOS-LIST.ERROR.2" "APROPOS.ERROR.2" "BOTH-CASE-P.2" "CHAR-DOWNCASE.2"
- "CHAR-UPCASE.2" "COMPILE-FILE.2"
+                  --eval '(let* ((expected (list* "APROPOS-LIST.ERROR.2" "APROPOS.ERROR.2" "COMPILE-FILE.2"
  "DEFINE-COMPILER-MACRO.8" "DESTRUCTURING-BIND.ERROR.10"
  "EXP.ERROR.10" "EXP.ERROR.11" "EXP.ERROR.8"
  "EXP.ERROR.9" "EXPT.ERROR.10" "EXPT.ERROR.11" "EXPT.ERROR.8" "EXPT.ERROR.9"
@@ -31,7 +31,7 @@ rm -fr sandbox/scratch
  "FORMATTER.X.29" "LOOP.1.39" "LOOP.1.40" "LOOP.1.41" "LOOP.1.42" "LOOP.1.43"
  "MACROLET.36" "MAKE-CONDITION.3" "MAKE-CONDITION.4"
  "MAKE-PATHNAME-ERROR-ABSOLUTE-WILD-INFERIORS-BACK"
- "MAKE-PATHNAME-ERROR-RELATIVE-WILD-INFERIORS-BACK" "MAP.48"
+ "MAKE-PATHNAME-ERROR-RELATIVE-WILD-INFERIORS-BACK"
  "PPRINT-LOGICAL-BLOCK.ERROR.1" "PPRINT-LOGICAL-BLOCK.ERROR.1-UNSAFE"
  "PPRINT-LOGICAL-BLOCK.ERROR.3" "PPRINT-LOGICAL-BLOCK.ERROR.3-UNSAFE"
  "PRINT-LEVEL.8" "PRINT-LEVEL.9" "PRINT.BACKQUOTE.RANDOM.1"
@@ -40,19 +40,33 @@ rm -fr sandbox/scratch
  "PRINT.BACKQUOTE.RANDOM.2" "PRINT.BACKQUOTE.RANDOM.3"
  "PRINT.BACKQUOTE.RANDOM.4" "PRINT.BACKQUOTE.RANDOM.5" "PROCLAIM.ERROR.7"
  "SHIFTF.7"
- "SUBTYPEP-COMPLEX.8"
- "SUBTYPEP.EQL.1" "SUBTYPEP.EQL.2" "SUBTYPEP.MEMBER.17" "SUBTYPEP.MEMBER.18"
  "SXHASH.17" "SXHASH.18" "SXHASH.19" "PRINT-STRUCTURE.1"
- (append #+win32 (list "ASINH.1" "ASINH.2" "ASINH.3" "ASINH.7" "ACOSH.3" "EXP.ERROR.7"
-                       "EXPT.ERROR.4" "EXPT.ERROR.5" "EXPT.ERROR.6" "EXPT.ERROR.7"
-                       "PROBE-FILE.4" "OPEN.OUTPUT.23" "OPEN.IO.22" "OPEN.IO.23")
-         #+arm64 (list "EXP.ERROR.4" "EXP.ERROR.5" "EXP.ERROR.6" "EXP.ERROR.7" "EXPT.ERROR.4"
-                       "EXPT.ERROR.5" "EXPT.ERROR.6" "EXPT.ERROR.7"))))
-                         (failing (remove "FORMAT.E.26"
-                                          (mapcar (function string) regression-test:*failed-tests*)
-                                          :test (function equal)))
-                         #+sb-devel
-                         (failing (remove "COMMON-LISP-PACKAGE-NICKNAMES" failing :test (function equal)))
+ "UNION.FOLD.1" "SUBTYPEP-COMPLEX.8" "FORMAT./.17"
+ "REMOVE-DUPLICATES.FOLD.4" "REMOVE-DUPLICATES.FOLD.3"
+ "REMOVE-DUPLICATES.FOLD.2" "REMOVE-DUPLICATES.FOLD.1" "REMOVE-IF-NOT.FOLD.2"
+ "REMOVE-IF.FOLD.4" "REMOVE-IF.FOLD.3" "REMOVE-IF.FOLD.1"
+ "REMOVE.FOLD.4" "REMOVE.FOLD.3" "REMOVE.FOLD.2" "REMOVE.FOLD.1"
+ "SUBSTITUTE-IF-NOT.FOLD.2" "SUBSTITUTE-IF-NOT.FOLD.1" "SUBSTITUTE-IF.FOLD.4"
+ "SUBSTITUTE-IF.FOLD.3" "SUBSTITUTE-IF.FOLD.2" "SUBSTITUTE-IF.FOLD.1"
+ "SUBSTITUTE.FOLD.4" "SUBSTITUTE.FOLD.3" "SUBSTITUTE.FOLD.2"
+ "SUBSTITUTE.FOLD.1"  "SUBSTITUTE-IF-NOT.FOLD.3"
+ (append #+x86 (list "CIS.4")
+         #+(or arm (and arm64 (not darwin)))
+           (list "EXP.ERROR.4" "EXP.ERROR.5" "EXP.ERROR.6" "EXP.ERROR.7" "EXPT.ERROR.4"
+                 "EXPT.ERROR.5" "EXPT.ERROR.6" "EXPT.ERROR.7")
+         #-sb-unicode (list "MISC.638")
+         (if (member :sb-fasteval sb-impl:+internal-features+)
+             (list "INTERSECTION.FOLD.1" "UNION.FOLD.1" "SET-DIFFERENCE.FOLD.1"
+                   "SET-EXCLUSIVE-OR.FOLD.1"
+                   "ALL-STRUCTURE-CLASSES-ARE-SUBTYPES-OF-STRUCTURE-OBJECT.2" "TRACE.8")
+             (list "MAP.48" "SYMBOL-FUNCTION.ERROR.5"
+                   "SUBSTITUTE-IF-NOT.FOLD.4" "REMOVE-IF.FOLD.2"
+                    "REMOVE-IF-NOT.FOLD.1" "REMOVE-IF-NOT.FOLD.3" "REMOVE-IF-NOT.FOLD.4"))
+
+         #+sb-unicode (list "BOTH-CASE-P.2" "CHAR-DOWNCASE.2" "CHAR-UPCASE.2"))))
+                         (failing (mapcar (function string) regression-test:*failed-tests*))
+                         (failing (set-difference failing (list "FORMAT.E.26" #+sb-devel "COMMON-LISP-PACKAGE-NICKNAMES")
+                          :test (function equal)))
                          (diff1 (set-difference failing  expected :test (function equal)))
                          (diff2 (set-difference expected failing :test (function equal))))
    (cond ((or diff1 diff2)

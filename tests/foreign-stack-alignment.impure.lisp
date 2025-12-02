@@ -13,10 +13,6 @@
 
 (use-package :sb-alien)
 
-;;; Callbacks are not part of the exported interface yet -- when they are this can
-;;; go away.
-(import 'sb-alien::alien-lambda)
-
 (defun run (program &rest arguments)
   (let* ((stringstream (make-string-output-stream))
          (proc (run-program program arguments
@@ -44,14 +40,14 @@
 ;;;; fork/exec, so that no lisp is on the stack. This is our known-good
 ;;;; number.
 
-(defvar *exename* (format nil "stackalign-test~a" (or #+win32 ".exe" "")))
-(defvar *soname*  (format nil "stackalign-test~a" (or #+win32 ".dll" ".so")))
+(defvar *exename* (scratch-file-name (or #+win32 "exe" nil)))
+(defvar *soname*  (scratch-file-name (or #+win32 "dll" "so")))
 
 (progn
   (cc #+unix "-sbcl-pic" "-o" *exename* "stack-alignment-offset.c")
 
   (defparameter *good-offset*
-    (parse-integer (run (format nil "./~a"  *exename*)
+    (parse-integer (run *exename*
                         (princ-to-string *required-alignment*))))
   (format t "~s is ~d~%" '*good-offset* *good-offset*)
   ;; Build the tool again, this time as a shared object, and load it
@@ -59,7 +55,7 @@
   #+unix  (cc "-sbcl-shared" "-sbcl-pic" "-o" *soname* "stack-alignment-offset.c")
   #+win32 (cc "-shared" "-o" *soname* "stack-alignment-offset.c")
 
-  (load-shared-object (truename *soname*))
+  (load-shared-object *soname*)
 
   (define-alien-routine stack-alignment-offset int (alignment int))
   #+alien-callbacks
@@ -74,8 +70,9 @@
 #+alien-callbacks
 (with-test (:name :callback)
   (assert (= *good-offset*
-             (trampoline (alien-lambda int ()
-                           (stack-alignment-offset *required-alignment*))))))
+             (with-alien-callable ((callback int ()
+                                     (stack-alignment-offset *required-alignment*)))
+               (trampoline callback)))))
 
 (ignore-errors (delete-file *exename*))
 (ignore-errors (delete-file *soname*))

@@ -10,7 +10,7 @@ export DH_VERBOSE=1
 # As soon as a new arch is bootstrapped, the lists should be updated.
 # See https://bugs.debian.org/954031
 ifeq (,$(filter amd64 arm64 armel armhf i386 kfreebsd-amd64 powerpc ppc64 ppc64el, $(DEB_HOST_ARCH)))
-ifneq (,$(filter riscv64 sh4, $(DEB_HOST_ARCH)))
+ifneq (,$(filter sh4, $(DEB_HOST_ARCH)))
         BOOTSTRAPLISP := /usr/bin/ecl --norc
 else
 	BOOTSTRAPLISP := /usr/bin/clisp -norc
@@ -26,9 +26,14 @@ ifeq (ppc64,$(DEB_HOST_ARCH))
 	export SBCL_ARCH=ppc64
 endif
 
+# Fix architecture detection on i386 in Salsa CI
+ifeq (i386,$(DEB_HOST_ARCH))
+	export SBCL_ARCH=x86
+endif
+
 FEATURES := --fancy
 
-ifneq (,$(filter amd64 i386, $(DEB_HOST_ARCH)))
+ifneq (,$(filter amd64 i386 armel armhf arm64, $(DEB_HOST_ARCH)))
 	FEATURES += --with-sb-linkable-runtime
 endif
 
@@ -62,7 +67,7 @@ override_dh_auto_build:
 
 ifeq (,$(filter nodoc,$(DEB_BUILD_OPTIONS)))
 	make -C doc/internals all html
-	cd doc/manual && make docstrings && make
+	make -j1 -C doc/manual
 endif
 
 # Run the testsuite, and fail on errors only on amd64, arm64 and i386
@@ -86,7 +91,8 @@ execute_after_dh_install-indep:
 	rm -f debian/sbcl-source/usr/share/sbcl-source/src/runtime/sbcl \
 		debian/sbcl-source/usr/share/sbcl-source/src/runtime/sbcl.nm \
 		debian/sbcl-source/usr/share/sbcl-source/src/runtime/shrinkwrap-sbcl \
-		debian/sbcl-source/usr/share/sbcl-source/src/runtime/heap-reloc-test
+		debian/sbcl-source/usr/share/sbcl-source/src/runtime/heap-reloc-test \
+		debian/sbcl-source/usr/share/sbcl-source/src/runtime/ldb
 
 execute_before_dh_gencontrol:
 	# Add the FASL version of this release to substvars

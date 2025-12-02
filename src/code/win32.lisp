@@ -63,6 +63,8 @@
 (defconstant file-type-unknown 0)
 
 (defconstant invalid-file-attributes (mod -1 (ash 1 32)))
+(defun sb-impl::file-exists-p (path)
+  (/= (get-file-attributes path) invalid-file-attributes))
 
 ;;;; File Type Introspection by handle
 (define-alien-routine ("GetFileType" get-file-type) dword
@@ -173,20 +175,23 @@
 
 ;;;; System Functions
 
-#-sb-thread
-(define-alien-routine ("Sleep" millisleep) void
-  (milliseconds dword))
+(define-alien-type wtimer system-area-pointer) ;HANDLE, but that's not defined yet
 
-#+sb-thread
+(define-alien-routine "os_create_wtimer" wtimer)
+(define-alien-routine "os_wait_for_wtimer" int (wt wtimer))
+(define-alien-routine "os_close_wtimer" void (wt wtimer))
+(define-alien-routine "os_cancel_wtimer" void (wt wtimer))
+(define-alien-routine "os_set_wtimer" void (wt wtimer) (sec int) (nsec int))
+
 (defun sb-unix:nanosleep (sec nsec)
   (let ((*allow-with-interrupts* *interrupts-enabled*))
     (without-interrupts
-      (let ((timer (sb-impl::os-create-wtimer)))
-        (sb-impl::os-set-wtimer timer sec nsec)
+      (let ((timer (os-create-wtimer)))
+        (os-set-wtimer timer sec nsec)
         (unwind-protect
              (do () ((with-local-interrupts
-                       (zerop (sb-impl::os-wait-for-wtimer timer)))))
-          (sb-impl::os-close-wtimer timer))))))
+                       (zerop (os-wait-for-wtimer timer)))))
+          (os-close-wtimer timer))))))
 
 (define-alien-routine ("win32_wait_object_or_signal" wait-object-or-signal)
     dword
@@ -302,11 +307,12 @@
       (let ((ret (alien-funcall afunc (1+ max_path) (cast apath (* char)))))
         (when (zerop ret)
           (win32-error "GetCurrentDirectory"))
-        (if (> ret (1+ max_path))
-            (with-alien ((apath (* char) (make-system-buffer ret)))
-              (alien-funcall afunc ret apath)
-              (cast-and-free apath))
-            (decode-system-string apath))))))
+        (possibly-base-stringize
+         (if (> ret (1+ max_path))
+             (with-alien ((apath (* char) (make-system-buffer ret)))
+               (alien-funcall afunc ret apath)
+               (cast-and-free apath))
+             (decode-system-string apath)))))))
 
 (defun sb-unix:unix-mkdir (name mode)
   (declare (type sb-unix:unix-pathname name)
@@ -316,13 +322,15 @@
            (values result (if result 0 (get-last-error)))
            name nil))
 
+(defconstant +movefile-replace-existing+ 1)
+
 (defun sb-unix:unix-rename (name1 name2)
   (declare (type sb-unix:unix-pathname name1 name2))
-  (syscall (("MoveFile" t) lispbool system-string system-string)
+  (syscall (("MoveFileEx" t) lispbool system-string system-string dword)
            (values result (if result 0 (get-last-error)))
-           name1 name2))
+           name1 name2 +movefile-replace-existing+))
 
-(defun sb-unix::posix-getenv (name)
+(defun sb-ext:posix-getenv (name)
   (declare (type simple-string name))
   (with-alien ((aenv (* char) (make-system-buffer default-environment-length)))
     (with-sysfun (afunc ("GetEnvironmentVariable" t)
@@ -333,7 +341,7 @@
           (setf aenv (make-system-buffer ret))
           (alien-funcall afunc name aenv ret))
         (if (> ret 0)
-            (cast-and-free aenv)
+            (possibly-base-stringize (cast-and-free aenv))
             (free-alien aenv))))))
 
 ;; GET-CURRENT-PROCESS
@@ -483,16 +491,16 @@ UNIX epoch: January 1st 1970."
   "Return file write date, represented as CL universal time."
   (with-alien ((file-attributes file-attributes))
     (syscall (("GetFileAttributesEx" t) lispbool
-              system-string int file-attributes)
+              system-string int (* file-attributes))
              (and result
                   (- (floor (deref (cast (slot file-attributes 'mtime)
                                          (* filetime)))
                             +filetime-unit+)
                      +common-lisp-epoch-filetime-seconds+))
-             native-namestring 0 file-attributes)))
+             native-namestring 0 (addr file-attributes))))
 
 (defun native-probe-file-name (native-namestring)
-  "Return truename \(using GetLongPathName\) as primary value,
+  "Return truename \(using GetFullPathName and GetLongPathName\) as primary value,
 File kind as secondary.
 
 Unless kind is false, null truename shouldn't be interpreted as error or file
@@ -500,16 +508,20 @@ absense."
   (with-alien ((file-attributes file-attributes)
                (buffer long-pathname-buffer))
     (syscall (("GetFileAttributesEx" t) lispbool
-              system-string int file-attributes)
+              system-string int (* file-attributes))
              (values
               (syscall (("GetLongPathName" t) dword
                         system-string long-pathname-buffer dword)
                        (and (plusp result) (decode-system-string buffer))
-                       native-namestring buffer 32768)
+                       (syscall (("GetFullPathName" t) dword
+                                 system-string dword long-pathname-buffer (* system-string))
+                                (and (plusp result) (decode-system-string buffer))
+                                native-namestring 32768 buffer nil)
+                       buffer 32768)
               (and result
                    (attribute-file-kind
                     (slot file-attributes 'attributes))))
-             native-namestring 0 file-attributes)))
+             native-namestring 0 (addr file-attributes))))
 
 (defun native-delete-file (native-namestring)
   (syscall (("DeleteFile" t) lispbool system-string)
@@ -525,7 +537,7 @@ absense."
   (when namestring
     (with-alien ((find-data find-data))
       (with-handle (handle (syscall (("FindFirstFile" t) handle
-                                     system-string find-data)
+                                     system-string (* find-data))
                                     (if (eql result invalid-handle)
                                         (if errorp
                                             (win32-error "FindFirstFile")
@@ -533,7 +545,7 @@ absense."
                                         result)
                                     (concatenate 'string
                                                  namestring "*.*")
-                                    find-data)
+                                    (addr find-data))
                     :close-operator find-close)
         (let ((more t))
           (dx-flet ((one-iter ()
@@ -545,8 +557,9 @@ absense."
                                  (attributes (slot find-data 'attributes)))
                              (setf more
                                    (syscall (("FindNextFile" t) lispbool
-                                             handle find-data) result
-                                             handle find-data))
+                                             handle (* find-data))
+                                            result
+                                            handle (addr find-data)))
                              (cond ((equal name ".") (go :next))
                                    ((equal name "..") (go :next))
                                    (t
@@ -568,15 +581,6 @@ absense."
                      name value)
       (void-syscall* (("SetEnvironmentVariable" t) system-string int-ptr)
                      name 0)))
-
-;; Let SETENV be an accessor for POSIX-GETENV.
-;;
-;; DFL: Merged this function because it seems useful to me.  But
-;; shouldn't we then define it on actual POSIX, too?
-(defun (setf sb-unix::posix-getenv) (new-value name)
-  (if (setenv name new-value)
-      new-value
-      (posix-getenv name)))
 
 (defmacro c-sizeof (s)
   "translate alien size (in bits) to c-size (in bytes)"

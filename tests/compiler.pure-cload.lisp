@@ -27,7 +27,8 @@
 ;;; isn't declared as a variable, but to set its SYMBOL-VALUE anyway.
 ;;;
 ;;; This bug was in sbcl-0.6.11.13.
-(print (setq improperly-declared-var '(1 2)))
+(locally (declare (sb-ext:muffle-conditions warning))
+  (print (setq improperly-declared-var '(1 2))))
 (assert (equal (symbol-value 'improperly-declared-var) '(1 2)))
 (makunbound 'improperly-declared-var)
 ;;; This is a slightly different way of getting the same symptoms out
@@ -118,31 +119,6 @@
               (error () :good))
             :good))
 
-;;; bug 282
-;;;
-;;; Verify type checking policy in full calls: the callee is supposed
-;;; to perform check, but the results should not be used before the
-;;; check will be actually performed.
-(locally
-    (declare (optimize (safety 3)))
-  (flet ((bar (f a)
-           (declare (type (simple-array (unsigned-byte 32) (*)) a))
-           (declare (type (function (fixnum)) f))
-           (funcall f (aref a 0))))
-    #-64-bit
-    (assert
-     (eval `(let ((n (1+ most-positive-fixnum)))
-              (if (not (typep n '(unsigned-byte 32)))
-                  (warn 'style-warning
-                        "~@<This test is written for platforms with ~
-                        ~@<(proper-subtypep 'fixnum '(unsigned-byte 32))~:@>.~:@>")
-                  (block nil
-                    (funcall ,#'bar
-                             (lambda (x) (when (eql x n) (return t)))
-                             (make-array 1 :element-type '(unsigned-byte 32)
-                                         :initial-element n))
-                    nil)))))))
-
 ;;; bug 261
 (let ((x (list (the (values &optional fixnum) (eval '(values))))))
   (assert (equal x '(nil))))
@@ -185,16 +161,6 @@
                                                   ,make-array)))))))
     (make-tests)))
 
-(lambda () (the string (+ 1 x)))
-
-(lambda ()
-  (macrolet ((x (&rest args)
-               (declare (ignore args))
-               'a))
-    (let (a)
-      (declare (type vector a))
-      (x #.#'list))))
-
 (defparameter *my-type-test-ran* 0)
 (deftype some-weird-type () '(satisfies my-thing-p))
 (defun my-thing-p (x)
@@ -211,3 +177,60 @@
   (multiple-value-bind (ok tested) (make-array-fill-nil)
     ;; should not inhibit stack allocation, should check that NIL is OK
     (assert (and ok (eql tested 1)))))
+
+(defun push-values-constants (k)
+  (let (*)
+    (if k
+        (eval k)
+        (load-time-value t))))
+
+(with-test (:name :push-values-constants)
+  (assert (eql (push-values-constants 1) 1))
+  (assert (eql (push-values-constants nil) t)))
+
+(declaim (inline component-xep-references-i))
+(defun component-xep-references-i (x)
+  x)
+(let ((x 0))
+  (defun component-xep-references ()
+    (incf x)
+    (let ((x #'component-xep-references-i))
+      (funcall x 10)))
+  (defun component-xep-references.2 ()
+    (component-xep-references-i 1)))
+
+(declaim (maybe-inline component-xep-references-mi))
+(defun component-xep-references-mi (x)
+  x)
+(let ((x 0))
+  (declare (optimize speed (space 0)))
+  (defun component-xep-references.3 ()
+    (incf x)
+    (let ((x #'component-xep-references-mi))
+      (funcall x 10)))
+  (defun component-xep-references.4 ()
+    (component-xep-references-mi 1)))
+
+(declaim (ftype (function (&key (:a fixnum)) t) compiled-ftype-test-key)
+         (ftype (function (&optional fixnum) t) compiled-ftype-test-opt))
+
+(defun compiled-ftype-test-key (&key a)
+  a)
+(defun compiled-ftype-test-opt (&optional (a nil))
+  a)
+
+(with-test (:name :ftype-optional)
+  (assert (type-specifiers-equal
+           (caddr
+            (sb-kernel:%simple-fun-type #'compiled-ftype-test-key))
+           '(values (or null fixnum) &optional)))
+  (assert (type-specifiers-equal
+           (caddr
+            (sb-kernel:%simple-fun-type #'compiled-ftype-test-opt))
+           '(values (or null fixnum) &optional))))
+
+(defun ltv-constants ()
+  (load-time-value (char-code #\a)))
+
+(with-test (:name :ltv-constants)
+  (assert (not (ctu:find-code-constants #'ltv-constants))))

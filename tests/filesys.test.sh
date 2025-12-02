@@ -11,11 +11,10 @@
 # absolutely no warranty. See the COPYING and CREDITS files for
 # more information.
 
-# Most of our shell tests write a few files into the source tree which is bad,
-# but this script is especially bad because it spews out dozens of files.
-export TEST_BASEDIR=${TMPDIR:-/tmp}
-
 . ./subr.sh
+
+run_sbcl --eval '(exit :code (or #+unix 0 2))'
+if [ $? -eq 2 ] ; then echo $0: SKIPPING ; exit $EXIT_TEST_WIN ; fi
 
 use_test_subdirectory
 testdir="`pwd -P`" # resolve symbolic links in the directory.

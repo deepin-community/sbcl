@@ -29,7 +29,7 @@ if [ -n "$SBCL_HOST_LOCATION" ]; then
     rsync -a "$SBCL_HOST_LOCATION/src/runtime/genesis" src/runtime
 fi
 
-# Build the runtime system and symbol table (.nm) file.
+# Build the runtime system
 #
 # (This C build has to come after the first genesis in order to get
 # 'sbcl.h' which the C build. It could come either before or after running
@@ -37,15 +37,21 @@ fi
 echo //building runtime system and symbol table file
 
 $GNUMAKE -C src/runtime clean
-# $GNUMAKE -C src/runtime depend
 $GNUMAKE $SBCL_MAKE_JOBS -C src/runtime all
 
 # Use a little C program to grab stuff from the C header files and
 # smash it into Lisp source code.
-$GNUMAKE -C tools-for-build -I../src/runtime grovel-headers
-tools-for-build/grovel-headers > output/stuff-groveled-from-headers.lisp
-
-$GNUMAKE -C src/runtime after-grovel-headers
+# -C tools-for-build is broken on some gnu make versions.
+if $android
+then
+    ( cd tools-for-build; $CC -I../src/runtime -ldl -o grovel-headers grovel-headers.c)
+    . ./tools-for-build/android_run.sh
+    android_run tools-for-build/grovel-headers > output/stuff-groveled-from-headers.lisp
+else
+    ( cd tools-for-build; $GNUMAKE -I../src/runtime grovel-headers )
+    tools-for-build/grovel-headers > output/stuff-groveled-from-headers.lisp
+fi
+touch -r tools-for-build/grovel-headers.c output/stuff-groveled-from-headers.lisp
 
 if [ -n "$SBCL_HOST_LOCATION" ]; then
     echo //copying target-1 output files to host

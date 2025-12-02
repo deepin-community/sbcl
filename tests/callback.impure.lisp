@@ -14,16 +14,19 @@
 (in-package :cl-user)
 
 ;;; callbacks only on a few platforms
-#-alien-callbacks
-(exit :code 104)
+;;; (actually, all platforms claim to support them now,
+;;; and :alien-callbacks is almost everywhere defined.
+;;; However mips doesn't seem to correctly implement them,
+;;; making the feature indicator somewhat useless)
+#+(or (not alien-callbacks) mips) (invoke-restart 'run-tests::skip-file)
 
 ;;; simple callback for a function
 
-(defun thunk ()
+(define-alien-callable thunk c-string ()
   (write-string "hi"))
 
 (defvar *thunk*
-  (sb-alien::alien-callback (function c-string) #'thunk))
+  (alien-callable-function 'thunk))
 
 (with-test (:name (:callback :c-string)
             ;; The whole file is broken, report one test
@@ -40,11 +43,11 @@
 
 ;;; simple callback for a symbol
 
-(defun add-two-ints (arg1 arg2)
+(define-alien-callable add-two-ints int ((arg1 int) (arg2 int))
   (+ arg1 arg2))
 
 (defvar *add-two-ints*
-  (sb-alien::alien-callback (function int int int) 'add-two-ints))
+  (alien-callable-function 'add-two-ints))
 
 (assert (= (alien-funcall *add-two-ints* 555 444444) 444999))
 
@@ -58,7 +61,7 @@
   (size int)
   (compar (function int (* double) (* double))))
 
-(sb-alien::define-alien-callback double*-cmp int ((arg1 (* double)) (arg2 (* double)))
+(define-alien-callable double*-cmp int ((arg1 (* double)) (arg2 (* double)))
   (let ((a1 (deref arg1))
         (a2 (deref arg2)))
     (cond ((= a1 a2) 0)
@@ -73,69 +76,64 @@
     (qsort (sb-sys:vector-sap vector)
            (length vector)
            (alien-size double :bytes)
-           double*-cmp))
+           (alien-callable-function 'double*-cmp)))
   (assert (equalp vector sorted)))
 
 ;;; returning floats
 
-(sb-alien::define-alien-callback redefined-fun int ()
-    0)
+(define-alien-callable redefined-fun int ()
+  0)
 
 (eval
- '(sb-alien::define-alien-callback redefined-fun int ()
+ '(define-alien-callable redefined-fun int ()
    42))
 
-(assert (= 42 (alien-funcall redefined-fun)))
+(assert (= 42 (alien-funcall (alien-callable-function 'redefined-fun))))
 
-(sb-alien::define-alien-callback return-single float ((x float))
+(define-alien-callable return-single float ((x float))
   x)
 
-(sb-alien::define-alien-callback return-double double ((x double))
+(define-alien-callable return-double double ((x double))
   x)
 
 (defconstant spi (coerce pi 'single-float))
 
-(assert (= spi (alien-funcall return-single spi)))
-(assert (= pi (alien-funcall return-double pi)))
+(assert (= spi (alien-funcall (alien-callable-function 'return-single) spi)))
+(assert (= pi (alien-funcall (alien-callable-function 'return-double) pi)))
 
-;;; invalidation
+;;; redefining and invalidating alien callables
 
-(sb-alien::define-alien-callback to-be-invalidated int ()
-  5)
-
-(assert (= 5 (alien-funcall to-be-invalidated)))
-
-(multiple-value-bind (p valid) (sb-alien::alien-callback-p to-be-invalidated)
-  (assert p)
-  (assert valid))
-
-(sb-alien::invalidate-alien-callback to-be-invalidated)
-
-(multiple-value-bind (p valid) (sb-alien::alien-callback-p to-be-invalidated)
-  (assert p)
-  (assert (not valid)))
-
-(multiple-value-bind (res err)
-    (ignore-errors (alien-funcall to-be-invalidated))
-  (assert (and (not res) (typep err 'error))))
-
-;;; getting and setting the underlying function
-
-(sb-alien::define-alien-callback foo int ()
+(define-alien-callable foo int ()
   13)
 
-(defvar *foo* #'foo)
+(defvar *old-foo* (alien-callable-function 'foo))
 
-(assert (eq #'foo (sb-alien::alien-callback-function foo)))
+(assert (sb-alien::alien-callback-p *old-foo*))
 
-(defun bar ()
+(assert (= 13 (alien-funcall *old-foo*)))
+
+(define-alien-callable foo int ()
   26)
 
-(setf (sb-alien::alien-callback-function foo) #'bar)
+;; Compatible redefinition just updates the underlying pointer.
+(assert (eq *old-foo* (alien-callable-function 'foo)))
 
-(assert (eq #'bar (sb-alien::alien-callback-function foo)))
+(assert (sb-alien::alien-callback-p *old-foo*))
 
-(assert (= 26 (alien-funcall foo)))
+(assert (= 26 (alien-funcall *old-foo*)))
+(assert (= 26 (alien-funcall (alien-callable-function 'foo))))
+
+(handler-bind ((error (lambda (c)
+                        (declare (ignore c))
+                        (continue))))
+  (define-alien-callable foo c-string ()
+    "blah"))
+
+(multiple-value-bind (res err)
+    (ignore-errors (alien-funcall *old-foo*))
+  (assert (and (not res) (typep err 'error))))
+
+(assert (string= "blah" (alien-funcall (alien-callable-function 'foo))))
 
 ;;; callbacks with void return values
 
@@ -145,10 +143,10 @@
 
 ;;; tests for integer-width problems in callback result handling
 
-(defvar *add-two-ints*
-  (sb-alien::alien-callback (function int int int) #'+))
+(define-alien-callable add-two-shorts short ((arg1 short) (arg2 short))
+  (+ arg1 arg2))
 (defvar *add-two-shorts*
-  (sb-alien::alien-callback (function short short short) #'+))
+  (alien-callable-function 'add-two-shorts))
 
 ;;; The original test cases here were what are now (:int-result
 ;;; :sign-extension) and (:int-result :underflow-detection), the latter
@@ -171,19 +169,24 @@
 ;;; tests for handling 64-bit arguments - this was causing problems on
 ;;; ppc - CLH, 2005-12-01
 
+(define-alien-callable add-two-long-longs (integer 64)
+    ((arg1 (integer 64)) (arg2 (integer 64)))
+  (+ arg1 arg2))
+
 (defvar *add-two-long-longs*
-  (sb-alien::alien-callback
-   (function (integer 64) (integer 64) (integer 64)) 'add-two-ints))
+  (alien-callable-function 'add-two-long-longs))
 (with-test (:name :long-long-callback-arg)
   (assert (= (alien-funcall *add-two-long-longs*
                             (ash 1 60)
                             (- (ash 1 59)))
              (ash 1 59))))
 
+(define-alien-callable add-two-unsigned-long-longs (unsigned 64)
+    ((arg1 (unsigned 64)) (arg2 (unsigned 64)))
+  (+ arg1 arg2))
+
 (defvar *add-two-unsigned-long-longs*
-  (sb-alien::alien-callback
-   (function (unsigned 64) (unsigned 64) (unsigned 64))
-   'add-two-ints))
+  (alien-callable-function 'add-two-unsigned-long-longs))
 (with-test (:name :unsigned-long-long-callback-arg)
   (assert (= (alien-funcall *add-two-unsigned-long-longs*
                             (ash 1 62)
@@ -222,17 +225,25 @@
        collect (car (rassoc (string-downcase g) *type-abbreviations* :test #'equal)))))
 
 (defmacro define-callback-adder (&rest types)
-  (let ((fname (format nil "*add-~{~A~^-~}*"
-                       (mapcar
-                        #'(lambda (x)
-                            (cdr (assoc x *type-abbreviations*)))
+  (let* ((fname (format nil "*add-~{~A~^-~}*"
                         (mapcar
-                         #'(lambda (y) (find-symbol (string-upcase y) 'sb-alien))
-                         (cdr types))))))
+                         #'(lambda (x)
+                             (cdr (assoc x *type-abbreviations*)))
+                         (mapcar
+                          #'(lambda (y) (find-symbol (string-upcase y) 'sb-alien))
+                          (cdr types)))))
+         (arg-types (cdr types))
+         (args (sb-int:make-gensym-list (length arg-types)))
+         (typed-lambda-list (mapcar (lambda (type arg)
+                                      (list arg type))
+                                    arg-types args))
+         (name (gensym "CALLBACK-ADDER-")))
     `(progn
-      (defparameter ,(intern
-                      (string-upcase fname))
-        (sb-alien::alien-callback (function ,@types) '+)))))
+       (define-alien-callable ,name
+           ,(car types) ,typed-lambda-list
+         (+ ,@args))
+       (defvar ,(intern (string-upcase fname))
+         (alien-callable-function ',name)))))
 
 (with-test (:name :define-2-int-callback)
   (define-callback-adder int int int))
@@ -453,3 +464,30 @@
   (define-callback-adder unsigned-long-long int int int int int unsigned-long-long))
 (with-test (:name :call-int-int-int-int-int-ulonglong-callback)
   (assert (= (alien-funcall *add-i-i-i-i-i-ull* 0 0 0 0 1 #x200000003) #x200000004)))
+
+(with-test (:name :with-alien-callable)
+  (with-alien-callable ((callable int ((x int) (y int))
+                          (+ x y)))
+    (assert (= (alien-funcall callable 1 2) 3))))
+
+(with-test (:name :with-alien-callable-invalidated)
+  (let (escape)
+    (with-alien-callable ((callable int ((x int) (y int))
+                            (+ x y)))
+      (setq escape callable)
+      (assert (= (alien-funcall callable 1 2) 3))
+      (assert (= (alien-funcall escape 2 3) 5)))
+    (multiple-value-bind (res err)
+        (ignore-errors (alien-funcall escape 2 3))
+      (assert (and (not res) (typep err 'error))))))
+
+(with-test (:name :with-alien-callable.closure)
+  ;; Ensure the same sap is reused.
+  (let (sap)
+    (dotimes (i 9)
+      (with-alien-callable ((callable int ((x int) (y int))
+                              (+ x y i)))
+        (unless sap
+          (setq sap (alien-sap callable)))
+        (assert (sb-sys:sap= sap (alien-sap callable)))
+        (assert (= (alien-funcall callable 1 2) (+ 3 i)))))))

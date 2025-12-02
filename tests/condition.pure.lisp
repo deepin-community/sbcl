@@ -280,7 +280,8 @@
 (with-test (:name (:printing-unintitialized-condition :bug-1184586))
   (prin1-to-string (make-condition 'simple-type-error)))
 
-(with-test (:name (:print-undefined-function-condition))
+(with-test (:name (:print-undefined-function-condition)
+            :fails-on :ppc64)
   (handler-case (funcall '#:foo)
     (undefined-function (c) (princ-to-string c))))
 
@@ -425,9 +426,9 @@ is not of type
 ;;; should resemble ones created normally. Due to a bug, they did not.
 ;;; (The LENGTH slot had the wrong value)
 (with-test (:name :condition-layout-lengths)
-  (loop for wrapper being each hash-value of (sb-kernel:classoid-subclasses
+  (loop for layout being each hash-value of (sb-kernel:classoid-subclasses
                                               (sb-kernel:find-classoid 'condition))
-        for len = (sb-kernel:wrapper-length wrapper)
+        for len = (sb-kernel:layout-length layout)
         minimize len into min
         maximize len into max
         finally (assert (= min max))))

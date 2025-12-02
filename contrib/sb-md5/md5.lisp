@@ -69,6 +69,7 @@
 
 (in-package sb-md5)
 (eval-when (:compile-toplevel :load-toplevel :execute)
+  (sb-ext:restrict-compiler-policy 'space 1) ; lp#1988683
   (setf (sb-int:system-package-p *package*) t))
 
 #+cmu
@@ -230,13 +231,15 @@ where a is the intended low-order byte and d the high-order byte."
 ;;; Section 3.4:  Table T
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
-  (defparameter *t* (make-array 64 :element-type 'ub32
+  (sb-int:defconstant-eqx +t+
+      (make-array 64 :element-type 'ub32
                                 :initial-contents
                                 (loop for i from 1 to 64
                                       collect
                                       (truncate
                                        (* 4294967296
-                                          (abs (sin (float i 0.0d0)))))))))
+                                          (abs (sin (float i 0.0d0)))))))
+    #'equalp))
 
 ;;; Section 3.4:  Helper Macro for single round definitions
 
@@ -246,7 +249,7 @@ where a is the intended low-order byte and d the high-order byte."
         collect
         `(setq ,a (mod32+ ,b (rol32 (mod32+ (mod32+ ,a (,op ,b ,c ,d))
                                             (mod32+ (ub32-aref ,block ,k)
-                                                    ,(aref *t* (1- i))))
+                                                    ,(aref +t+ (1- i))))
                                     ,s)))
         into result
         finally
@@ -483,7 +486,7 @@ in `regs'.  Returns a (simple-array (unsigned-byte 8) (16))."
 starting at `buffer-offset'."
   (declare (optimize (speed 3) (safety 0) (space 0) (debug 0)
                      #+lw-int32 (float 0) #+lw-int32 (hcl:fixnum-safety 0))
-           (type (unsigned-byte 29) from-offset)
+           (type sb-int:index from-offset)
            (type (integer 0 63) count buffer-offset)
            (type (simple-array * (*)) from)
            (type (simple-array (unsigned-byte 8) (64)) buffer))
@@ -560,7 +563,7 @@ external-format conversion routines beforehand."
         ((simple-array (unsigned-byte 8) (*))
            (locally
                (declare (type (simple-array (unsigned-byte 8) (*)) sequence))
-             (loop for offset of-type (unsigned-byte 29) from start below end by 64
+             (loop for offset of-type sb-int:index from start below end by 64
                    until (< (- end offset) 64)
                    do
                 (fill-block-ub8 block sequence offset)
@@ -573,7 +576,7 @@ external-format conversion routines beforehand."
         (simple-string
            (locally
                (declare (type simple-string sequence))
-             (loop for offset of-type (unsigned-byte 29) from start below end by 64
+             (loop for offset of-type sb-int:index from start below end by 64
                    until (< (- end offset) 64)
                    do
                 (fill-block-char block sequence offset)

@@ -201,7 +201,6 @@
     (foldable flushable movable))
 
 (defoptimizer (sign-extend derive-type) ((x size))
-  (declare (ignore x))
   (when (sb-c:constant-lvar-p size)
     (specifier-type `(signed-byte ,(sb-c:lvar-value size)))))
 
@@ -224,6 +223,24 @@
     (16 (sign-extend x size))
     (32 (sign-extend x size))))
 
+;;; There is a troublesome assumption about alien code linkage entries, namely that you
+;;; can reference entry + 8 to extract the actual address of the C function.
+;;; This is not ideal, for two distinct reasons:
+;;;
+;;; (1) The linkage entry should contain instructions for GC yieldpoint cooperation,
+;;; removing such instructions from call out sites. (You have to inform the GC that
+;;; a thread is leaving managed code and entering code that won't execute yieldpoints.)
+;;; Clearly this won't work if jumping into the middle of the linkage entry is allowed.
+;;;
+;;; (2) The CPU has separate I+D caches, and there is a cost to shuttling data between
+;;; them. Jumping to an alien linkage entries as they are puts the whole entry into the I
+;;; cache (presumably) when the second word should instead be in the D cache.
+;;; To optimally structure the entries, all JMPs should precede all data words, like so:
+;;;   jmp [RIP+disp]
+;;;   jmp [RIP+disp]
+;;;   ...
+;;;   data ...
+;;; And were such change made, it would cease to be valid to jump to an entry + 8.
 (define-vop (foreign-symbol-sap)
   (:translate foreign-symbol-sap)
   (:policy :fast-safe)
@@ -232,8 +249,15 @@
   (:info foreign-symbol)
   (:results (res :scs (sap-reg)))
   (:result-types system-area-pointer)
+  (:vop-var vop)
   (:generator 2
-   (inst mov res (make-fixup foreign-symbol :foreign))))
+    #-immobile-space (inst lea res (ea (make-fixup foreign-symbol :foreign) null-tn))
+    #+immobile-space
+    (cond ((code-immobile-p vop)
+           (inst lea res (rip-relative-ea (make-fixup foreign-symbol :foreign))))
+          (t
+           (inst mov res (make-fixup foreign-symbol :foreign))
+           (inst add res (static-constant-ea alien-linkage-table))))))
 
 (define-vop (foreign-symbol-dataref-sap)
   (:translate foreign-symbol-dataref-sap)
@@ -243,31 +267,39 @@
   (:info foreign-symbol)
   (:results (res :scs (sap-reg)))
   (:result-types system-area-pointer)
+  (:vop-var vop)
   (:generator 2
-   (inst mov res (ea (make-fixup foreign-symbol :foreign-dataref)))))
+    #-immobile-space (inst mov res (ea (make-fixup foreign-symbol :foreign-dataref) null-tn))
+    #+immobile-space
+    (cond ((code-immobile-p vop)
+           (inst mov res (rip-relative-ea (make-fixup foreign-symbol :foreign-dataref))))
+          (t
+           (inst mov res (static-constant-ea alien-linkage-table))
+           (inst mov res (ea (make-fixup foreign-symbol :foreign-dataref) res))))))
 
-#+sb-safepoint
-(defconstant thread-saved-csp-offset (- (1+ sb-vm::thread-header-slots)))
+#+(or sb-safepoint nonstop-foreign-call)
+(defconstant thread-saved-csp-offset -1)
 
 (eval-when (#-sb-xc :compile-toplevel :load-toplevel :execute)
   (defun destroyed-c-registers ()
     ;; Safepoints do not save interrupt contexts to be scanned during
     ;; GCing, it only looks at the stack, so if a register isn't
     ;; spilled it won't be visible to the GC.
-    #+sb-safepoint
+    #+(or sb-safepoint nonstop-foreign-call)
     '((:save-p t))
-    #-sb-safepoint
-    (let ((gprs (list rcx-offset rdx-offset
-                      #-win32 rsi-offset #-win32 rdi-offset
-                      r8-offset r9-offset r10-offset r11-offset))
+    #-(or sb-safepoint nonstop-foreign-call)
+    (let ((gprs (list '#:rcx '#:rdx #-win32 '#:rsi #-win32 '#:rdi
+                      '#:r8 '#:r9 '#:r10 '#:r11))
           (vars))
       (append
        (loop for gpr in gprs
-             collect `(:temporary (:sc any-reg :offset ,gpr :from :eval :to :result)
-                                  ,(car (push (sb-xc:gensym) vars))))
+             for offset = (symbol-value (intern (concatenate 'string (symbol-name gpr) "-OFFSET") "SB-VM"))
+             collect `(:temporary (:sc any-reg :offset ,offset :from :eval :to :result)
+                                  ,(car (push gpr vars))))
        (loop for float to 15
+             for varname = (format nil "FLOAT~D" float)
              collect `(:temporary (:sc single-reg :offset ,float :from :eval :to :result)
-                                  ,(car (push (sb-xc:gensym) vars))))
+                                  ,(car (push (make-symbol varname) vars))))
        `((:ignore ,@vars))))))
 
 (define-vop (call-out)
@@ -307,32 +339,24 @@
   (:temporary (:sc unsigned-reg :offset r15-offset :from :eval :to :result) r15)
   #+win32
   (:ignore r15)
-  #+win32
   (:temporary (:sc unsigned-reg :offset rbx-offset :from :eval :to :result) rbx)
   (:ignore results)
   (:vop-var vop)
   (:generator 0
+    (progn rbx)
     (emit-c-call vop rax c-symbol args varargsp
                  #+sb-safepoint pc-save
                  #+win32 rbx))
   . #.(destroyed-c-registers))
 
-#+win32
-(defconstant win64-seh-direct-thunk-addr win64-seh-data-addr)
-#+win32
-(defconstant win64-seh-indirect-thunk-addr (+ win64-seh-data-addr 8))
-
+;;; Remember when changing this to check that these work:
+;;; - disassembly, undefined alien, and conversion to ELF core
 (defun emit-c-call (vop rax fun args varargsp #+sb-safepoint pc-save #+win32 rbx)
   (declare (ignorable varargsp))
   ;; Current PC - don't rely on function to keep it in a form that
   ;; GC understands
   #+sb-safepoint
   (let ((label (gen-label)))
-    ;; This looks unnecessary. GC can look at the stack word physically below
-    ;; the CSP-around-foreign-call, which must be a PC pointing into the lisp caller.
-    ;; A more interesting question would arise if we had callee-saved registers
-    ;; within lisp code, which we don't at the moment. If we did, those
-    ;; wouldn't be anywhere on the stack unless C code decides to save them.
     (inst lea rax (rip-relative-ea label))
     (emit-label label)
     (move pc-save rax))
@@ -355,34 +379,50 @@
                                     'float-registers))))
 
   ;; Store SP in thread struct, unless the enclosing block says not to
-  #+sb-safepoint
-  (when (policy (sb-c::vop-node vop) (/= sb-c:insert-safepoints 0))
+
+  #+(or sb-safepoint nonstop-foreign-call)
+  (when (and #+sb-safepoint
+             (policy (sb-c::vop-node vop) (/= sb-c:insert-safepoints 0)))
     (inst mov (thread-slot-ea thread-saved-csp-offset) rsp-tn))
 
   #+win32 (inst sub rsp-tn #x20)       ;MS_ABI: shadow zone
 
-  ;; From immobile space we use the "CALL rel32" format to the linkage
-  ;; table jump, and from dynamic space we use "CALL [ea]" format
-  ;; where ea is the address of the linkage table entry's operand.
-  ;; So while the former is a jump to a jump, we can optimize out
-  ;; one jump in a statically linked executable.
+  ;; Immobile code uses "CALL rel32" to reach the linkage table entry,
+  ;; but movable code computes the linkage entry address into RBX first.
+  ;; N.B.: if you change how the call is emitted, you will also have to adjust
+  ;; the UNDEFINED-ALIEN-TRAMP lisp asm routine to recognize the various shapes
+  ;; this instruction sequence can take.
   #-win32
-  (inst call (cond ((tn-p fun) fun)
-                   ((sb-c::code-immobile-p vop) (make-fixup fun :foreign))
-                   (t (ea (make-fixup fun :foreign 8)))))
-  ;; On win64, we don't support immobile space (yet) and calls go through one of
-  ;; the thunks defined in set_up_win64_seh_data(). If the linkage table is
-  ;; involved, RBX either points to a linkage table trampoline or to the linkage
-  ;; table operand; this simplifies UNDEFINED-ALIEN-TRAMP's job.
+  (pseudo-atomic (:elide-if (not (call-out-pseudo-atomic-p vop)))
+    (inst call
+          #-immobile-space ; always call via RBX
+          (cond ((stringp fun) (inst lea rbx-tn (ea (make-fixup fun :foreign) null-tn)) rbx-tn)
+                (t fun))
+          #+immobile-space ; sometimes call via RBX
+          (if (stringp fun)
+              (cond ((code-immobile-p vop) (make-fixup fun :foreign))
+                    (t
+                     (inst mov rbx-tn (make-fixup fun :foreign))
+                     (inst add rbx-tn (static-constant-ea alien-linkage-table))
+                     rbx-tn))
+              ;; Emit a 3-byte NOP so the undefined-alien routine reads a well-defined byte
+              ;; on error. In practice, decoding never seemed to go wrong, but looked fishy
+              ;; due to the possibility of any random bytes preceding the call.
+              (dolist (b '(#x0f #x1f #x00) fun) (inst byte b)))))
+
+  ;; On win64, calls go through a thunk defined in set_up_win64_seh_data().
   #+win32
-  (cond ((tn-p fun)
-         (move rbx fun)
-         (inst mov rax win64-seh-direct-thunk-addr)
-         (inst call rax))
-        (t
-         (inst mov rbx (make-fixup fun :foreign 8))
-         (inst mov rax win64-seh-indirect-thunk-addr)
-         (inst call rax)))
+  (progn
+    (cond ((tn-p fun) (move rbx fun)) ; wasn't this already done by the VOP ?
+          ;; Compute address of entrypoint in the alien linkage table into RBX
+          ((code-immobile-p vop)
+           (inst lea rbx (rip-relative-ea (make-fixup fun :foreign))))
+          (t
+           #-immobile-space (inst lea rbx (ea (make-fixup fun :foreign) null-tn))
+           #+immobile-space
+           (progn (inst mov rbx (make-fixup fun :foreign))
+                  (inst add rbx (static-constant-ea alien-linkage-table)))))
+    (invoke-asm-routine 'call 'seh-trampoline vop))
 
   ;; For the undefined alien error
   (note-this-location vop :internal-error)
@@ -391,7 +431,9 @@
   ;; Zero the saved CSP, unless this code shouldn't ever stop for GC
   #+sb-safepoint
   (when (policy (sb-c::vop-node vop) (/= sb-c:insert-safepoints 0))
-    (inst xor (thread-slot-ea thread-saved-csp-offset) rsp-tn)))
+    (inst xor (thread-slot-ea thread-saved-csp-offset) rsp-tn))
+  #+nonstop-foreign-call
+  (inst mov :qword (thread-slot-ea thread-saved-csp-offset) 0))
 
 (define-vop (alloc-number-stack-space)
   (:info amount)
@@ -407,7 +449,7 @@
     (move result rsp-tn)))
 
 (macrolet ((alien-stack-ptr ()
-             #+sb-thread '(symbol-known-tls-cell '*alien-stack-pointer*)
+             #+sb-thread `(thread-slot-ea ,(symbol-thread-slot '*alien-stack-pointer*))
              #-sb-thread '(static-symbol-value-ea '*alien-stack-pointer*)))
   (define-vop (alloc-alien-stack-space)
     (:info amount)
@@ -420,17 +462,6 @@
           (inst sub :qword (alien-stack-ptr) delta)))
       (inst mov result (alien-stack-ptr)))))
 
-;;; not strictly part of the c-call convention, but needed for the
-;;; WITH-PINNED-OBJECTS macro used for "locking down" lisp objects so
-;;; that GC won't move them while foreign functions go to work.
-(define-vop (touch-object)
-  (:translate touch-object)
-  (:args (object))
-  (:ignore object)
-  (:policy :fast-safe)
-  (:arg-types t)
-  (:generator 0))
-
 ;;; Callbacks
 
 #-sb-xc-host
@@ -441,9 +472,7 @@
 (defun alien-callback-assembler-wrapper (index result-type argument-types)
   (labels ((make-tn-maker (sc-name)
              (lambda (offset)
-               (make-random-tn :kind :normal
-                               :sc (sc-or-lose sc-name)
-                               :offset offset))))
+               (make-random-tn (sc-or-lose sc-name) offset))))
     (let* ((segment (make-segment))
            (rax rax-tn)
            #+win32 (rcx rcx-tn)
@@ -509,6 +538,14 @@
                   (t
                    (bug "Unknown alien floating point type: ~S" type)))))
 
+        (macrolet
+            ((call-wrapper ()
+               ;; Technically this fixup should have an optional arg of
+               ;;  (- (ASH SYMBOL-VALUE-SLOT WORD-SHIFT) OTHER-POINTER-LOWTAG)
+               ;; but as the fixup is hand-crafted anyway, it doesn't matter.
+               `(inst call (rip-relative-ea
+                      (make-fixup 'callback-wrapper-trampoline
+                                  :immobile-symbol))))) ; arbitraryish flavor
         #-sb-thread
         (progn
           ;; arg0 to ENTER-ALIEN-CALLBACK (trampoline index)
@@ -527,12 +564,10 @@
           (inst mov  rbp rsp)
 
           ;; Call
-          (inst mov  rax (foreign-symbol-address "funcall_alien_callback"))
-          (inst call rax)
+          (call-wrapper)
 
           ;; Back! Restore frame
-          (inst mov rsp rbp)
-          (inst pop rbp))
+          (inst leave))
 
         #+sb-thread
         (progn
@@ -552,11 +587,10 @@
           #+win32 (inst sub rsp #x20)
           #+win32 (inst and rsp #x-20)
           ;; Call
-          (inst mov rax (foreign-symbol-address "callback_wrapper_trampoline"))
-          (inst call rax)
+          (call-wrapper)
+
           ;; Back! Restore frame
-          (inst mov rsp rbp)
-          (inst pop rbp))
+          (inst leave)))
 
         ;; Result now on top of stack, put it in the right register
         (cond
@@ -586,7 +620,22 @@
       (finalize-segment segment)
       ;; Now that the segment is done, convert it to a static
       ;; vector we can point foreign code to.
-      (let ((buffer (sb-assem:segment-buffer segment)))
-        (make-static-vector (length buffer)
-                            :element-type '(unsigned-byte 8)
-                            :initial-contents buffer)))))
+      (let* ((buffer (sb-assem:segment-buffer segment))
+             (result (make-static-vector (length buffer)
+                                         :element-type '(unsigned-byte 8)
+                                         :initial-contents buffer)))
+        ;; This is an ad-hoc substitute for the general fixup logic, due to
+        ;; absence of a code component. Even the machine-dependent part is not
+        ;; useful since it wants to call CODE-INSTRUCTIONS.
+        (let* ((notes (sb-assem::segment-fixup-notes segment))
+               (note (car notes)))
+          (when note
+            (aver (eq (fixup-note-kind note) :rel32))
+            ;; +4 is because RIP-relative EA is relative to following instruction
+            (let* ((pc (sap+ (vector-sap result) (+ (fixup-note-position note) 4)))
+                   (fixup (fixup-note-fixup note))
+                   (ea (+ nil-value (ea-disp (static-symbol-value-ea (fixup-name fixup)))))
+                   (disp (sap- (int-sap ea) pc)))
+              (setf (signed-sap-ref-32  (vector-sap result) (fixup-note-position note))
+                    disp))))
+        result))))

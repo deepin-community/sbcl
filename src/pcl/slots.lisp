@@ -84,7 +84,45 @@
 
 ;;;; SLOT-VALUE, (SETF SLOT-VALUE), SLOT-BOUNDP, SLOT-MAKUNBOUND
 
+;;; Structure-slot-value is usually faster than our litle chunks of code that are
+;;; automatically cobbled together for SLOT-VALUE on an unknown type but constant slot name.
+;;; While the global generic for a specific slot might only need to invoke a type-check,
+;;; the dispatch function is not faster than this, if even as fast.
+;;; If "flexible" defstructs (multiple inheritance, standard-object ancestors) are ever
+;;; brought to life, this might be inadmissible. Probably we would not store the
+;;; fast map in such situations.
+(defun structure-slot-value (instance slot-name)
+  (declare (optimize (sb-c::insert-array-bounds-checks 0)))
+  (let* ((layout (%instance-layout (truly-the structure-object instance)))
+         (mapper (sb-kernel::layout-slot-mapper layout))
+         (bits (cond ((functionp mapper)
+                      ;; Something earlier has asserted that SLOT-NAME is a symbol
+                      ;; so SYMBOL-HASH won't croak on it.
+                      (funcall mapper slot-name))
+                     ((simple-vector-p mapper)
+                      (search-struct-slot-name-vector mapper slot-name)))))
+    (if bits
+        (let ((raw-type (logand (truly-the fixnum bits) sb-vm:dsd-raw-type-mask))
+              (index (truly-the index (ash bits (- sb-vm:dsd-index-shift)))))
+          (declare (optimize (sb-c:insert-array-bounds-checks 0)))
+          ;; We don't transform SLOT-VALUE to STRUCTURE-SLOT-VALUE in safety 3,
+          ;; so this need not check for unbound-marker.
+          (if (/= raw-type 0)
+              (funcall (sb-kernel::raw-slot-data-accessor-fun
+                        (svref (load-time-value sb-kernel::*raw-slot-data* t)
+                               (truly-the index (1- raw-type))))
+                       instance index)
+              (%instance-ref instance index)))
+        ;; not found, take the slow path
+        (locally (declare (notinline slot-value))
+          (slot-value instance slot-name)))))
+
 (declaim (ftype (sfunction (t symbol) t) slot-value))
+;;; It would be nifty if this could utilize the LAYOUT-STRUCT-SLOT-MAP
+;;; to optimize for subtypes of STRUCTURE-OBJECT in here, but as currently
+;;; defined, STRUCTURE-SLOT-VALUE calls SLOT-VALUE when either it can't find
+;;; the slot or the slot is raw. Since that function punts to this as a fallback,
+;;; this can't utilize that or else they enter an infinite loop on failure.
 (defun slot-value (object slot-name)
   (let* ((wrapper (valid-wrapper-of object))
          (cell (find-slot-cell wrapper slot-name))
@@ -121,7 +159,7 @@
          (info (cdr cell))
          (typecheck (slot-info-typecheck info)))
     (when typecheck
-      (funcall typecheck new-value))
+      (setf new-value (funcall typecheck new-value)))
     (cond ((fixnump location)
            (if (std-instance-p object)
                (setf (standard-instance-access object location) new-value)
@@ -152,7 +190,7 @@
          (info (cdr cell))
          (typecheck (slot-info-typecheck info)))
     (when typecheck
-      (funcall typecheck new-value))
+      (setf new-value (funcall typecheck new-value)))
     (let ((old (cond ((fixnump location)
                       (if (std-instance-p object)
                           (cas (standard-instance-access object location) old-value new-value)
@@ -333,9 +371,12 @@
   (let ((fun (slot-info-boundp (slot-definition-info slotd))))
     (funcall fun object)))
 
-(defmethod slot-makunbound-using-class ((class condition-class) object slot)
-  (error "attempt to unbind slot ~S in condition object ~S."
-         slot object))
+(defmethod slot-makunbound-using-class
+    ((class condition-class)
+     (object condition)
+     (slotd condition-effective-slot-definition))
+  (let ((fun (slot-info-makunbound (slot-definition-info slotd))))
+    (funcall fun object)))
 
 (defmethod slot-value-using-class
     ((class structure-class)
@@ -344,8 +385,6 @@
   (let* ((function (slot-definition-internal-reader-function slotd))
          (value (funcall function object)))
     (declare (type function function))
-    ;; FIXME: Is this really necessary? Structure slots should surely
-    ;; never be unbound!
     (if (unbound-marker-p value)
         (values (slot-unbound class object (slot-definition-name slotd)))
         value)))
@@ -359,16 +398,23 @@
     (funcall function new-value object)))
 
 (defmethod slot-boundp-using-class
-           ((class structure-class)
-            (object structure-object)
-            (slotd structure-effective-slot-definition))
-  t)
+    ((class structure-class)
+     (object structure-object)
+     (slotd structure-effective-slot-definition))
+  (let* ((function (slot-definition-internal-reader-function slotd))
+         (value (funcall function object)))
+    (declare (type function function))
+    (not (unbound-marker-p value))))
 
 (defmethod slot-makunbound-using-class
-           ((class structure-class)
-            (object structure-object)
-            (slotd structure-effective-slot-definition))
-  (error "Structure slots can't be unbound."))
+    ((class structure-class)
+     (object structure-object)
+     (slotd structure-effective-slot-definition))
+  (if (slot-definition-always-bound-p slotd)
+      (error "Structure slots can't be unbound.")
+      (let ((function (slot-definition-internal-writer-function slotd)))
+        (declare (type function function))
+        (funcall function sb-pcl:+slot-unbound+ object))))
 
 (defmethod slot-missing
            ((class t) instance slot-name operation &optional new-value)
@@ -420,7 +466,7 @@
        ;; in list. The only exceptions are when there are non-local slots
        ;; before the one we want.
        (slot-definition-name
-        (find position (wrapper-slot-list (wrapper-of instance))
+        (find position (wrapper-slot-list (layout-of instance))
               :key #'slot-definition-location)))
       (cons
        (car position))))))
@@ -457,10 +503,6 @@
            :format-arguments (list 'class-slots class)
            :references '((:amop :generic-function class-slots)))))
 
-(defun %set-slots (object names &rest values)
-  (mapc (lambda (name value)
-          (if (unbound-marker-p value)
-              ;; SLOT-MAKUNBOUND-USING-CLASS might do something nonstandard.
-              (slot-makunbound object name)
-              (setf (slot-value object name) value)))
-        names values))
+;;; The error case of the optimizer for slot-value on a structure-object
+;;; that could be NIL. Just shortens the call site by passing one arg.
+(defun nil-not-slot-object (slot-name) (slot-value nil slot-name))

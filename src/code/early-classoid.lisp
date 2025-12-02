@@ -15,17 +15,25 @@
 
 ;;;; DEFSTRUCT-DESCRIPTION
 
+(defconstant +dd-named+      #b000001) ; :NAMED was specified
+(defconstant +dd-printfun+   #b000010) ; :PRINT-FUNCTION was specified
+(defconstant +dd-printobj+   #b000100) ; :PRINT-OBJECT was specified
+(defconstant +dd-pure+       #b001000) ; :PURE T was specified
+(defconstant +dd-varylen+    #b010000)
+(defconstant +dd-nullenv+    #b100000)
+
 ;;; The DEFSTRUCT-DESCRIPTION structure holds compile-time information
 ;;; about a structure type.
-;;; It is defined prior to WRAPPER because WRAPPER-INFO
+;;; It is defined prior to LAYOUT because a LAYOUT-INFO slot
 ;;; is declared to hold a DEFSTRUCT-DESCRIPTION.
 (def!struct (defstruct-description
              (:conc-name dd-)
              (:copier nil)
              (:pure t)
-             (:constructor make-defstruct-description (null-lexenv-p name)))
+             (:constructor make-defstruct-description (name flags)))
   ;; name of the structure
   (name (missing-arg) :type symbol :read-only t)
+  (flags 0 :type fixnum) ; see the constants above
   ;; documentation on the structure
   (doc nil :type (or string null))
   ;; prefix for slot names. If NIL, none.
@@ -33,8 +41,6 @@
   ;; All the :CONSTRUCTOR specs and posssibly an implied constructor,
   ;; keyword constructors first, then BOA constructors. NIL if none.
   (constructors () :type list)
-  ;; True if the DEFSTRUCT appeared in a null lexical environment.
-  (null-lexenv-p nil :type boolean :read-only t) ; the safe default is NIL
   ;; name of copying function
   (copier-name nil :type symbol)
   ;; name of type predicate
@@ -59,34 +65,24 @@
   (inherited-accessor-alist () :type list)
   ;; number of data words, including the layout itself if the layout
   ;; requires an entire word (when no immobile-space)
+  ;; Technically this is redundant information: it can be derived from DD-SLOTS
+  ;; by taking the index of the final slot and adding its length in words.
+  ;; If there are no slots, then it's just INSTANCE-DATA-START.
   (length 0 :type index)
   ;; General kind of implementation.
   (type 'structure :type (member structure vector list
                                  funcallable-structure))
 
-  ;; The next three slots are for :TYPE'd structures (which aren't
-  ;; classes, DD-CLASS-P = NIL)
-  ;;
-  ;; vector element type
-  (element-type t)
-  ;; T if :NAMED was explicitly specified, NIL otherwise
-  (named nil :type boolean)
+  ;; If this structure is a classoid, then T if all slots are tagged, * if not.
+  ;; If a vector, the vector element type.
+  ;; If a list, not used.
+  (%element-type t)
   ;; any INITIAL-OFFSET option on this direct type
   (offset nil :type (or index null))
 
-  ;; which :PRINT-mumble option was given, if either was.
-  (print-option nil :type (member nil :print-function :print-object))
   ;; the argument to the PRINT-FUNCTION or PRINT-OBJECT option.
   ;; NIL if the option was given with no argument.
-  (printer-fname nil :type (or cons symbol))
-
-  ;; the value of the :PURE option, used by cheneygc when purifying.
-  ;; This is true if objects of this class are never modified to
-  ;; contain dynamic pointers in their slots or constant-like
-  ;; substructure (and hence can be copied into read-only space by
-  ;; PURIFY).
-  ;; This is only meaningful if DD-CLASS-P = T.
-  (pure nil :type (member t nil)))
+  (printer-fname nil :type (or cons symbol)))
 (declaim (freeze-type defstruct-description))
 (!set-load-form-method defstruct-description (:host :xc :target))
 
@@ -103,6 +99,7 @@
 (defconstant +string-stream-layout-flag+     #b001000000)
 (defconstant +stream-layout-flag+            #b010000000)
 (defconstant +sequence-layout-flag+          #b100000000)
+(defconstant +strictly-boxed-flag+          #b1000000000)
 (defconstant layout-flags-mask #xffff) ; "strictly flags" bits from the packed field
 
 ;;; the type of LAYOUT-DEPTHOID and LAYOUT-LENGTH values.
@@ -113,6 +110,59 @@
 (def!type layout-bitmap () 'integer)
 ;;; ID must be an fixnum for either value of n-word-bits.
 (def!type layout-id () '(signed-byte 30))
+
+(declaim (start-block))
+
+;;; The CLASSOID structure is a supertype of all classoid types.  A
+;;; CLASSOID is also a CTYPE structure as recognized by the type
+;;; system.  (FIXME: It's also a type specifier, though this might go
+;;; away as with the merger of SB-PCL:CLASS and CL:CLASS it's no
+;;; longer necessary)
+(defstruct (classoid
+             (:include ctype)
+             (:constructor nil)
+             (:copier nil)
+             (:print-object
+              (lambda (class stream)
+                (let ((name (classoid-name class)))
+                  (print-unreadable-object (class stream
+                                                  :type t
+                                                  :identity (not name))
+                    (format stream
+                            ;; FIXME: Make sure that this prints
+                            ;; reasonably for anonymous classes.
+                            "~:[anonymous~;~:*~S~]~@[ (~(~A~))~]"
+                            name
+                            (classoid-state class))))))
+             #-sb-xc-host (:pure nil))
+  ;;; KLUDGE: Keep synchronized with hardcoded slot order in 'instance.inc'
+  ;; the value to be returned by CLASSOID-NAME.
+  (name nil :type symbol)
+  ;; the current LAYOUT for this class, or NIL if none assigned yet
+  (layout nil :type (or null layout))
+  ;; How sure are we that this class won't be redefined?
+  ;;   :READ-ONLY = We are committed to not changing the effective
+  ;;                slots or superclasses.
+  ;;   :SEALED    = We can't even add subclasses.
+  ;;   NIL        = Anything could happen.
+  (state nil :type (member nil :read-only :sealed))
+  ;; direct superclasses of this class. Always NIL for CLOS classes.
+  (direct-superclasses () :type list)
+  ;; Definition location
+  ;; Not used for standard-classoid, because pcl has its own mechanism.
+  (source-location nil)
+  ;; representation of all of the subclasses (direct or indirect) of
+  ;; this class. This is NIL if no subclasses or not initalized yet;
+  ;; otherwise, it's an EQ hash-table mapping CLASSOID objects to the
+  ;; subclass layout that was in effect at the time the subclass was
+  ;; created.
+  ;; Initially an alist, and changed to a hash-table at some threshold.
+  (subclasses nil :type (or list hash-table))
+  (%lock nil) ; install it just-in-time, similar to hash-table-lock
+  ;; the PCL class (= CL:CLASS, but with a view to future flexibility
+  ;; we don't just call it the CLASS slot) object for this class, or
+  ;; NIL if none assigned yet
+  (pcl-class nil))
 
 ;;; The LAYOUT structure is pointed to by the first cell of instance
 ;;; (or structure) objects. It represents what we need to know for
@@ -149,11 +199,9 @@
 
 ;;; 32-bit is not done yet. Three slots are still used, instead of two.
 
-#-metaspace
-(progn
-(sb-xc:defstruct (wrapper (:copier nil)
+(sb-xc:defstruct (layout (:copier nil)
                          ;; Parsing DEFSTRUCT uses a temporary layout
-                         (:constructor make-temporary-wrapper
+                         (:constructor make-temporary-layout
                              (clos-hash classoid inherits &aux (invalid nil))))
 
   ;; A packed field containing the DEPTHOID, LENGTH, and FLAGS
@@ -166,6 +214,14 @@
   ;; for classes named by a symbol, otherwise a pseudo-random value.
   ;; Must be acceptable as an argument to SB-INT:MIX
   (clos-hash (missing-arg) :type (and fixnum unsigned-byte))
+  ;; Vtable could be used to store the per-layout implementation of the combined methods for
+  ;; any single-dispatch function. The trick is to dynamically figure out when it would make
+  ;; sense to claim a unique index into the vtable. Certainly for a function that has about half
+  ;; as many methods as there are classes e.g. #<STANDARD-GENERIC-FUNCTION CL-PROTOBUFS:CLEAR (2017)>
+  ;; when there are 4000 classes. A PCL cache (key = layout, value = method) would take up double
+  ;; the space at least, plus all the unused cells required to make the probing strategy work.
+  ;; And it wouldn't be as quick as a direct lookup.
+  (vtable)
   ;; the class that this is a layout for
   (classoid (missing-arg) :type classoid)
   ;; The value of this slot can be:
@@ -212,6 +268,11 @@
   ;; Could be the generalized function, or a type-specific one
   ;; if the defstruct was compiled in a policy of SPEED 3.
   (equalp-impl #'equalp-err :type (sfunction (t t) boolean) :read-only t)
+  ;; Information for the quicker variant of SLOT-VALUE on STRUCTURE-OBJECT
+  ;; INSTANCE uses at most 14 bits in the primitive object header for the payload
+  ;; length, so the function can't actually return all of the INDEX type.
+  (slot-mapper nil :type (or (sfunction (symbol) (or index null))
+                             simple-vector null))
   ;; Information about slots in the class to PCL: this provides fast
   ;; access to slot-definitions and locations by name, etc.
   ;; See MAKE-SLOT-TABLE in pcl/slots-boot.lisp for further details.
@@ -222,44 +283,9 @@
   #-64-bit (id-word3 0 :type word)
   #-64-bit (id-word4 0 :type word)
   #-64-bit (id-word5 0 :type word))
-(declaim (freeze-type wrapper)))
+(declaim (freeze-type layout))
 
-#+metaspace
-(progn
-;;; Separating the pointer and nonpointer slots of LAYOUT satisfies the
-;;; requirement of a certain garbage collector (WIP), but also opens up the
-;;; possibility of absorbing at least one of the vectorish slots into the
-;;; WRAPPER since it could be reallocated with variable size.
-;;; The SLOT-TABLE slot might be a good candidate for trailing tagged slots.
-(sb-xc:defstruct (wrapper (:copier nil) (:constructor %make-wrapper))
-  ;; !!! The FRIEND slot in WRAPPER *MUST* BE FIRST !!! (Wired-in assumption in genesis)
-  (friend nil :type sb-vm:layout)
-  (clos-hash (missing-arg) :type (and fixnum unsigned-byte)) ; redundant
-  (classoid (missing-arg) :type classoid)
-  (inherits #() :type simple-vector)
-  (equalp-impl #'equalp-err :type (sfunction (t t) boolean) :read-only t)
-  (slot-table #(1 nil) :type simple-vector)
-  (%info nil :type (or list defstruct-description))
-  (invalid :uninitialized :type (or cons (member nil t :uninitialized))))
-;;; See #-metaspace structure definition for remarks about each slot.
-;;; LAYOUT points to WRAPPER and vice-versa.
-;;; The most common LAYOUT is 8 words.
-;;; Needing >64 words would be quite unusual - the layout would have
-;;; an enormous depthoid or bitmap or both.
-(sb-xc:defstruct (sb-vm:layout (:copier nil)
-                         ;; Parsing DEFSTRUCT uses a temporary layout
-                         (:constructor %make-temporary-layout (friend clos-hash)))
-  ;; !!! The FRIEND slot in LAYOUT *MUST* BE FIRST !!!
-  (friend nil :type wrapper)
-  (clos-hash (missing-arg) :type (and fixnum unsigned-byte))
-  (flags 0 :type (signed-byte #.sb-vm:n-word-bits))
-  (id-word0 0 :type word)
-  (id-word1 0 :type word)
-  (id-word2 0 :type word)
-  ;; There are zero or more raw words if a type needs to store additional layout-ids,
-  ;; and there are one or more raw words for the GC bitmap.
-  )
-(declaim (freeze-type wrapper sb-vm:layout)))
+(declaim (end-block))
 
 ;;; The cross-compiler representation of a LAYOUT omits several things:
 ;;;   * BITMAP - obtainable via (DD-BITMAP (LAYOUT-INFO layout)).
@@ -272,12 +298,9 @@
 ;;; FLAGS are computed on demand, and not stored.
 #+sb-xc-host
 (progn
-  (defstruct (wrapper (:include structure!object)
-                      (:constructor host-make-wrapper
+  (defstruct (layout (:constructor host-make-layout
                          (id clos-hash classoid
-                          &key ((:info %info)) depthoid inherits length invalid
-                          #+metaspace friend)))
-    #+metaspace (friend)
+                          &key ((:info %info)) depthoid inherits length invalid)))
     (id nil :type (or null fixnum))
     ;; Cross-compiler-only translation from slot index to symbol naming
     ;; the accessor to call. (Since access by position is not a thing)
@@ -293,13 +316,10 @@
     (depthoid -1 :type layout-depthoid)
     (length 0 :type layout-length)
     (%info nil :type (or null defstruct-description)))
-  #+metaspace (defstruct (sb-vm:layout (:include structure!object)
-                                       (:constructor %make-layout))
-                friend)
-  (defun make-temporary-wrapper (clos-hash classoid inherits)
-    (host-make-wrapper nil clos-hash classoid :inherits inherits :invalid nil))
-  (defun wrapper-flags (wrapper)
-    (declare (type wrapper wrapper))
+  (defun make-temporary-layout (clos-hash classoid inherits)
+    (host-make-layout nil clos-hash classoid :inherits inherits :invalid nil))
+  (defun layout-flags (layout)
+    (declare (type layout layout))
     (let ((mapping `((structure-object  ,+structure-layout-flag+)
                      (standard-object   ,+pcl-object-layout-flag+)
                      (pathname          ,+pathname-layout-flag+)
@@ -309,30 +329,52 @@
                      (stream            ,+stream-layout-flag+)
                      (sequence          ,+sequence-layout-flag+)))
           (flags 0))
-      (dolist (x (cons wrapper (coerce (wrapper-inherits wrapper) 'list)) flags)
-        (let ((cell (assoc (wrapper-classoid-name x) mapping)))
-          (when cell (setq flags (logior flags (second cell))))))))
-  (defun wrapper-bitmap (wrapper)
-    (acond ((wrapper-%info wrapper) (dd-bitmap it)) (t +layout-all-tagged+))))
+      (dolist (x (cons layout (coerce (layout-inherits layout) 'list)))
+        (let ((cell (assoc (layout-classoid-name x) mapping)))
+          (when cell (setq flags (logior flags (second cell))))))
+      (let ((dd (layout-%info layout)))
+        (when (or (logtest flags (logior +pathname-layout-flag+ +condition-layout-flag+))
+                  (and (logtest flags +structure-layout-flag+)
+                       dd
+                       (eq (dd-%element-type dd) 't)))
+          (setf flags (logior flags +strictly-boxed-flag+))))
+      ;; KLUDGE: I really don't care to make defstruct-with-alternate-metaclass
+      ;; any more complicated than necessary. It is unable to express that
+      ;; these funcallable instances can go on pure boxed pages.
+      ;; (The trampoline is always an assembler routine, thus ignorable)
+      (when (member (layout-classoid-name layout)
+                    '(sb-pcl::ctor sb-pcl::%method-function))
+        (setf flags (logior flags +strictly-boxed-flag+)))
+      flags))
+  (defun layout-bitmap (layout)
+    (acond ((layout-%info layout) (dd-bitmap it))
+           ;; Give T a 0 bitmap. It's arbitrary, but when we need some layout
+           ;; that has this bitmap we can use the layout of T.
+           ((eq layout (find-layout t)) 0)
+           ;; KLUDGE: PROMISE-COMPILE stuffs the layout of FUNCTION into the
+           ;; funcallable-instance it produces.  gencgc verifies that funcallable-instances
+           ;; have a bitmap with 0 bits where the trampoline word and layout are.
+           #-compact-instance-header ((eq layout (find-layout 'function)) -4)
+           (t
+            +layout-all-tagged+)))
+  (defun %layout-bitmap (layout) (layout-bitmap layout))
+) ; end PROGN #+sb-xc-host
 
 (defun equalp-err (a b)
   (bug "EQUALP ~S ~S" a b))
 
-(defmacro name->dd (name)
-  ;; This wants to be a toplevel macrolet but can't be, because the body of
-  ;; the macro (which is run in the host) wouldn't see NAME->DD as a macro
-  ;; when expanding for the target. And it can't be a toplevel FLET because
-  ;; that would demote the two using macros from toplevel.
-  `(find-defstruct-description (cond #-metaspace ((eq ,name 'sb-vm:layout) 'wrapper)
-                                     (t ,name))))
-(defmacro type-dd-length (type-name) (dd-length (name->dd type-name)))
 (defmacro get-dsd-index (type-name slot-name)
   (declare (notinline dsd-index)) ; avoid later inlining failure style-warning
-  (dsd-index (find slot-name (dd-slots (name->dd type-name)) :key #'dsd-name)))
+  (dsd-index (find slot-name
+                   (dd-slots (find-defstruct-description type-name))
+                   :key #'dsd-name)))
 
 ;;; Applicable only if bit-packed (for 64-bit architectures)
 (defmacro pack-layout-flags (depthoid length flags)
   `(logior (ash ,depthoid (+ 32 sb-vm:n-fixnum-tag-bits)) (ash ,length 16) ,flags))
+
+(defmacro type-dd-length (type-name)
+  (dd-length (find-defstruct-description type-name)))
 
 (defconstant layout-id-vector-fixed-capacity 7)
 (defmacro calculate-extra-id-words (depthoid)
@@ -343,131 +385,58 @@
   `(ceiling (max 0 (- ,depthoid ,layout-id-vector-fixed-capacity))
             ,(/ sb-vm:n-word-bytes 4)))
 
-(declaim (inline wrapper-info wrapper-dd))
-(defun wrapper-info (wrapper)
-  (let ((info (wrapper-%info wrapper))) (unless (listp info) info)))
-(defun (setf wrapper-info) (newval wrapper)
+(declaim (inline layout-dd layout-info))
+;; Use LAYOUT-DD to read LAYOUT-INFO if you want to assert that it is non-nil.
+(defun layout-dd (layout)
+  (the defstruct-description (layout-%info layout)))
+(defun layout-info (layout)
+  (let ((info (layout-%info layout)))
+    (unless (listp info) info)))
+(defun (setf layout-info) (newval layout)
   ;; The current value must be nil or a defstruct-description,
   ;; otherwise we'd clobber a non-nil slot list.
-  (aver (not (consp (wrapper-%info wrapper))))
-  (setf (wrapper-%info wrapper) newval))
-;; Use WRAPPER-DD to read WRAPPER-INFO and assert that it is non-nil.
-(defun wrapper-dd (wrapper)
-  (the defstruct-description (wrapper-%info wrapper)))
-
-;;; See the pictures above DD-BITMAP in src/code/defstruct for the details.
-(defconstant standard-gf-primitive-obj-layout-bitmap
-  #+compact-instance-header  6
-  #-compact-instance-header -4)
+  (aver (not (consp (layout-%info layout))))
+  (setf (layout-%info layout) newval))
 
 #-sb-xc-host
 (progn
-(declaim (inline bitmap-nwords bitmap-all-taggedp))
+(declaim (inline bitmap-start bitmap-nwords bitmap-all-taggedp))
+(defun bitmap-start (layout)
+  (+ (type-dd-length layout)
+     (calculate-extra-id-words (layout-depthoid layout))))
 (defun bitmap-nwords (layout)
-  (declare (sb-vm:layout layout))
-  (- (%instance-length layout) (type-dd-length sb-vm:layout)))
-
+  (declare (layout layout))
+  (- (%instance-length layout)
+     (calculate-extra-id-words (layout-depthoid layout))
+     (type-dd-length layout)))
 (defun bitmap-all-taggedp (layout)
   ;; All bitmaps have at least 1 word; read that first.
-  (and (= (%raw-instance-ref/signed-word layout (type-dd-length sb-vm:layout))
+  (and (= (%raw-instance-ref/signed-word layout (bitmap-start layout))
           +layout-all-tagged+)
        ;; Then check that there are no additional words.
-       (= (%instance-length layout) (1+ (type-dd-length sb-vm:layout)))))
-
-#+metaspace ; If metaspace, then WRAPPER has no flags; they're in the LAYOUT.
-(defmacro wrapper-flags (x) `(layout-flags (wrapper-friend ,x)))
-
-;; 32-bit has the depthoid as a slot, 64-bit has it is part of FLAGS which are
-;; in the LAYOUT
+       (= (bitmap-nwords layout) 1)))
 #+64-bit
-(defun wrapper-depthoid (wrapper) (layout-depthoid (wrapper-friend wrapper)))
-
-(defun wrapper-bitmap (wrapper)
-  (declare (type wrapper wrapper))
-  (acond ((wrapper-info wrapper) (dd-bitmap it))
-         ;; Instances lacking DD-INFO are CLOS objects, which can't generally have
-         ;; raw slots, except that funcallable-instances may have 2 raw slots -
-         ;; the trampoline and the layout. The trampoline can have a tag, depending
-         ;; on the platform, and the layout is tagged but a special case.
-         ;; In any event, the bitmap is always 1 word, and there are no "extra ID"
-         ;; words preceding it.
-         (t (the fixnum
-                 (%raw-instance-ref/signed-word (wrapper-friend wrapper)
-                                                (type-dd-length sb-vm:layout))))))
-#+64-bit
-(defmacro wrapper-length (wrapper) ; SETFable
-  `(ldb (byte 16 16) (layout-flags (wrapper-friend ,wrapper))))
-
-) ; end PROGN
+(defmacro layout-length (layout) ; SETFable
+  `(ldb (byte 16 16) (layout-flags ,layout)))
+) ; end PROGN #-sb-xc-host
 
 ;;; True of STANDARD-OBJECT, which include generic functions.
 (declaim (inline layout-for-pcl-obj-p))
-(defun layout-for-pcl-obj-p (wrapper)
-  (declare (type wrapper wrapper))
-  (logtest (wrapper-flags wrapper) +pcl-object-layout-flag+))
+(defun layout-for-pcl-obj-p (layout)
+  (declare (type layout layout))
+  (logtest (layout-flags layout) +pcl-object-layout-flag+))
 
-;;; The CLASSOID structure is a supertype of all classoid types.  A
-;;; CLASSOID is also a CTYPE structure as recognized by the type
-;;; system.  (FIXME: It's also a type specifier, though this might go
-;;; away as with the merger of SB-PCL:CLASS and CL:CLASS it's no
-;;; longer necessary)
-(def!struct (classoid
-             (:include ctype)
-             (:constructor nil)
-             (:copier nil)
-             (:print-object
-              (lambda (class stream)
-                (let ((name (classoid-name class)))
-                  (print-unreadable-object (class stream
-                                                  :type t
-                                                  :identity (not name))
-                    (format stream
-                            ;; FIXME: Make sure that this prints
-                            ;; reasonably for anonymous classes.
-                            "~:[anonymous~;~:*~S~]~@[ (~(~A~))~]"
-                            name
-                            (classoid-state class))))))
-             #-sb-xc-host (:pure nil))
-  ;; the value to be returned by CLASSOID-NAME.
-  (name nil :type symbol)
-  ;; the current WRAPPER for this class, or NIL if none assigned yet
-  (wrapper nil :type (or null wrapper))
-  ;; How sure are we that this class won't be redefined?
-  ;;   :READ-ONLY = We are committed to not changing the effective
-  ;;                slots or superclasses.
-  ;;   :SEALED    = We can't even add subclasses.
-  ;;   NIL        = Anything could happen.
-  (state nil :type (member nil :read-only :sealed))
-  ;; direct superclasses of this class. Always NIL for CLOS classes.
-  (direct-superclasses () :type list)
-  ;; Definition location
-  ;; Not used for standard-classoid, because pcl has its own mechanism.
-  (source-location nil)
-  ;; representation of all of the subclasses (direct or indirect) of
-  ;; this class. This is NIL if no subclasses or not initalized yet;
-  ;; otherwise, it's an EQ hash-table mapping CLASSOID objects to the
-  ;; subclass layout that was in effect at the time the subclass was
-  ;; created.
-  ;; Initially an alist, and changed to a hash-table at some threshold.
-  (subclasses nil :type (or list hash-table))
-  (%lock nil) ; install it just-in-time, similar to hash-table-lock
-  ;; the PCL class (= CL:CLASS, but with a view to future flexibility
-  ;; we don't just call it the CLASS slot) object for this class, or
-  ;; NIL if none assigned yet
-  (pcl-class nil))
-
-(defun wrapper-classoid-name (x)
-  (classoid-name (wrapper-classoid x)))
+(defun layout-classoid-name (x)
+  (classoid-name (layout-classoid x)))
 
 ;;;; object types to represent classes
 
 ;;; An UNDEFINED-CLASSOID is a cookie we make up to stick in forward
 ;;; referenced layouts. Users should never see them.
-(def!struct (undefined-classoid
-             (:include classoid)
-             (:copier nil)
-             (:constructor make-undefined-classoid
-                 (name &aux (%bits (pack-ctype-bits classoid name))))))
+(defstruct (undefined-classoid
+            (:include classoid)
+            (:constructor !alloc-undefined-classoid (%bits name))
+            (:copier nil)))
 
 ;;; BUILT-IN-CLASS is used to represent the standard classes that
 ;;; aren't defined with DEFSTRUCT and other specially implemented
@@ -479,22 +448,17 @@
 ;;; This translation is done when type specifiers are parsed. Type
 ;;; system operations (union, subtypep, etc.) should never encounter
 ;;; translated classes, only their translation.
-(sb-xc:defstruct (built-in-classoid (:include classoid) (:copier nil)
+(defstruct (built-in-classoid (:include classoid) (:copier nil)
                                     (:constructor !make-built-in-classoid))
   ;; the type we translate to on parsing. If NIL, then this class
-  ;; stands on its own
-  (translation nil :type (or null ctype) :read-only t)
-  (predicate nil :type (sfunction (t) boolean) :read-only t))
-#+sb-xc-host
-(defstruct (built-in-classoid (:include classoid) (:copier nil)
-                              (:constructor !make-built-in-classoid))
-  ;; until bootstrap of all CTYPEs, store a dummy value distinct from NIL
-  (translation nil :type (or null ctype (member :initializing))))
+  ;; stands on its own. Only :INITIALIZING for a period during cold
+  ;; load.
+  (translation nil :type (or null ctype (member :initializing)))
+  (predicate (missing-arg) :type (sfunction (t) boolean) :read-only t))
 
-(def!struct (condition-classoid (:include classoid)
-                                (:copier nil)
-                                (:constructor make-condition-classoid
-                                    (&key name &aux (%bits (pack-ctype-bits classoid name)))))
+(defstruct (condition-classoid (:include classoid)
+                                (:constructor !alloc-condition-classoid (%bits name))
+                                (:copier nil))
   ;; list of CONDITION-SLOT structures for the direct slots of this
   ;; class
   (slots nil :type list)
@@ -522,17 +486,16 @@
 ;;; STRUCTURE-CLASSOID represents what we need to know about structure
 ;;; classes. Non-structure "typed" defstructs are a special case, and
 ;;; don't have a corresponding class.
-(def!struct (structure-classoid
+(defstruct (structure-classoid
              (:include classoid)
-             (:copier nil)
-             (:constructor make-structure-classoid
-                           (&key name &aux (%bits (pack-ctype-bits classoid name))))))
+             (:constructor !alloc-structure-classoid (%bits name))
+             (:copier nil)))
 
 ;;;; classoid namespace
 
 ;;; We use an indirection to allow forward referencing of class
 ;;; definitions with load-time resolution.
-(def!struct (classoid-cell
+(defstruct (classoid-cell
              (:copier nil)
              (:constructor make-classoid-cell (name &optional classoid))
              (:print-object (lambda (s stream)
@@ -556,18 +519,206 @@
 ;;; STANDARD-CLASS and FUNCALLABLE-STANDARD-CLASS.  The type system
 ;;; side does not need to distinguish between STANDARD-CLASS and
 ;;; FUNCALLABLE-STANDARD-CLASS.
-(def!struct (standard-classoid (:include classoid)
-                               (:copier nil)
-                               (:constructor make-standard-classoid
-                                   (&key name pcl-class
-                                    &aux (%bits (pack-ctype-bits classoid name)))))
+(defstruct (standard-classoid
+             (:include classoid)
+             (:constructor !alloc-standard-classoid (%bits name pcl-class))
+             (:copier nil))
   old-layouts)
 ;;; a metaclass for classes which aren't standardlike but will never
 ;;; change either.
-(def!struct (static-classoid (:include classoid)
-                             (:copier nil)
-                             (:constructor make-static-classoid
-                                 (&key name &aux (%bits (pack-ctype-bits classoid name))))))
+(defstruct (static-classoid (:include classoid)
+                             (:constructor !alloc-static-classoid (%bits name))
+                             (:copier nil)))
 
 (declaim (freeze-type built-in-classoid condition-classoid
                       standard-classoid static-classoid))
+
+;;; Return the name of the global hashset that OBJ (a CTYPE instance)
+;;; would be stored in, if it were stored in one.
+;;; This is only for bootstrap, and not 100% precise as it does not know
+;;; about *EQL-TYPE-CACHE* or *MEMBER/EQ-TYPE-HASHSET*
+(defun ctype->hashset-sym (obj)
+  (macrolet ((generate  ()
+               (collect ((clauses))
+                 (dolist (type-class *type-class-list*)
+                   (dolist (instance-type (cdr type-class))
+                     (clauses
+                      (cons instance-type
+                            (unless (member instance-type '(classoid named-type))
+                              (symbolicate "*" instance-type "-HASHSET*"))))))
+                 #+sb-xc-host
+                 `(etypecase obj
+                    ,@(mapcar (lambda (x) `(,(car x) ',(cdr x))) (clauses)))
+                 ;; For cold-init, we need something guaranteed to work no matter the expansion
+                 ;; of TYPEP. If this is called too early, then the optimized code for TYPEP
+                 ;; (whatever it is) may fail. But Genesis is able to externalize an alist that
+                 ;; maps #<layout> to symbol, and it's mostly ok to compare layouts by EQ here,
+                 ;; but it fails on CLASSOID's subtypes, so recognize those specially.
+                 #-sb-xc-host
+                 (let ((alist (mapcar (lambda (x) (cons (find-layout (car x)) (cdr x)))
+                                      (clauses))))
+                   `(let ((cell (assoc (%instance-layout obj) ',alist)))
+                      (cond (cell (cdr cell))
+                            ((classoid-p obj) nil)
+                            (t (bug "ctype dumping problem"))))))))
+    (generate)))
+
+(declaim (freeze-type ctype))
+
+;;; Anything which performs TYPECASE over the type metatypes should occur
+;;; after all sructures are frozen, otherwise we'll use the inefficient
+;;; expansion of TYPECASE
+;;; Copy X to the heap, give it a random hash, and if it is a MEMBER type
+;;; then assert that all members are cacheable.
+#+sb-xc-host
+(defun copy-ctype (x)
+  (let ((bits (logior (type-%bits x) (logand (ctype-random) +ctype-hash-mask+))))
+    (etypecase x
+      (member-type
+       (!alloc-member-type bits (member-type-xset x))))))
+#-sb-xc-host
+(macrolet ((safe-member-type-elt-p (obj)
+             `(or (not (sb-vm:is-lisp-pointer (get-lisp-obj-address ,obj)))
+                  (heap-allocated-p ,obj))))
+(defun copy-ctype (x &optional (flags 0))
+  (declare (type ctype x))
+  (declare (sb-c::tlab :system) (inline !new-xset))
+  #.(cl:if (cl:and (cl:member :c-stack-is-control-stack sb-xc:*features*)
+                   sb-ext:*stack-allocate-dynamic-extent*)
+           '(aver (stack-allocated-p x)))
+  (labels ((copy (x)
+             ;; Return a heap copy of X if X was arena or stack-allocated.
+             ;; I suspect it's quicker to copy always rather than conditionally.
+             ;; The use for this is that supposing the user constructs a type specifier
+             ;; like (DOUBLE-FLOAT (2.0) 4.0) where those numbers and the inner list
+             ;; were constructed on an arena, they need to be copied.
+             (etypecase x
+               (number (sb-vm:copy-number-to-heap x))
+               (cons (cons (copy (car x)) (copy (cdr x))))
+               (symbol x)))
+           (copy-xset (xset &aux (data (xset-data xset)))
+             ;; MEMBER-TYPE is a problem because the members could be arena-allocated.
+             ;; It would be easy enough to avoid entering some instances in a hashset, though
+             ;; the larger issue is that it may be inserted into any number of other caches.
+             ;; CLHS never says whether DX objects are or aren't legal in type specifiers.
+             ;; I consider this "user error" as it seems to push the boundary of what should
+             ;; be permissible, but we can do better than to cache data that are on the stack.
+             ;; If the XSET is represented as a hash-table, we may have another issue
+             ;; which is not dealt with here (hash-table in the arena)
+             (cond ((listp data)
+                    (collect ((elts))
+                      (dolist (x data (!new-xset (elts) (xset-extra xset)))
+                        (elts (cond ((numberp x) (sb-vm:copy-number-to-heap x))
+                                    ((safe-member-type-elt-p x) x)
+                                    ;; surely things will go haywire if this occurs
+                                    (t (error "Off-heap MEMBER type member @ ~X"
+                                              (get-lisp-obj-address x))))))))
+                   ;; Huge MEMBER types are rare so I'm not going to worry too much,
+                   ;; just check whether it's OK or not
+                   ((and (loop for k being each hash-key of data
+                               always (safe-member-type-elt-p k))
+                         (heap-allocated-p data))
+                    xset)
+                   (t ; This could certainly be improved
+                    (error "Off-heap MEMBER type members")))))
+    (let ((bits (logior (type-%bits x) (logand (ctype-random) +ctype-hash-mask+) flags)))
+      ;; These cases are in descending order of frequency of seek in the hashsets.
+      ;; It matters only for backends that don't convert TYPECASE to a jump table.
+      (etypecase x
+        (values-type
+         (!alloc-values-type bits (values-type-required x) (values-type-optional x)
+                             (values-type-rest x)))
+        (fun-type ; or FUN-DESIGNATOR-TYPE
+         (let ((copy (!alloc-fun-type
+                      bits (fun-type-required x) (fun-type-optional x) (fun-type-rest x)
+                      (fun-type-keyp x) (fun-type-keywords x) (fun-type-allowp x)
+                      (fun-type-wild-args x) (fun-type-returns x))))
+           (%set-instance-layout copy (%instance-layout x))
+           copy))
+        (numeric-union-type
+         (!alloc-numeric-union-type bits (numeric-union-type-aspects x)
+                                    (map 'vector #'copy (numeric-union-type-ranges x))))
+        (compound-type ; UNION or INTERSECTION
+         (let ((copy (!alloc-union-type bits (compound-type-enumerable x)
+                                        (compound-type-types x))))
+           (%set-instance-layout copy (%instance-layout x))
+           copy))
+        (member-type
+         (!alloc-member-type bits (copy-xset (member-type-xset x))))
+        (array-type
+         (!alloc-array-type bits (copy (array-type-dimensions x))
+                            (array-type-complexp x) (array-type-element-type x)
+                            (array-type-specialized-element-type x)))
+        (hairy-type ; SATISFIES or UNKNOWN
+         (let ((copy (!alloc-hairy-type bits (copy (hairy-type-specifier x)))))
+           (%set-instance-layout copy (%instance-layout x))
+           copy))
+        (negation-type (!alloc-negation-type bits (negation-type-type x)))
+        (constant-type (!alloc-constant-type bits (constant-type-type x)))
+        (cons-type (!alloc-cons-type bits (cons-type-car-type x) (cons-type-cdr-type x)))
+        (character-set-type
+         (!alloc-character-set-type bits (copy (character-set-type-pairs x))))
+        #+sb-simd-pack
+        (simd-pack-type (!alloc-simd-pack-type bits (simd-pack-type-tag-mask x)))
+        #+sb-simd-pack-256
+        (simd-pack-256-type (!alloc-simd-pack-256-type bits (simd-pack-256-type-tag-mask x)))
+        (alien-type-type (!alloc-alien-type-type bits (alien-type-type-alien-type x)))))))
+) ; end  MACROLET
+
+#-sb-xc-host
+(progn
+(define-load-time-global *!initial-ctypes* nil)
+(defun preload-ctype-hashsets ()
+  (dolist (pair (nreverse *!initial-ctypes*))
+    (let ((instance (car pair))
+          (container (symbol-value (cdr pair))))
+      (cond ((hash-table-p container)
+             (aver (member-type-p instance))
+             ;; As of this writing there are only two EQL types to preload:
+             ;; one is in the IR1-transform of FORMAT with stream (EQL T),
+             ;; the other is CHECK-ARG-TYPE looking for (EQL DUMMY) type.
+             (let ((key (first (member-type-members instance))))
+               (aver (not (gethash key container)))
+               (setf (gethash key container) instance)))
+            (t
+             (aver (not (hashset-find container instance))) ; instances are built bottom-up
+             (hashset-insert container instance)))
+      (labels ((ensure-interned-list (list hashset)
+                 (let ((found (hashset-find hashset list)))
+                   (when (and found (neq found list))
+                     (bug "genesis failed to uniquify list-of-ctype in ~X"
+                          (get-lisp-obj-address instance)))
+                   (when (and list (not found))
+                     (hashset-insert hashset list)))
+                 (mapc #'check list))
+               ;; Assert that looking for SUBPART finds nothing or finds itself
+               (check (subpart &aux (hashset-symbol (ctype->hashset-sym subpart)))
+                 (when hashset-symbol
+                   (let* ((hashset (symbol-value hashset-symbol))
+                          (found (hashset-find hashset subpart)))
+                     (when (and found (neq found subpart))
+                       (bug "genesis dumped bad instance within ~X"
+                            (get-lisp-obj-address instance)))))))
+        (etypecase instance
+          ((or numeric-union-type member-type character-set-type ; nothing extra to do
+           #+sb-simd-pack simd-pack-type #+sb-simd-pack-256 simd-pack-256-type
+           hairy-type))
+          (args-type
+           (ensure-interned-list (args-type-required instance) *ctype-list-hashset*)
+           (ensure-interned-list (args-type-optional instance) *ctype-list-hashset*)
+           (awhen (args-type-rest instance) (check it))
+           (when (fun-type-p instance)
+             (aver (null (fun-type-keywords instance)))
+             (check (fun-type-returns instance))))
+          (cons-type
+           (check (cons-type-car-type instance))
+           (check (cons-type-cdr-type instance)))
+          (array-type
+           (check (array-type-element-type instance))
+           (check (array-type-specialized-element-type instance)))
+          (compound-type
+           (ensure-interned-list (compound-type-types instance) *ctype-set-hashset*))
+          (negation-type
+           (check (negation-type-type instance)))))))
+  #+sb-devel (setq *hashsets-preloaded* t))
+(preload-ctype-hashsets))

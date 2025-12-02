@@ -55,7 +55,17 @@
 #+arm-softfp
 (define-alien-type-method (single-float :arg-tn) (type state)
   (declare (ignore type))
-  (int-arg state 'single-float unsigned-reg-sc-number single-stack-sc-number))
+  (let ((register (arg-state-num-register-args state)))
+    (cond ((>= register +max-register-args+)
+           (let ((frame-size (arg-state-stack-frame-size state)))
+             (incf (arg-state-stack-frame-size state))
+             (make-wired-tn* 'single-float single-stack-sc-number frame-size)))
+          (t
+           (incf (arg-state-num-register-args state))
+           (list
+            (make-wired-tn* 'unsigned-byte-32 unsigned-reg-sc-number
+                            (register-args-offset register))
+            'move-single-to-int-args)))))
 
 #-arm-softfp
 (define-alien-type-method (single-float :arg-tn) (type state)
@@ -123,7 +133,9 @@
 #+arm-softfp
 (define-alien-type-method (single-float :result-tn) (type state)
   (declare (ignore type state))
-  (make-wired-tn* 'single-float unsigned-reg-sc-number nargs-offset))
+  (list (make-wired-tn* 'unsigned-byte-32 unsigned-reg-sc-number nargs-offset)
+        (make-normal-tn (primitive-type-or-lose 'single-float))
+        'move-int-args-to-single))
 
 #-arm-softfp
 (define-alien-type-method (single-float :result-tn) (type state)
@@ -247,26 +259,46 @@
 ;;;
 
 #+arm-softfp
-(define-vop (move-double-to-int-args)
-  (:args (double :scs (double-reg)))
-  (:results (lo-bits :scs (unsigned-reg))
-            (hi-bits :scs (unsigned-reg)))
-  (:arg-types double-float)
-  (:result-types unsigned-num unsigned-num)
-  (:policy :fast-safe)
-  (:generator 1
-    (inst fmrrd lo-bits hi-bits double)))
+(progn
+  (define-vop (move-double-to-int-args)
+    (:args (double :scs (double-reg)))
+    (:results (lo-bits :scs (unsigned-reg))
+              (hi-bits :scs (unsigned-reg)))
+    (:arg-types double-float)
+    (:result-types unsigned-num unsigned-num)
+    (:policy :fast-safe)
+    (:generator 1
+      (inst fmrrd lo-bits hi-bits double)))
 
-#+arm-softfp
-(define-vop (move-int-args-to-double)
-  (:args (lo-bits :scs (unsigned-reg))
-         (hi-bits :scs (unsigned-reg)))
-  (:results (double :scs (double-reg)))
-  (:arg-types unsigned-num unsigned-num)
-  (:result-types double-float)
-  (:policy :fast-safe)
-  (:generator 1
-    (inst fmdrr double lo-bits hi-bits)))
+
+  (define-vop (move-int-args-to-double)
+    (:args (lo-bits :scs (unsigned-reg))
+           (hi-bits :scs (unsigned-reg)))
+    (:results (double :scs (double-reg)))
+    (:arg-types unsigned-num unsigned-num)
+    (:result-types double-float)
+    (:policy :fast-safe)
+    (:generator 1
+      (inst fmdrr double lo-bits hi-bits)))
+
+  (define-vop (move-single-to-int-args)
+    (:args (single :scs (single-reg)))
+    (:results (bits :scs (unsigned-reg)))
+    (:arg-types single-float)
+    (:result-types unsigned-num)
+    (:policy :fast-safe)
+    (:generator 1
+      (inst fmrs bits single)))
+
+
+  (define-vop (move-int-args-to-single)
+    (:args (bits :scs (unsigned-reg)))
+    (:results (single :scs (single-reg)))
+    (:arg-types unsigned-num)
+    (:result-types single-float)
+    (:policy :fast-safe)
+    (:generator 1
+      (inst fmsr single bits))))
 
 ;;; long-long support
 (deftransform %alien-funcall ((function type &rest args) * * :node node)
@@ -343,25 +375,12 @@
 ;;; Callback
 #-sb-xc-host
 (defun alien-callback-accessor-form (type sap offset)
-  (let ((parsed-type type))
-    (if (alien-integer-type-p parsed-type)
-        (let ((bits (sb-alien::alien-integer-type-bits parsed-type)))
-               (let ((byte-offset
-                      (cond ((< bits n-word-bits)
-                             (- n-word-bytes
-                                (ceiling bits n-byte-bits)))
-                            (t 0))))
-                 `(deref (sap-alien (sap+ ,sap
-                                          ,(+ byte-offset offset))
-                                    (* ,type)))))
-        `(deref (sap-alien (sap+ ,sap ,offset) (* ,type))))))
+  `(deref (sap-alien (sap+ ,sap ,offset) (* ,type))))
 
 #-sb-xc-host
 (defun alien-callback-assembler-wrapper (index result-type argument-types)
   (flet ((make-tn (offset &optional (sc-name 'any-reg))
-           (make-random-tn :kind :normal
-                           :sc (sc-or-lose sc-name)
-                           :offset offset)))
+           (make-random-tn (sc-or-lose sc-name) offset)))
     (let* ((segment (make-segment))
            ;; How many arguments have been copied
            (arg-count 0)
@@ -371,7 +390,6 @@
            (r1-tn (make-tn 1))
            (r2-tn (make-tn 2))
            (r3-tn (make-tn 3))
-           (r4-tn (make-tn 4))
            (temp-tn (make-tn 5))
            (nsp-save-tn (make-tn 6))
            #-arm-softfp
@@ -477,21 +495,18 @@
                    (incf arg-count 1))
                   (t
                    (bug "Unknown alien floating point type: ~S" type)))))
-        ;; arg0 to FUNCALL3 (function)
-        (load-immediate-word r0-tn (static-fdefn-fun-addr 'enter-alien-callback))
-        (loadw r0-tn r0-tn)
         ;; arg0 to ENTER-ALIEN-CALLBACK (trampoline index)
-        (inst mov r1-tn (fixnumize index))
+        (inst mov r0-tn (fixnumize index))
         ;; arg1 to ENTER-ALIEN-CALLBACK (pointer to argument vector)
-        (inst mov r2-tn nsp-tn)
+        (inst mov r1-tn nsp-tn)
         ;; add room on stack for return value
         (inst sub nsp-tn nsp-tn 8)
         ;; arg2 to ENTER-ALIEN-CALLBACK (pointer to return value)
-        (inst mov r3-tn nsp-tn)
+        (inst mov r2-tn nsp-tn)
 
         ;; Call
-        (load-immediate-word r4-tn (foreign-symbol-address "funcall3"))
-        (inst blx r4-tn)
+        (load-immediate-word r3-tn (foreign-symbol-address "callback_wrapper_trampoline"))
+        (inst blx r3-tn)
 
         ;; Result now on top of stack, put it in the right register
         (cond

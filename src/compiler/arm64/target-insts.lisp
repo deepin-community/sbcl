@@ -197,7 +197,7 @@
     (if (= (length value) 3)
         (destructuring-bind (size opc reg) value
           (cond ((zerop v)
-                 (when (= size #b10)
+                 (when (/= size #b11)
                    (princ "W" stream))
                  (princ (svref *register-names* reg) stream))
                 (t
@@ -237,13 +237,157 @@
                 "S")
             value)))
 
+(defun decode-vector-size (q size)
+  (case q
+    (0
+     (case size
+       (#b00 "8B")
+       (#b01 "4H")
+       (#b10 "2S")))
+    (1
+     (case size
+       (#b00 "16B")
+       (#b01 "8H")
+       (#b10 "4S")
+       (#b11 "2D")))))
+
 (defun print-simd-reg (value stream dstate)
   (declare (ignore dstate))
-  (destructuring-bind (size offset) value
+  (multiple-value-bind (q size offset)
+      (if (= (length value) 3)
+          (destructuring-bind (q size offset) value
+            (values q size offset))
+          (destructuring-bind (q offset) value
+            (values q 0 offset)))
     (format stream "V~d.~a" offset
-            (if (zerop size)
+            (decode-vector-size q size))))
+
+(defun print-simd-immh-reg (value stream dstate)
+  (declare (ignore dstate))
+  (if (= (length value) 2)
+      (destructuring-bind (immh offset) value
+        (format stream "V~d.~a" offset
+                (cond ((logbitp 0 immh)
+                       "8H")
+                      ((logbitp 1 immh)
+                       "4S")
+                      ((logbitp 2 immh)
+                       "2D"))))
+      (destructuring-bind (q immh offset) value
+        (format stream "V~d.~a" offset
+                (cond ((= immh 1)
+                       (if (zerop q)
+                           "8B"
+                           "16B"))
+                      ((= (ash immh -1) 1)
+                       (if (zerop q)
+                           "4H"
+                           "8H"))
+                      ((= (ash immh -2) 1)
+                       (if (zerop q)
+                           "2S"
+                           "4S"))
+                      ((= (ash immh -3) 1)
+                       "2D"))))))
+
+(defun print-simd-immh-shift-right (value stream dstate)
+  (declare (ignore dstate))
+  (destructuring-bind (immh immb) value
+    (let ((imm (logior (ash immh 3) immb)))
+      (format stream "#~a" (- (ash 1 (1- (integer-length imm)))
+                              (ldb (byte (1- (integer-length imm)) 0)
+                                   imm))))))
+(defun print-simd-immh-shift-left (value stream dstate)
+  (declare (ignore dstate))
+  (destructuring-bind (immh immb) value
+    (let ((imm (logior (ash immh 3) immb)))
+      (format stream "#~a" (ldb (byte (1- (integer-length imm)) 0)
+                                imm)))))
+
+(defun print-simd-reg-cmode (value stream dstate)
+  (declare (ignore dstate))
+  (destructuring-bind (q cmode offset op) value
+    (format stream "V~d.~a" offset
+            (cond ((eq cmode #b1110)
+                   (if (eq op 1)
+                       (if (zerop q)
+                           ""
+                           "2D")
+                       (if (zerop q)
+                           "8B"
+                           "16B")))
+                  ((eq (logandc2 cmode #b10) #b1000)
+                   (if (zerop q)
+                       "4H"
+                       "8H"))
+                  ((zerop (logand cmode #b1001))
+                   (if (zerop q)
+                       "2S"
+                       "4S"))))))
+
+(defun print-simd-table-regs (value stream dstate)
+  (declare (ignore dstate))
+  (destructuring-bind (len offset) value
+    (format stream "{")
+    (loop for i to len
+          do (format stream " V~d.16B" (+ i offset))
+             (unless (= i len)
+               (write-char #\, stream)))
+    (format stream " }")))
+
+(defun print-simd-b-reg (value stream dstate)
+  (declare (ignore dstate))
+  (destructuring-bind (q offset) value
+    (format stream "V~d.~a" offset
+            (if (zerop q)
                 "8B"
                 "16B"))))
+
+(defun print-simd-modified-imm (value stream dstate)
+  (declare (ignore dstate))
+  (destructuring-bind (abc cmode defgh) value
+    (let ((shift
+            (cond ((eq cmode #b1110)
+                   0)
+                  ((zerop (logand cmode #b1001))
+                   (ash cmode 2))
+                  (t 0))))
+      (princ (dpb abc (byte 3 5) defgh) stream)
+      (when (plusp shift)
+        (format stream ", LSL #~d" shift)))))
+
+(defun decode-fp-immediate (imm type)
+  (let ((sign (ldb (byte 1 7) imm))
+        (exp (ldb (byte 3 4) imm))
+        (frac (ldb (byte 4 0) imm)))
+    (case type
+      (double-float
+       (sb-kernel::double-from-bits
+        sign
+        (logior (ash (logandc1 (ldb (byte 1 2) exp) 1) 10)
+                (ash (if (zerop (ldb (byte 1 2) exp))
+                         0
+                         (ldb (byte 8 0) -1))
+                     2)
+                (ldb (byte 2 0) exp))
+        (ash frac 48)))
+      (single-float
+       (sb-kernel::single-from-bits
+        sign
+        (logior (ash (logandc1 (ldb (byte 1 2) exp) 1) 7)
+                (ash (if (zerop (ldb (byte 1 2) exp))
+                         0
+                         (ldb (byte 5 0) -1))
+                     2)
+                (ldb (byte 2 0) exp))
+        (ash frac 19))))))
+
+(defun print-fp-imm (value stream dstate)
+  (declare (ignore dstate))
+  (destructuring-bind (type imm) value
+    (format stream "#~a" (decode-fp-immediate imm (if (= type 0)
+                                                      'single-float
+                                                      'double-float)))))
 
 (defun print-vbhs (value stream dstate)
   (declare (ignore dstate))
@@ -299,6 +443,31 @@
                  (ash imm4 (- index))
                  (ash imm5 (- (1+ index))))))))
 
+(defun print-simd-dup-reg (value stream dstate)
+  (declare (ignore dstate))
+  (destructuring-bind (offset q imm5) value
+    (format stream "V~d.~a" offset
+            (cond ((= imm5 #b1)
+                   (if (zerop q)
+                       "8B"
+                       "16B"))
+                  ((= imm5 #b10)
+                   (if (zerop q)
+                       "4H"
+                       "8H"))
+                  ((= imm5 #b100)
+                   (if (zerop q)
+                       "2S"
+                       "4S"))
+                  ((= imm5 #b1000)
+                   "2D")))))
+
+(defun print-simd-float-reg (value stream dstate)
+  (declare (ignore dstate))
+  (destructuring-bind (q size offset) value
+    (format stream "V~d.~a" offset
+            (decode-vector-size q (logior #b10 size)))))
+
 (defun print-sys-reg (value stream dstate)
   (declare (ignore dstate))
   (princ (decode-sys-reg value) stream))
@@ -307,17 +476,42 @@
   (declare (ignore dstate))
   (princ (svref +condition-name-vec+ value) stream))
 
+(defun print-negated-cond (value stream dstate)
+  (print-cond (logxor 1 value) stream dstate))
+
 (defun use-label (value dstate)
   (let* ((value (if (consp value)
                     (logior (ldb (byte 2 0) (car value))
                             (ash (cadr value) 2))
                     (ash value 2)))
          (address (+ value (dstate-cur-addr dstate))))
-    ;; LRA pointer
-    (if (= (logand address lowtag-mask) other-pointer-lowtag)
-        (- address (- other-pointer-lowtag n-word-bytes))
+    (maybe-note-assembler-routine address nil dstate)
+    ;; Reference to a function within this code object.
+    (or (and (= (logand address lowtag-mask) fun-pointer-lowtag)
+             (let* ((seg (dstate-segment dstate))
+                    (code (seg-code seg))
+                    (offset (+ (sb-disassem::seg-initial-offset seg)
+                               (dstate-cur-offs dstate)
+                               (- value fun-pointer-lowtag))))
+               (loop for n below (code-n-entries code)
+                     do (when (= (%code-fun-offset code n) offset)
+                          (let ((fun (%code-entry-point code n)))
+                            (note (lambda (stream) (prin1-quoted-short fun stream)) dstate))
+                          (return (- address fun-pointer-lowtag))))))
         address)))
 
+(defun annotate-add-sub-imm (value stream dstate)
+  (declare (ignore stream))
+  (destructuring-bind (register shift offset) value
+    (case register
+      (#.sb-vm::null-offset
+       (let ((inst (current-instruction dstate))
+             (offset (+ sb-vm:nil-value
+                        (if (= shift 1)
+                            (ash offset 12)
+                            offset))))
+         (when (zerop (ldb (byte 2 29) inst)) ;; ADD
+           (maybe-note-static-symbol offset dstate)))))))
 
 (defun annotate-ldr-str (register offset dstate)
   (case register
@@ -353,21 +547,34 @@
                  (note (lambda (stream) (format stream "tls: ~S" symbol))
                        dstate)))))))))
 
-(defun find-value-from-previos-inst (register dstate)
+(defun find-value-from-previous-inst (register dstate)
   ;; Needs to be MOVZ REGISTER, imm, LSL #0
   ;; Should cover most offsets in sane code
   (let ((inst (current-instruction dstate -4)))
-    (when (and (= (ldb (byte 9 23) inst) #b110100101) ;; MOVZ
-               (= (ldb (byte 5 0) inst) register)
-               (= (ldb (byte 2 21) inst) 0)) ;; LSL #0
-      (ldb (byte 16 5) inst))))
+    (cond ((and (= (ldb (byte 9 23) inst) #b110100101) ;; MOVZ
+                (= (ldb (byte 5 0) inst) register)
+                (= (ldb (byte 2 21) inst) 0)) ;; LSL #0
+           (ldb (byte 16 5) inst))
+          ((and (= (ldb (byte 6 26) inst) #b010110) ;; LDR literal
+                (= (ldb (byte 5 0) inst) register))
+           (let ((value (sb-disassem::code-constant-value
+                         (sb-disassem::segment-offs-to-code-offs
+                          (+ (dstate-cur-offs dstate)
+                             -4
+                             (* (sb-c::mask-signed-field 19 (ldb (byte 19 5) inst))
+                                4))
+                          (dstate-segment dstate))
+                         dstate)))
+             (when (fixnump value)
+               (fixnumize value)))))))
 
 (defun annotate-ldr-str-reg (value stream dstate)
   (declare (ignore stream))
   (let* ((inst (current-instruction dstate))
          (float (ldb-test (byte 1 26) inst)))
     (unless float
-      (let ((value (find-value-from-previos-inst value dstate)))
+      (let ((value (and (seg-code (sb-disassem:dstate-segment dstate))
+                        (find-value-from-previous-inst value dstate))))
         (when value
           (annotate-ldr-str (ldb (byte 5 5) inst) value dstate))))))
 
@@ -383,8 +590,9 @@
                         dstate))))
 
 (defun annotate-ldr-str-pair (value stream dstate)
-  (declare (ignore stream))
+  (declare (ignore stream) (ignorable dstate))
   (destructuring-bind (reg offset) value
+    (declare (ignorable offset))
     (case reg
       #+sb-thread
       (#.sb-vm::thread-offset
@@ -396,25 +604,60 @@
               (slot2 (find (1+ offset) thread-slots :key #'slot-offset)))
          (when slot1
            (note (lambda (stream)
-                   (if (memq (slot-name slot1) '(sb-vm::boxed-tlab
+                   (if (memq (slot-name slot1) '(sb-vm::mixed-tlab
+                                                 sb-vm::cons-tlab
                                                  sb-vm::unboxed-tlab))
                        (format stream "~(~a~).{free-pointer, end-addr}" (slot-name slot1))
                        (format stream "~(~A, ~A~)" (slot-name slot1) (slot-name slot2))))
                  dstate)))))))
 
+(defun print-stlxr/ldaxr-mnemonic (dchunk inst stream dstate)
+  (declare (ignore dstate))
+  ;; SIZE can't be constrained in the :PRINTER spec because there are two
+  ;; different values that should print the same. Also, we're printing the wrong
+  ;; size for 4 byte because 32-BIT-REGISTER-P tests bit index 31, but it's index 30
+  ;; that distinguishes those two cases. The 2-bit field would probably need to
+  ;; become two 1-bit fields to correct the disassembly.
+  (let ((suffix (case (ldb (byte 2 30) dchunk)
+                  (#b00 "B")
+                  (#b01 "H")
+                  (t ""))))
+    (when stream
+      (format stream "~A~A" (sb-disassem::inst-print-name inst) suffix))))
+
 (defun annotate-ldr-literal (value stream dstate)
   (declare (ignore stream))
   (let* ((value (* 4 value))
          (seg (dstate-segment dstate))
-         (code (seg-code seg)))
+         (code (seg-code seg))
+         (inst (current-instruction dstate))
+         (v (ldb (byte 1 26) inst))
+         (addr (+ (dstate-cur-addr dstate) value)))
     (when code
-      (or (note-code-constant (sb-disassem::segment-offs-to-code-offs
-                               (+ (dstate-cur-offs dstate) value) seg)
-                              dstate)
-          (let ((addr (+ (dstate-cur-addr dstate) value)))
-            (and (sb-disassem::points-to-code-constant-p addr code)
-                 (maybe-note-assembler-routine (sap-ref-word (int-sap addr) 0)
-                                               nil dstate)))))))
+      (if (plusp v)
+          (when (sb-disassem::points-to-code-constant-p addr code)
+            (case (ldb (byte 2 30) inst)
+              (#b00
+               (note (lambda (stream)
+                       (format stream "~a" (sap-ref-single (int-sap addr) 0)))
+                     dstate))
+              (#b01
+               (note
+                (lambda (stream)
+                  (format stream "~a" (sap-ref-double (int-sap addr) 0)))
+                dstate))
+              (#b10
+               (note
+                (lambda (stream)
+                  (format stream "~x ~x"(sap-ref-double (int-sap addr) 0)
+                          (sap-ref-double (int-sap addr) 8)))
+                dstate))))
+          (or (note-code-constant (sb-disassem::segment-offs-to-code-offs
+                                   (+ (dstate-cur-offs dstate) value) seg)
+                                  dstate)
+              (and (sb-disassem::points-to-code-constant-p addr code)
+                   (maybe-note-assembler-routine (sap-ref-word (int-sap addr) 0)
+                                                 nil dstate)))))))
 
 ;;;; special magic to support decoding internal-error and related traps
 ;;; See EMIT-ERROR-BREAK for the scheme
@@ -429,6 +672,8 @@
                           (prog1 (sap-ref-8 sap offset)
                             (incf offset)))))
          (first-arg (ldb (byte 8 13) inst))
+         (first-offset (ldb (byte 5 0) first-arg))
+         (first-sc (ldb (byte 2 5) first-arg))
          (length (sb-kernel::error-length error-number))
          (index offset))
     (declare (type sb-sys:system-area-pointer sap)
@@ -442,8 +687,11 @@
           (t
            (collect ((sc+offsets)
                      (lengths))
-             (unless (= first-arg sb-vm::zr-offset)
-               (sc+offsets (make-sc+offset sb-vm:descriptor-reg-sc-number first-arg))
+             (unless (= first-offset sb-vm::zr-offset)
+               (sc+offsets (make-sc+offset (case first-sc
+                                             (1 sb-vm:unsigned-reg-sc-number)
+                                             (2 sb-vm:signed-reg-sc-number)
+                                             (t sb-vm:descriptor-reg-sc-number)) first-offset))
                (lengths 0))
              (loop repeat length do
                    (let ((old-index index))

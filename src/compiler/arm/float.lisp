@@ -114,18 +114,14 @@
 ;;;; Complex float move functions
 
 (defun complex-single-reg-real-tn (x)
-  (make-random-tn :kind :normal :sc (sc-or-lose 'single-reg)
-                  :offset (tn-offset x)))
+  (make-random-tn (sc-or-lose 'single-reg) (tn-offset x)))
 (defun complex-single-reg-imag-tn (x)
-  (make-random-tn :kind :normal :sc (sc-or-lose 'single-reg)
-                  :offset (1+ (tn-offset x))))
+  (make-random-tn (sc-or-lose 'single-reg) (1+ (tn-offset x))))
 
 (defun complex-double-reg-real-tn (x)
-  (make-random-tn :kind :normal :sc (sc-or-lose 'double-reg)
-                  :offset (tn-offset x)))
+  (make-random-tn (sc-or-lose 'double-reg) (tn-offset x)))
 (defun complex-double-reg-imag-tn (x)
-  (make-random-tn :kind :normal :sc (sc-or-lose 'double-reg)
-                  :offset (+ 2 (tn-offset x))))
+  (make-random-tn (sc-or-lose 'double-reg) (+ 2 (tn-offset x))))
 
 
 (define-move-fun (load-complex-single 2) (vop x y)
@@ -362,7 +358,7 @@
 (define-vop (fsqrts)
   (:args (x :scs (single-reg)))
   (:results (y :scs (single-reg)))
-  (:translate %sqrt)
+  (:translate %sqrtf)
   (:policy :fast-safe)
   (:arg-types single-float)
   (:result-types single-float)
@@ -442,9 +438,9 @@
                 (:args (x :scs (,sc)))
                 (:arg-types ,ptype (:constant, constant-type)))))
   (frob single-float-compare-zero single-reg single-float
-        (single-float $-0f0 $0f0))
+        (single-float -0f0 0f0))
   (frob double-float-compare-zero double-reg double-float
-        (double-float $-0d0 $0d0)))
+        (double-float -0d0 0d0)))
 
 (macrolet ((frob (translate cond sname dname is-=)
              `(progn

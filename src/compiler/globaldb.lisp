@@ -51,26 +51,23 @@
 ;;; sources partway through bootstrapping, tch tch, overwriting its
 ;;; version with our version would be unlikely to help, because that
 ;;; would make the cross-compiler very confused.)
-(defun !register-meta-info (metainfo)
+(defun register-meta-info (metainfo)
   (let* ((name (meta-info-kind metainfo))
-         (list (!get-meta-infos name)))
+         (list (get-meta-infos name)))
     (set-info-value name +info-metainfo-type-num+
                     (cond ((not list) metainfo) ; unique, just store it
                           ((listp list) (cons metainfo list)) ; prepend to the list
                           (t (list metainfo list)))))) ; convert atom to a list
 
-(defun !%define-info-type (category kind type-spec type-checker
-                           validate-function default &optional id)
+(defun !%define-info-type
+    (id category kind type-spec type-checker validate-function default)
   (awhen (meta-info category kind nil) ; if found
-    (when id
-      (aver (= (meta-info-number it) id)))
+    (aver (= (meta-info-number it) id))
     (return-from !%define-info-type it)) ; do nothing
-  (let ((id (or id (position nil *info-types* :start 1)
-                   (error "no more INFO type numbers available"))))
-    (!register-meta-info
-     (setf (aref *info-types* id)
-           (!make-meta-info id category kind type-spec type-checker
-                            validate-function default)))))
+  (register-meta-info
+   (setf (aref *info-types* id)
+         (!make-meta-info id category kind type-spec type-checker
+                          validate-function default))))
 
 
 ;;;; info types, and type numbers, part II: what's
@@ -92,57 +89,90 @@
 ;;;  :DEFAULT (CONSTANTLY #'<a-function-name>) to adhere to the convention
 ;;; that default objects satisfying FUNCTIONP will always be funcalled.
 ;;;
-(defmacro define-info-type ((category kind)
+(eval-when (:compile-toplevel :execute)
+(defun pick-info-number (category kind)
+  (let ((pos (position (cons category kind) *info-priority-order* :test 'equal)))
+    (cond (pos
+           (let ((info (aref *info-types* pos)))
+             (when info
+               (aver (eq (meta-info-category info) category))
+               (aver (eq (meta-info-kind info) kind)))
+             pos))
+          ((and (eq category :function) (eq kind :definition))
+           +fdefn-info-num+)
+          (t
+           ;; find an existing index or available index. Since the unused cells get populated
+           ;; in order, we can stop searching at the first NULL.
+           (the fixnum
+                (position-if
+                 (lambda (x)
+                   (cond ((null x) t)
+                         ((listp x) (and (eq (car x) category) (eq (cdr x) kind)))
+                         (t (and (eq (meta-info-category x) category)
+                                 (eq (meta-info-kind x) kind)))))
+                 *info-types*
+                 :start (length *info-priority-order*))))))))
+
+(defvar *globaldb-defaulting-exprs* nil)
+(defvar *globaldb-validate-exprs* nil)
+(eval-when (:compile-toplevel :execute) ; no load-time definition
+(#+sb-xc-host cl:defmacro
+ #-sb-xc-host sb-xc:defmacro
+ define-info-type ((category kind)
                             &key (type-spec (missing-arg))
                                  (validate-function)
                                  default)
   (declare (type keyword category kind))
-  ;; There was formerly a remark that (COPY-TREE TYPE-SPEC) ensures repeatable
-  ;; fasls. That's not true now, probably never was. A compiler is permitted to
-  ;; coalesce EQUAL quoted lists and there's no defense against it, so why try?
-  `(!cold-init-forms
-    (!%define-info-type
-     ,category ,kind ',type-spec
-     ,(if (eq type-spec 't)
-          '#'identity
-          `(named-lambda "check-type" (x) (the ,type-spec x)))
-     ,validate-function ,default
-     ;; Rationale for hardcoding here is explained at INFO-VECTOR-FDEFN.
-     ,(or (and (eq category :function) (eq kind :definition)
-               +fdefn-info-num+)
-          #+sb-xc (meta-info-number (meta-info category kind))))))
+  (let ((num (pick-info-number category kind)))
+    `(progn
+       #+sb-xc-host ; don't mess up the *INFO-TYPES* in make-host-2
+       (eval-when (:compile-toplevel)
+         (setf (aref *info-types* ,num) (cons ,category ,kind)))
+       #-sb-xc-host
+       ,@(append
+          (when (consp default)
+            `((setf *globaldb-defaulting-exprs*
+                    (cons '(,num . ,default)
+                          (remove ,num *globaldb-defaulting-exprs* :key 'car)))))
+          (when validate-function
+            `((setf *globaldb-validate-exprs*
+                    (cons '(,num . ,validate-function)
+                          (remove ,num *globaldb-validate-exprs* :key 'car))))))
+       (!cold-init-forms
+        (!%define-info-type
+         ,num ,category ,kind ',type-spec
+         ,(if (eq type-spec 't)
+              '#'identity
+              `(named-lambda "check-type" (x) (the ,type-spec x)))
+         ,validate-function ,default))))))
 ;; It's an external symbol of SB-INT so wouldn't be removed automatically
 (push '("SB-INT" define-info-type) *!removable-symbols*)
 
 
-(macrolet ((meta-info-or-lose (category kind)
-             ;; don't need to type-check META-INFO's result, since it
-             ;; defaults to signaling an error if no meta-info found.
-             `(truly-the meta-info (meta-info ,category ,kind))))
 ;;; INFO is the standard way to access the database. It's settable.
 ;;;
 ;;; Return the information of the specified CATEGORY and KIND for NAME.
 ;;; The second value returned is true if there is any such information
 ;;; recorded. If there is no information, the first value returned is
 ;;; the default and the second value returned is NIL.
-  (defun info (category kind name)
-    (let ((info (meta-info category kind)))
-      (get-info-value name (meta-info-number info))))
+(defun info (category kind name)
+  (let ((info (meta-info category kind)))
+    (get-info-value name (meta-info-number info))))
 
-  (defun (setf info) (new-value category kind name)
-    (let ((info (meta-info category kind)))
-      (funcall (meta-info-type-checker info) new-value)
-      (awhen (meta-info-validate-function info)
-        (funcall it name new-value))
-      (set-info-value name (meta-info-number info) new-value)))
+(defun (setf info) (new-value category kind name)
+  (let ((info (meta-info category kind)))
+    (funcall (meta-info-type-checker info) new-value)
+    (awhen (meta-info-validate-function info)
+      (funcall it name new-value))
+    (set-info-value name (meta-info-number info) new-value)))
 
-  ;; Clear the information of the specified CATEGORY and KIND for NAME in
-  ;; the current environment. Return true if there was any info.
-  (defun clear-info (category kind name)
-    (let* ((info (meta-info category kind))
-           (info-number-list (list (meta-info-number info))))
-      (declare (dynamic-extent info-number-list))
-      (clear-info-values name info-number-list))))
+;; Clear the information of the specified CATEGORY and KIND for NAME in
+;; the current environment. Return true if there was any info.
+(defun clear-info (category kind name)
+  (let* ((info (meta-info category kind))
+         (info-number-list (list (meta-info-number info))))
+    (declare (dynamic-extent info-number-list))
+    (clear-info-values name info-number-list)))
 
 (defun clear-info-values (name info-numbers)
   (dolist (type info-numbers)
@@ -200,22 +230,23 @@
 (declaim (ftype (sfunction (t info-number) (values t boolean))
                 get-info-value))
 (defun get-info-value (name info-number)
+  ;; #+sb-xc-host (incf (aref *get-info-value-histo* info-number))
   (let* ((hook *globaldb-observer*)
          (hookp (and (and hook
                           (not (eql 0 (car hook)))
                           (logbitp info-number (car hook))))))
-    (multiple-value-bind (vector aux-key)
+    (multiple-value-bind (packed-info aux-key)
         (let ((name (uncross name)))
           (with-globaldb-name (key1 key2) name
            ;; In the :simple branch, KEY1 is no doubt a symbol,
            ;; but constraint propagation isn't informing the compiler here.
-           :simple (values (symbol-info-vector (truly-the symbol key1)) key2)
+           :simple (values (symbol-dbinfo (truly-the symbol key1)) key2)
            :hairy (values (info-gethash name *info-environment*)
                           +no-auxiliary-key+)))
-      (when vector
-        (let ((index (packed-info-value-index vector aux-key info-number)))
+      (when packed-info
+        (let ((index (packed-info-value-index packed-info aux-key info-number)))
           (when index
-            (let ((answer (svref vector index)))
+            (let ((answer (%info-ref packed-info index)))
               (when hookp
                 (funcall (truly-the function (cdr hook))
                          name info-number answer t))
@@ -228,7 +259,13 @@
 
 (!begin-collecting-cold-init-forms)
 ;;;; ":FUNCTION" subsection - Data pertaining to globally known functions.
-(define-info-type (:function :definition) :type-spec #-sb-xc-host (or fdefn null) #+sb-xc-host t)
+;;; As a special case, this info stores the interpreter's handler for sb-fasteval.
+;;; There is no ambiguity, because a symbol naming a function will never store
+;;; its fdefn in packed-info. Therefore if :function :definition is present
+;;; for a symbol, it must be the special-form handler. In that case it is a cons
+;;; of the deferred and immediate handlers (in that order)
+(define-info-type (:function :definition) :type-spec #-sb-xc-host (or fdefn list)
+                                                     #+sb-xc-host t)
 
 ;;; the kind of functional object being described. If null, NAME isn't
 ;;; a known functional object.
@@ -246,11 +283,6 @@
                  (if (or (fboundp name) (pcl-methodfn-name-p name))
                      :function
                      nil)))
-
-;;; The deferred mode processor for fasteval special operators.
-;;; Immediate processors are hung directly off symbols in a dedicated slot.
-#+sb-fasteval
-(define-info-type (:function :interpreter) :type-spec (or function null))
 
 ;;; Indicates whether the function is deprecated.
 (define-info-type (:function :deprecated)
@@ -271,7 +303,7 @@
   :default (lambda (name)
              (declare (ignorable name))
              #+sb-xc-host (specifier-type 'function)
-             #-sb-xc-host (sb-impl::ftype-from-fdefn name)))
+             #-sb-xc-host (sb-c::ftype-from-definition name)))
 
 ;;; the ASSUMED-TYPE for this function, if we have to infer the type
 ;;; due to not having a declaration or definition
@@ -279,11 +311,7 @@
 ;;; property as either (:known . #<ctype>) or (:assumed . #<ctype>)
 ;;; rather than using two different properties. Do we ever use *both* ?
 (define-info-type (:function :assumed-type)
-  ;; FIXME: The type-spec really should be
-  ;;   (or approximate-fun-type null)).
-  ;; It was changed to T as a hopefully-temporary hack while getting
-  ;; cold init problems untangled.
-  :type-spec t)
+  :type-spec (or sb-c::approximate-fun-type null))
 
 ;;; where this information came from:
 ;;;    :ASSUMED  = from uses of the object
@@ -320,28 +348,6 @@
 ;;; This specifies whether this function may be expanded inline. If
 ;;; null, we don't care.
 (define-info-type (:function :inlinep) :type-spec sb-c::inlinep)
-
-;;; Track how many times IR2 converted a call to this function as a full call
-;;; that was not in the scope of a local or global notinline declaration.
-;;; Useful for finding functions that were supposed to have been converted
-;;; through some kind of transformation but were not.
-(define-info-type (:function :emitted-full-calls) :type-spec list)
-
-;; Return the number of calls to NAME that IR2 emitted as full calls,
-;; not counting calls via #'F that went untracked.
-;; Return 0 if the answer is nonzero but a warning was already signaled
-;; about any full calls were emitted. This return convention satisfies the
-;; intended use of this statistic - to decide whether to generate a warning
-;; about failure to inline NAME, which is shown at most once per name
-;; to avoid unleashing a flood of identical warnings.
-(defun emitted-full-call-count (name)
-  (let ((status (car (info :function :emitted-full-calls name))))
-     (and (integerp status)
-          ;; Bit 0 tells whether any call was NOT in the presence of
-          ;; a 'notinline' declaration, thus eligible to be inline.
-          ;; Bit 1 tells whether any warning was emitted yet.
-          (= (logand status 3) #b01)
-          (ash status -2)))) ; the call count as tracked by IR2
 
 ;;; a macro-like function which transforms a call to this function
 ;;; into some other Lisp form. This expansion is inhibited if inline
@@ -389,6 +395,8 @@
 ;;;   (AND (SATISFIES UNINTERESTING-METHOD-REDEFINITION-P) RATIONAL)
 ;;; is *empty-type*, which in turn avoids type cache pollution.
 (define-info-type (:function :predicate-truth-constraint) :type-spec t)
+
+(define-info-type (:function :specialized-xep) :type-spec t)
 
 ;;;; ":VARIABLE" subsection - Data pertaining to globally known variables.
 
@@ -409,18 +417,34 @@
 ;;; the declared type for this variable
 (define-info-type (:variable :type)
   :type-spec ctype
-  :default #+sb-xc-host (lambda (x)
-                          (declare (special *universal-type*) (ignore x))
-                          *universal-type*)
-           #-sb-xc-host *universal-type*)
+  :default (lambda (name)
+             (declare (ignore name)
+                      #+sb-xc-host (special *universal-type*))
+             *universal-type*))
 
 ;;; where this type and kind information came from
 (define-info-type (:variable :where-from)
   :type-spec (member :declared :assumed :defined) :default :assumed)
 
+;;; a list of forward references to this constant.
+(define-info-type (:variable :forward-references)
+  :type-spec list)
+
 ;;; the macro-expansion for symbol-macros
 (define-info-type (:variable :macro-expansion) :type-spec t)
 
+(in-package "SB-ALIEN")
+;;; Information describing a heap-allocated alien.
+(defstruct (heap-alien-info (:copier nil))
+  ;; The type of this alien.
+  (type (missing-arg) :type alien-type)
+  ;; Its name.
+  (alien-name (missing-arg) :type simple-string)
+  ;; Data or code?
+  (datap (missing-arg) :type boolean))
+(!set-load-form-method heap-alien-info (:xc :target))
+
+(in-package "SB-IMPL")
 (define-info-type (:variable :alien-info)
   :type-spec (or null sb-alien-internals:heap-alien-info))
 
@@ -435,6 +459,12 @@
 ;;     Note that this does not affect elision of the check for unbound-marker
 ;;     which is under control of the :ALWAYS-BOUND info.
 ;;  - an integer is a permanent index, and also implies :ALWAYS-THREAD-LOCAL.
+;;    This last case is theoretically subsumed by the former, because
+;;    :ALWAYS-THREAD-LOCAL can resolve to a TLS index at load-time, at least for
+;;    the SET vop. The down-side is that some CPU architectures might have trouble
+;;    with an unknown integer in instructions that have [thread+n] addressing mode
+;;    where the immediate operand size is not as generous as for x86.
+;;    e.g.. what if the imm operand exceeds (signed-byte 16) for PPC?
 ;; Specials in the CL package (notably reader/printer controls) use a wired-tls,
 ;; whether or not we bind per-thread [if we don't, that's a bug!]
 ;; We don't assume wired TLS more generally, because user code often defines
@@ -487,10 +517,10 @@
 
 ;;; wrapper for this type being used by the compiler
 (define-info-type (:type :compiler-layout)
-  :type-spec (or wrapper null)
+  :type-spec (or layout null)
   :default (lambda (name)
              (let ((class (find-classoid name nil)))
-               (and class (classoid-wrapper class)))))
+               (and class (classoid-layout class)))))
 
 ;;; DEFTYPE lambda-list
 ;; FIXME: remove this after making swank-fancy-inspector not use it.
@@ -528,6 +558,12 @@
                              (t
                               (setq *recognized-declarations*
                                     (delete name *recognized-declarations*))))))
+
+(setf (sb-int:info :declaration :known 'sb-c::tlab)
+      (lambda (res spec vars fvars)
+        (declare (ignore vars fvars))
+        (sb-c::make-lexenv :default res
+                           :user-data `((:declare ,@spec)))))
 
 ;;;; ":ALIEN-TYPE" subsection - Data pertaining to globally known alien-types.
 (define-info-type (:alien-type :kind)
@@ -570,6 +606,13 @@
 (define-info-type (:source-location :declaration) :type-spec t)
 (define-info-type (:source-location :alien-type) :type-spec t)
 
+;;; If we used the maximum number of IDs available, a package gets no ID.
+;;; Any symbols in that package must use SYMBOL-DBINFO for their package.
+;;; Technically we can't store NIL, because that would be package ID 0,
+;;; i.e. directly represented in the symbol, but this type spec has to be
+;;; correct for what INFO can return, not what it may store.
+(define-info-type (:symbol :package) :type-spec (or package null))
+
 (!defun-from-collected-cold-init-forms !info-type-cold-init)
 
 #-sb-xc-host
@@ -583,7 +626,7 @@
 
 ;; This is for the SB-INTROSPECT contrib module, and debugging.
 (defun call-with-each-info (function symbol)
-  (awhen (symbol-info-vector symbol)
+  (awhen (symbol-dbinfo symbol)
     (%call-with-each-info function it symbol)))
 
 ;; This is for debugging at the REPL.
@@ -600,3 +643,27 @@
                      (list (meta-info-category type) (meta-info-kind type))))
          (write val :level 2)))
      sym)))
+
+#-sb-xc-host
+(defun !recompile-globaldb-checkfuns ()
+  ;; Recompiling these expressions allows GCing of the single code component (~11KB)
+  ;; dumped by the cross-compiler containing 50 toplevel forms plus all the fragments
+  ;; of code for the various type checks. And consolidate the type-check functions
+  ;; because often 1 function can be reused for several pieces of info.
+  (loop for (id . lexpr) in *globaldb-defaulting-exprs*
+        do (setf (%instance-ref (aref *info-types* id) (get-dsd-index meta-info default))
+                 (compile nil lexpr)))
+  (loop for (id . lexpr) in *globaldb-validate-exprs*
+        do (setf (%instance-ref (aref *info-types* id)
+                                (get-dsd-index meta-info validate-function))
+                 (compile nil lexpr)))
+  (let (checkfuns)
+    (dovector (meta-info *info-types*)
+      (when (and meta-info (neq t (meta-info-type-spec meta-info)))
+        (let* ((spec (meta-info-type-spec meta-info))
+               (cell (assoc spec checkfuns :test 'equal)))
+          (unless cell
+            (let ((f (compile nil `(named-lambda "check-type" (x) (the ,spec x)))))
+              (push (setf cell (cons spec f)) checkfuns)))
+          (setf (%instance-ref meta-info (get-dsd-index meta-info type-checker))
+                (cdr cell)))))))

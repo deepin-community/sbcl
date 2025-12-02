@@ -1,0 +1,21 @@
+From: Sean Whitton <spwhitton@spwhitton.name>
+Date: Thu, 8 Aug 2024 09:27:25 +0800
+Subject: Enable debug printing in :WASTE-HEAP test
+
+---
+ tests/arenaheapwaste.impure.lisp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/tests/arenaheapwaste.impure.lisp b/tests/arenaheapwaste.impure.lisp
+index 375b80d..e491d9e 100644
+--- a/tests/arenaheapwaste.impure.lisp
++++ b/tests/arenaheapwaste.impure.lisp
+@@ -42,7 +42,7 @@
+              (waste-bytes (- consumed-bytes used-bytes))
+              (waste (float (/ waste-bytes consumed-bytes))))
+         (incf sum-fractional-waste waste)
+-        #+nil (format t "~&waste: ~,,2f~%" waste))
++        (format t "~&waste: ~,,2f~%" waste))
+       (sb-vm:rewind-arena arena))
+     (setq *runflag* nil)
+     (sb-thread:signal-semaphore (first semaphores) nthreads)

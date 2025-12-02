@@ -16,23 +16,28 @@
 (defconstant sb-assem:assem-scheduler-p nil)
 (defconstant sb-assem:+inst-alignment-bytes+ 4)
 
-(defconstant +backend-fasl-file-implementation+ :arm64)
+(defconstant sb-fasl:+backend-fasl-file-implementation+ :arm64)
 
   ;; Can be in the range 4K-64K
 (defconstant +backend-page-bytes+ 65536)
 
-;;; The size in bytes of GENCGC cards, i.e. the granularity at which
-;;; writes to old generations are logged.  With mprotect-based write
-;;; barriers, this must be a multiple of the OS page size.
-(defconstant gencgc-card-bytes +backend-page-bytes+)
+;;; The size in bytes of GENCGC pages. A page is essentially
+;;; the granularity at which we claim memory for TLABs.
+(defconstant gencgc-page-bytes +backend-page-bytes+)
+;;; The divisor relative to page-bytes which computes the granularity
+;;; at which writes to old generations are logged.
+(defconstant cards-per-page
+             #+gencgc 32
+             #+mark-region-gc (/ +backend-page-bytes+ 128))
+
 ;;; The minimum size of new allocation regions.  While it doesn't
 ;;; currently make a lot of sense to have a card size lower than
 ;;; the alloc granularity, it will, once we are smarter about finding
 ;;; the start of objects.
 (defconstant gencgc-alloc-granularity 0)
-;;; The minimum size at which we release address ranges to the OS.
+;;; The card size for immobile/low space.
 ;;; This must be a multiple of the OS page size.
-(defconstant gencgc-release-granularity +backend-page-bytes+)
+(defconstant immobile-card-bytes +backend-page-bytes+)
 
 ;;; number of bits per word where a word holds one lisp descriptor
 (defconstant n-word-bits 64)
@@ -64,31 +69,25 @@
 
 ;;;; Where to put the different spaces.
 
-;;; On non-gencgc we need large dynamic and static spaces for PURIFY
-#-gencgc
-(progn
-  (defconstant read-only-space-start #x04000000)
-  (defconstant read-only-space-end   #x07ff8000)
-  (defconstant static-space-start    #x08000000)
-  (defconstant static-space-end      #x097fff00)
-
-  (defconstant linkage-table-space-start #x0a000000)
-  (defconstant linkage-table-space-end   #x0b000000)
-  #+(or linux openbsd)
-  (progn
-    (defparameter dynamic-0-space-start #x4f000000)
-    (defparameter dynamic-0-space-end   #x66fff000)))
-
-#+gencgc
-(!gencgc-space-setup #+(or linux openbsd) #xF0000000
+(gc-space-setup #+(or linux openbsd netbsd freebsd)
+                     #x2F0000000
                      #+darwin #x300000000
-                     #+netbsd #x2F0000000
+                     #-darwin :read-only-space-size #-darwin 0
+                     :fixedobj-space-start 0
+                     :fixedobj-space-size 0
+                     :text-space-start #x0A00000000
+                     :text-space-size #.(* 2 65536 1024)
                      :dynamic-space-start
                      #-darwin #x1000000000
                      #+darwin #x7003000000)
 
-(defconstant linkage-table-growth-direction :up)
-(defconstant linkage-table-entry-size 16)
+(defconstant alien-linkage-table-growth-direction :up)
+(defconstant alien-linkage-table-entry-size 16)
+  ;; text space:
+  ;;   | ALIEN LINKAGE | CODE OBJECTS ...
+  ;;   |<------------->|
+#+(and sb-xc-host immobile-space)
+(defparameter alien-linkage-space-start (- text-space-start alien-linkage-space-size))
 
 ;;;; other miscellaneous constants
 
@@ -118,20 +117,11 @@
     ,@'(*binding-stack-pointer*
         *pseudo-atomic-atomic*
         *pseudo-atomic-interrupted*)
-    *allocation-pointer*
      ;; interrupt handling
      ,@+common-static-symbols+)
   #'equalp)
 
-(defconstant-eqx +static-fdefns+
-  #(two-arg-gcd two-arg-lcm
-    two-arg-+ two-arg-- two-arg-* two-arg-/
-    two-arg-< two-arg-> two-arg-=
-    two-arg-and two-arg-ior two-arg-xor two-arg-eqv
-
-    eql
-    sb-kernel:%negate)
-  #'equalp)
+(defconstant-eqx +static-fdefns+ `#(,@common-static-fdefns) #'equalp)
 
 
 ;;;; Assembler parameters:
@@ -139,5 +129,3 @@
 ;;; The number of bits per element in the assemblers code vector.
 ;;;
 (defparameter *assembly-unit-length* 8)
-
-(defvar *allocation-pointer*)

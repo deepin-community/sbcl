@@ -1,0 +1,7 @@
+Git workflow
+============
+
+This package uses dgit-maint-debrebase(7).
+Please consult that manpage before committing to the team repository on salsa.
+
+ -- Sean Whitton <spwhitton@spwhitton.name>, Thu, 30 May 2024 21:34:51 +0100

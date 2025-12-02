@@ -57,7 +57,8 @@
   (or (member symbol
               '(closurep simple-fun-p unbound-marker-p
                 sb-impl::vector-with-fill-pointer-p
-                legal-fun-name-p extended-function-designator-p))
+                legal-fun-name-p extended-function-designator-p
+                numeric-type-p proper-list-p))
       (member symbol sb-vm::*backend-cross-foldable-predicates*)
       (and (eq (sb-xc:symbol-package symbol) *cl-package*)
            (or (eq usage 'sb-xc:typep)
@@ -69,7 +70,7 @@
 ;;; Defined here so that CROSS-TYPEP can use it.
 ;;; The target variant of this is in src/code/package.
 (defmacro system-package-p (package)
-  `(eql (mismatch "SB-" (package-name ,package)) 3))
+  `(eql (mismatch "SB-" (cl:package-name ,package)) 3))
 
 ;;; This is like TYPEP, except that it asks whether OBJ (a host object acting
 ;;; as a proxy for some logically equivalent object in the target sytem)
@@ -82,7 +83,7 @@
 ;;; The logic is a mixture of the code for CTYPEP and %%TYPEP
 ;;; because it handles both.
 ;;; The order of clauses is fairly symmetrical with that of %%TYPEP.
-(defvar *xtypep-uncertainty-action* 'warn) ; {BREAK WARN STYLE-WARN ERROR NIL}
+(defvar *xtypep-uncertainty-action* #-sb-devel 'warn #+sb-devel nil) ; {BREAK WARN STYLE-WARN ERROR NIL}
 (macrolet ((unimplemented ()
              '(bug "Incomplete implementation of ~S ~S ~S" caller obj type))
            (uncertain ()
@@ -99,8 +100,8 @@
           ((instance) (values (%instancep obj) t))
           ((nil extended-sequence funcallable-instance)
            (values nil t)))) ; nothing could be these
-       (numeric-type
-        (values (number-typep obj type) t))
+       (numeric-union-type
+        (values (numeric-union-typep obj type) t))
        (array-type
         ;; Array types correspond fairly closely between host and target, but
         ;; asking whether an array is definitely non-simple is a nonsensical
@@ -157,9 +158,7 @@
                     ((not (%instancep obj))
                      (values nil t)) ; false certainly
                     (t
-                     (if (and (cl:find-class name nil) ; see if the host knows the type
-                              ;; and it's in our object hierarchy
-                              (cl:subtypep name 'structure!object))
+                     (if (cl:find-class name nil) ; see if the host knows the type
                          (values (cl:typep obj name) t)
                          (unimplemented)))))))
        (fun-type
@@ -186,8 +185,8 @@
           ;; true for various X that are not known yet.
           (cond ((and (symbolp spec)
                       (cl:find-class spec nil)
-                      ;; See if the host knows our DEF!STRUCT yet
-                      (cl:subtypep spec 'structure!object))
+                      ;; See if the host knows our DEFSTRUCT yet
+                      (cl:subtypep spec 'instance))
                  (values (cl:typep obj spec) t))
                 ;; Sometimes we try to test a forward-referenced type
                 ;; that was unknown at the point of creation but has
@@ -313,8 +312,10 @@
             (and (boundp 'sb-c::*compilation*)
                  (eq (sb-c::block-compile sb-c::*compilation*) t)))
         (values answer certain)
+        #-sb-devel
         (warn 'cross-type-giving-up :call `(ctypep ,obj ,ctype)))))
 
+;; TODO: would it be feasible to unify this definition with that in src/code/typep ?
 (defun ctype-of (x)
   (typecase x
     (function
@@ -333,7 +334,7 @@
      (ctype-of-number x))
     (array
      ;; It is critical not to inquire of the host for the array's element type.
-     (let ((etype (specifier-type (sb-xc:array-element-type x))))
+     (let ((etype (specifier-type (array-element-type x))))
        (make-array-type (array-dimensions x)
                         ;; complexp relies on the host implementation,
                         ;; but in practice any array for which we need to
@@ -348,14 +349,15 @@
            (t
             ;; Beyond this, there seems to be no portable correspondence.
             (error "can't map host Lisp CHARACTER ~S to target Lisp" x))))
-    (sb-c::opaque-box (find-classoid 'structure-object))
     (instance
      (let ((type (type-of x)))
        (if (eq type 'sb-format::fmt-control-proxy)
            ;; These are functions, but they're weird. We don't want any IR1 transform
            ;; on FORMAT to kick in and try to convert to FUNCALL on the thing.
            (specifier-type '(or string function))
-           (find-classoid type))))
+           ;; The structure may not be defined on the target yet.
+           (or (find-classoid type nil)
+               (find-classoid 'structure-object)))))
     (t
      ;; There might be more cases which we could handle with
      ;; sufficient effort; since all we *need* to handle are enough
@@ -365,4 +367,17 @@
      (error "can't handle ~S in cross CTYPE-OF" x))))
 
 (defun sb-pcl::class-has-a-forward-referenced-superclass-p (x)
-  (bug "CLASS-HAS-A-FORWARD-REFERENCED-SUPERCLASS-P reached: ~S" x))
+  (declare (ignore x))
+  nil)
+
+(defun non-null-symbol-p (x) (and x (symbolp x)))
+;; these two functions don't need to be fully general
+(defun pointerp (x)
+  (aver (or (symbolp x) (fixnump x)))
+  (symbolp x))
+;; Use of non-ASCII during build occurs no sooner than make-target-2,
+;; therefore _every_ character satisfies BASE-CHAR-P prior to that.
+#+sb-unicode (defun base-char-p (x) (characterp x))
+
+(defun sb-bignum:%bignum-length (x)
+  (values (ceiling (1+ (integer-length x)) sb-vm:n-word-bits)))

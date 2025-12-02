@@ -21,7 +21,7 @@
   (let ((lambda (if (typep expr '(cons (eql function) (cons t null)))
                     (cadr expr)
                     expr)))
-    (if (typep lambda '(cons (member lambda named-lambda lambda-with-lexenv)))
+    (if (typep lambda '(cons (member lambda named-lambda)))
         (values lambda nil)
         (values `(lambda ()
                  ;; why PROGN? So that attempts to eval free declarations
@@ -340,9 +340,11 @@
 
 (defun values (&rest values)
   "Return all arguments, in order, as values."
-  (declare (truly-dynamic-extent values))
+  (declare (dynamic-extent values))
   (values-list values))
 
 (defun values-list (list)
   "Return all of the elements of LIST, in order, as values."
+  #+(or arm64 x86-64)
+  (declare (explicit-check))
   (values-list list))

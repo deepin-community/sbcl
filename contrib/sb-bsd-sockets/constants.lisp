@@ -43,11 +43,12 @@
  (:integer so-rcvbuf "SO_RCVBUF")
  (:integer so-keepalive "SO_KEEPALIVE"
            "Send periodic keepalives.  If peer does not respond, we get SIGPIPE.")
- #+linux (:integer tcp-keepcnt "TCP_KEEPCNT"
-                   "Number of unacknowledged probes before the connection is considered dead.")
- #+linux (:integer tcp-keepidle "TCP_KEEPIDLE"
-                   "Seconds between the last data packet sent and the first keepalive probe.")
- #+linux (:integer tcp-keepintvl "TCP_KEEPINTVL" "Seconds between keepalive probes.")
+ #+(or linux (and bsd (not openbsd))) (:integer tcp-keepcnt "TCP_KEEPCNT"
+                     "Number of unacknowledged probes before the connection is considered dead.")
+ #+(or linux (and bsd (not (or openbsd darwin)))) (:integer tcp-keepidle "TCP_KEEPIDLE"
+                     "Seconds between the last data packet sent and the first keepalive probe.")
+ #+(or linux (and bsd (not openbsd))) (:integer tcp-keepintvl "TCP_KEEPINTVL" "Seconds between keepalive probes.")
+ #+linux (:integer tcp-user-timeout "TCP_USER_TIMEOUT" "Timeout for unacknowledged transmitted data (milliseconds).")
  (:integer so-oobinline "SO_OOBINLINE"
            "Put out-of-band data into the normal input queue when received")
  #+linux
@@ -230,6 +231,7 @@
  (:function fcntl ("fcntl" int
                    (fd int)
                    (cmd int)
+                   &optional
                    (arg long)))
  (:function getsockopt ("getsockopt" int
                         (socket int)

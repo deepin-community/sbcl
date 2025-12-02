@@ -11,6 +11,17 @@
 ;;;; files for more information.
 
 (in-package "SB-VM")
+
+(defun emit-gengc-barrier (object cell-address temps &optional value-tn-ref allocator)
+  (aver (neq (car temps) cell-address)) ; LD would clobber the cell-address
+  (when (require-gengc-barrier-p object value-tn-ref allocator)
+    ;; (inst ld (car temps) thread-base-tn (ash thread-card-table-slot word-shift))
+    ;; RLIDCL dest, source, (64-rightshift), (64-indexbits)
+    (inst rldicl (car temps) (or cell-address object) (- 64 gencgc-card-shift)
+          (make-fixup nil :card-table-index-mask))
+    ;; THREAD-TN's low byte is 0.
+    (inst stbx thread-base-tn card-table-base-tn (car temps))))
+
 
 ;;; Cell-Ref and Cell-Set are used to define VOPs like CAR, where the offset to
 ;;; be read or written is a property of the VOP used.
@@ -28,12 +39,38 @@
          (value :scs (descriptor-reg any-reg)))
   (:variant-vars offset lowtag)
   (:policy :fast-safe)
+  (:vop-var vop)
+  (:temporary (:sc non-descriptor-reg) t1)
   (:generator 4
+    (emit-gengc-barrier object nil (list t1) (vop-nth-arg 1 vop))
     (storew value object offset lowtag)))
 
 ;;;; Indexed references:
 
 ;;; Define some VOPs for indexed memory reference.
+
+(define-vop (descriptor-word-index-set)
+  (:args (object :scs (descriptor-reg))
+         (index :scs (any-reg immediate))
+         (value :scs (any-reg descriptor-reg)))
+  (:arg-types * tagged-num *)
+  (:temporary (:scs (non-descriptor-reg)) temp)
+  (:variant-vars offset lowtag)
+  (:policy :fast-safe)
+  (:vop-var vop)
+  (:generator 5
+   (emit-gengc-barrier object nil (list temp) (vop-nth-arg 2 vop))
+   (sc-case index
+    ((immediate)
+     (let ((offset (- (ash (+ (tn-value index) offset) word-shift) lowtag)))
+       (cond ((and (typep offset '(signed-byte 16)) (not (logtest offset #b11)))
+              (inst std value object offset))
+             (t
+              (inst lr temp offset)
+              (inst stdx value object temp)))))
+    (t
+     (inst addi temp index (- (ash offset word-shift) lowtag))
+     (inst stdx value object temp)))))
 
 ;;; Due to the encoding restrictione that doubleword accesses can not displace
 ;;; from the base register by an arbitrarily aligned value, but only an even
@@ -56,17 +93,15 @@
 ;;; and there is no case in which left-shift is required.
 (defmacro define-indexer (name shift write-p ri-op rr-op &key sign-extend-byte
                                                               multiple-of-four
-                                                              (result t)
                           &aux (net-shift (- shift n-fixnum-tag-bits)))
   `(define-vop (,name)
      (:args (object :scs (descriptor-reg))
             (index :scs (any-reg immediate))
-            ,@(when write-p
-                `((value :scs (any-reg descriptor-reg) ,@(when result '(:target result))))))
+            ,@(when write-p '((value :scs (any-reg descriptor-reg)))))
      (:arg-types * tagged-num ,@(when write-p '(*)))
      (:temporary (:scs (non-descriptor-reg)) temp)
-     ,@(when result
-         `((:results (,(if write-p 'result 'value) :scs (any-reg descriptor-reg)))
+     ,@(unless write-p
+         `((:results (value :scs (any-reg descriptor-reg)))
            (:result-types *)))
      (:variant-vars offset lowtag)
      (:policy :fast-safe)
@@ -93,9 +128,7 @@
                 (- (ash offset word-shift) lowtag))
           (inst ,rr-op value object temp)))
        ,@(when sign-extend-byte
-           `((inst extsb value value)))
-       ,@(when (and write-p result)
-           '((move result value))))))
+           `((inst extsb value value))))))
 
 (define-indexer word-index-ref           3 nil ld  ldx) ;; Word means Lisp Word
 (define-indexer 32-bits-index-ref        2 nil lwz lwzx)
@@ -109,11 +142,6 @@
 (define-indexer 32-bits-index-set        2 t   stw stwx)
 (define-indexer 16-bits-index-set        1 t   sth sthx)
 (define-indexer byte-index-set           0 t   stb stbx)
-;; the -NR setters yield no result
-(define-indexer word-index-set-nr        3 t   std stdx :result nil)
-(define-indexer 32-bits-index-set-nr     2 t   stw stwx :result nil)
-(define-indexer 16-bits-index-set-nr     1 t   sth sthx :result nil)
-(define-indexer byte-index-set-nr        0 t   stb stbx :result nil)
 
 (define-vop (word-index-cas)
   (:args (object :scs (descriptor-reg))
@@ -126,12 +154,23 @@
   (:result-types *)
   (:variant-vars offset lowtag)
   (:policy :fast-safe)
+  (:vop-var vop)
   (:generator 5
+    (let ((ea
+           (ecase lowtag
+             (#.instance-pointer-lowtag nil)
+             (#.other-pointer-lowtag ; has to be (SETF SVREF)
+              (cond ((sc-is index immediate)
+                     (let ((offset (- (ash (+ (tn-value index) offset) word-shift) lowtag)))
+                       (inst lr temp offset)))
+                    (t
+                     (inst addi temp index (- (ash offset word-shift) lowtag))))
+              (inst add temp object temp)
+              temp))))
+      (emit-gengc-barrier object ea (list result temp) (vop-nth-arg 3 vop)))
     (sc-case index
       ((immediate)
-       (let ((offset (- (+ (ash (tn-value index) word-shift)
-                           (ash offset word-shift))
-                        lowtag)))
+       (let ((offset (- (ash (+ (tn-value index) offset) word-shift) lowtag)))
          (inst lr temp offset)))
       (t
        (inst sldi temp index (- word-shift n-fixnum-tag-bits))

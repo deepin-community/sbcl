@@ -11,14 +11,10 @@
 ;;;; absolutely no warranty. See the COPYING and CREDITS files for
 ;;;; more information.
 
-#-win32 (exit :code 104) ;; This is extremely win32-specific.
-#-x86   (exit :code 104) ;; And our AMD64 backend does not aim to support it.
+#-win32 (invoke-restart 'run-tests::skip-file) ;; This is extremely win32-specific.
+#-x86   (invoke-restart 'run-tests::skip-file) ;; And our AMD64 backend does not aim to support it.
 
 (use-package :sb-alien)
-
-;;; Callbacks are not part of the exported interface yet -- when they are this can
-;;; go away.
-(import 'sb-alien::alien-lambda)
 
 ;;; XXX XXX this should change to use run-compiler.sh, now that we have it
 (defun run-compiler ()
@@ -33,23 +29,13 @@
 
 (load-shared-object (truename "win32-stack-unwind.dll"))
 
-
-(defvar *current-test-callback*)
-
-(defparameter *test-callback-thunk*
-  (sb-alien::alien-callback
-   (function void)
-   #'(lambda () (funcall *current-test-callback*))))
-
 (defun establish-return-frame (callback)
   "Establish an SEH frame for use as a target with PERFORM-TEST-UNWIND and invoke CALLBACK via FUNCALL"
-  ;; We don't use a LET here because we don't want to accidentally
-  ;; correct a blown binding stack pointer just yet.
-  (setf *current-test-callback* callback)
-  (alien-funcall (extern-alien "establish_return_frame"
-                               (function void (* (function void))))
-                 (alien-sap *test-callback-thunk*))
-  (makunbound '*current-test-callback*)
+  (with-alien-callable ((test void ()
+                          (funcall callback)))
+    (alien-funcall (extern-alien "establish_return_frame"
+                                 (function void (* (function void))))
+                   (alien-sap test)))
   (values))
 
 (defun perform-test-unwind ()

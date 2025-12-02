@@ -46,9 +46,8 @@
   (:temporary (:scs (descriptor-reg) :from (:argument 0)) obj-temp))
 
 ;;; With Symbol-Value, we check that the value isn't the trap object.
-;;; So Symbol-Value of NIL is NIL.
 (define-vop (symbol-value checked-cell-ref)
-  (:translate symeval)
+  (:translate symbol-value)
   (:generator 9
     (move obj-temp object)
     (loadw value obj-temp symbol-value-slot other-pointer-lowtag)
@@ -59,14 +58,12 @@
 
 ;;; Like CHECKED-CELL-REF, only we are a predicate to see if the cell
 ;;; is bound.
-(define-vop (boundp-frob)
+(define-vop (boundp)
   (:args (object :scs (descriptor-reg)))
   (:conditional)
   (:info target not-p)
   (:policy :fast-safe)
-  (:temporary (:scs (descriptor-reg)) value))
-
-(define-vop (boundp boundp-frob)
+  (:temporary (:scs (descriptor-reg)) value)
   (:translate boundp)
   (:generator 9
     (loadw value object symbol-value-slot other-pointer-lowtag)
@@ -77,34 +74,37 @@
 (define-vop (fast-symbol-value cell-ref)
   (:variant symbol-value-slot other-pointer-lowtag)
   (:policy :fast)
-  (:translate symeval))
+  (:translate symbol-value))
+
+;;; On unithreaded builds these are just copies of the non-global versions.
+(define-vop (%set-symbol-global-value set))
+(define-vop (symbol-global-value symbol-value)
+  (:translate symbol-global-value))
+(define-vop (fast-symbol-global-value fast-symbol-value)
+  (:translate symbol-global-value))
 
 (define-vop (symbol-hash)
   (:policy :fast-safe)
   (:translate symbol-hash)
   (:args (symbol :scs (descriptor-reg)))
-  (:results (res :scs (any-reg)))
+  (:results (res :scs (unsigned-reg)))
   (:result-types positive-fixnum)
-  (:args-var args)
+  (:temporary (:sc unsigned-reg) tmp)
   (:generator 2
-    ;; The symbol-hash slot of NIL holds NIL because it is also the
-    ;; cdr slot, so we have to strip off the two low bits to make sure
-    ;; it is a fixnum.  The lowtag selection magic that is required to
-    ;; ensure this is explained in the comment in objdef.lisp
     (loadw res symbol symbol-hash-slot other-pointer-lowtag)
-    (unless (not-nil-tn-ref-p args)
-      (inst andn res res fixnum-tag-mask))))
+    ;; Clear the 3 highest bits, ensuring the result is positive fixnum.
+    ;; I am not as smart as the C compiler which uses ANDN for 1 fewer instruction.
+    (inst li tmp #x1fffffff)
+    (inst and res res tmp)))
 
-;;; On unithreaded builds these are just copies of the non-global versions.
-(define-vop (%set-symbol-global-value set))
-(define-vop (symbol-global-value symbol-value)
-  (:translate sym-global-val))
-(define-vop (fast-symbol-global-value fast-symbol-value)
-  (:translate sym-global-val))
+(define-vop (symbol-name-hash symbol-hash)
+  (:translate symbol-name-hash)
+  (:ignore tmp)
+  (:generator 2
+    (loadw res symbol symbol-hash-slot other-pointer-lowtag)
+    (inst srl res 3))) ; shift out the 3 pseudorandom bits
 
 ;;;; FDEFINITION (fdefn) objects.
-(define-vop (fdefn-fun cell-ref)
-  (:variant fdefn-fun-slot other-pointer-lowtag))
 
 (define-vop (safe-fdefn-fun)
   (:translate safe-fdefn-fun)
@@ -124,23 +124,19 @@
 
 (define-vop (set-fdefn-fun)
   (:policy :fast-safe)
-  (:translate (setf fdefn-fun))
-  (:args (function :scs (descriptor-reg) :target result)
+  (:args (function :scs (descriptor-reg))
          (fdefn :scs (descriptor-reg)))
   (:temporary (:scs (interior-reg)) lip)
   (:temporary (:scs (non-descriptor-reg)) type)
-  (:results (result :scs (descriptor-reg)))
   (:generator 38
-    (let ((normal-fn (gen-label)))
-      (load-type type function (- fun-pointer-lowtag))
-      (inst cmp type simple-fun-widetag)
-      (inst b :eq normal-fn)
-      (inst move lip function)
-      (inst li lip (make-fixup 'closure-tramp :assembly-routine))
-      (emit-label normal-fn)
-      (storew function fdefn fdefn-fun-slot other-pointer-lowtag)
-      (storew lip fdefn fdefn-raw-addr-slot other-pointer-lowtag)
-      (move result function))))
+    (load-type type function (- fun-pointer-lowtag))
+    (inst cmp type simple-fun-widetag)
+    (inst b :eq SIMPLE)
+    (inst move lip function)
+    (inst li lip (make-fixup 'closure-tramp :assembly-routine))
+    SIMPLE
+    (storew function fdefn fdefn-fun-slot other-pointer-lowtag)
+    (storew lip fdefn fdefn-raw-addr-slot other-pointer-lowtag)))
 
 (define-vop (fdefn-makunbound)
   (:policy :fast-safe)
@@ -218,13 +214,13 @@
   (:variant closure-info-offset fun-pointer-lowtag)
   (:translate %closure-index-ref))
 
+(define-vop (%closure-index-set word-index-set)
+  (:variant closure-info-offset fun-pointer-lowtag)
+  (:translate %closure-index-set))
+
 (define-vop (funcallable-instance-info word-index-ref)
   (:variant funcallable-instance-info-offset fun-pointer-lowtag)
   (:translate %funcallable-instance-info))
-
-(define-vop (set-funcallable-instance-info word-index-set-nr)
-  (:variant funcallable-instance-info-offset fun-pointer-lowtag)
-  (:translate %set-funcallable-instance-info))
 
 (define-vop (closure-ref)
   (:args (object :scs (descriptor-reg)))
@@ -236,7 +232,8 @@
 (define-vop (closure-init)
   (:args (object :scs (descriptor-reg))
          (value :scs (descriptor-reg any-reg)))
-  (:info offset)
+  (:info offset dx)
+  (:ignore dx)
   (:generator 4
     (storew value object (+ closure-info-offset offset) fun-pointer-lowtag)))
 
@@ -247,9 +244,6 @@
     (storew cfp-tn object (+ closure-info-offset offset) fun-pointer-lowtag)))
 
 ;;;; value cell hackery.
-
-(define-vop (value-cell-ref cell-ref)
-  (:variant value-cell-value-slot other-pointer-lowtag))
 
 (define-vop (value-cell-set cell-set)
   (:variant value-cell-value-slot other-pointer-lowtag))
@@ -272,7 +266,7 @@
   (:variant instance-slots-offset instance-pointer-lowtag)
   (:arg-types * positive-fixnum))
 
-(define-vop (instance-index-set word-index-set-nr)
+(define-vop (instance-index-set word-index-set)
   (:policy :fast-safe)
   (:translate %instance-set)
   (:variant instance-slots-offset instance-pointer-lowtag)
@@ -285,12 +279,37 @@
   (:policy :fast-safe)
   (:variant 0 other-pointer-lowtag))
 
-(define-vop (code-header-set word-index-set)
+(define-vop (code-header-set)
   (:translate code-header-set)
   (:policy :fast-safe)
-  (:variant 0 other-pointer-lowtag))
-
-
+  (:args (object :scs (descriptor-reg))
+         (index :scs (any-reg))
+         (value :scs (any-reg descriptor-reg)))
+  (:arg-types * tagged-num *)
+  (:temporary (:scs (non-descriptor-reg)) temp card)
+  (:generator 10
+    ;; Load the card mask
+    (inst li temp (make-fixup "gc_card_table_mask" :foreign-dataref)) ; linkage entry
+    (inst ld temp temp) ; address of gc_card_table_mask
+    (inst ld temp temp) ; value of gc_card_table_mask
+    (pseudo-atomic (temp)
+      ;; Compute card mark index
+      (inst srl card object gencgc-card-shift)
+      (inst and card card temp)
+      ;; Load mark table base
+      (inst li temp (make-fixup "gc_card_mark" :foreign-dataref)) ; linkage entry
+      (inst ld temp temp) ; address of gc_card_mark
+      (inst ld temp temp) ; value of gc_card_mark
+      ;; Touch the card mark byte.
+      (inst stb null-tn temp card)
+      ;; set 'written' flag in the code header
+      ;; If two threads get here at the same time, they'll write the same byte.
+      (let ((byte #+big-endian (- other-pointer-lowtag) #+little-endian (bug "Wat")))
+        (inst ldub temp object byte)
+        (inst or temp temp #x40)
+        (inst stb temp object byte))
+      (inst add temp index (- other-pointer-lowtag))
+      (inst st value object temp))))
 
 ;;;; raw instance slot accessors
 

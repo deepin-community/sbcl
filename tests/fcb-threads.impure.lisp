@@ -15,7 +15,10 @@
 ;;;  - garbage_collect: no SP known for thread 0x802bea000 (OS 34367133952)
 ;;;  - failed AVER: (NOT (SB-THREAD::AVL-FIND ADDR SB-THREAD::OLD))
 
-#+(or (not sb-thread) freebsd) (sb-ext:exit :code 104)
+#+(or (not sb-thread) freebsd) (invoke-restart 'run-tests::skip-file)
+
+(setf (generation-number-of-gcs-before-promotion 0) 5)
+(setf (generation-number-of-gcs-before-promotion 1) 3)
 
 #+win32
 (with-scratch-file (solib "dll")
@@ -39,11 +42,37 @@
       (sb-alien:load-shared-object solib)))
 
 ;;;; Just exercise a ton of calls from 1 thread
-(sb-alien::define-alien-callback perftestcb int () 0)
+(define-alien-callable perftestcb int () 0)
 (defun trivial-call-test (n)
   (with-alien ((testfun (function int system-area-pointer int) :extern "minimal_perftest"))
-    (alien-funcall testfun (alien-sap perftestcb) n)))
-(time (trivial-call-test 200000))
+    (alien-funcall testfun (alien-sap (alien-callable-function 'perftestcb)) n)))
+
+
+;;; When compiled with APROF, the truly astounding amount of space taken up not by objects
+;;; but just closing the open regions in unregister_thread becomes evident:
+#|
+10 (of 150000 max) profile entries consumed, 367 GCs done
+       %        Bytes        Count    Function
+ -------  -----------    ---------    --------
+  99.7    19590256480       600000    SB-VM::FILLER - SB-VM::FILLER
+   0.1       28800144       600003    SB-THREAD::AVLNODE - SB-THREAD::AVLNODE
+   0.1       28800000       200000    SB-THREAD::MAKE-FOREIGN-THREAD - SB-THREAD:FOREIGN-THREAD
+  00.0        6400000       200000    SB-THREAD:MAKE-MUTEX - SB-THREAD:MUTEX
+  00.0        3200000       200000    SB-THREAD::SYS-TLAB-LIST
+  00.0           5840          365    (FLET "WITHOUT-GCING-BODY-" :IN SB-KERNEL:SUB-GC) - LIST
+  00.0             16            1    SB-THREAD::%ENROLL-NEW-THREADS - LIST
+ =======  ===========
+ 100.0    19657462480
+|#
+;;; Something is very off about these numbers though. If there are 20,000 thread creation/
+;;; destructions, and each thread wastes all of its 4 TLABs, that should be 132KiB per thread,
+;;; for roughly 2.6GB of waste in total. How are we seing nearly 8x that?
+(with-test (:name :trivial-call-test)
+ (cond #+(and x86-64 sb-thread (not win32))
+       ((> (sb-c:policy sb-c::*policy* sb-c:instrument-consing) 0)
+        (sb-aprof:aprof-run #'trivial-call-test :arguments '(200000)))
+       (t
+        (time (trivial-call-test 200000)))))
 
 ;;;;
 (defglobal *counter* 0)
@@ -56,7 +85,7 @@
 (defglobal *print-greetings-and-salutations* (or #+linux t))
 
 (defglobal *semaphore* nil)
-(sb-alien::define-alien-callback testcb int ((arg1 c-string) (arg2 double))
+(define-alien-callable testcb int ((arg1 c-string) (arg2 double))
   (when *semaphore* (sb-thread:signal-semaphore *semaphore*))
   (let ((cell (assoc sb-thread:*current-thread* *seen-threads*))
         (result (floor (* (length arg1) arg2))))
@@ -110,23 +139,18 @@
                 (loop
                  (gc)
                  (incf *n-gcs*)
-                 (sleep .0001)
+                 (sleep .0005)
                  (sb-thread:barrier (:read))
                  (if (not *keepon*) (return)))))))
           (start (get-internal-real-time)))
       (setq *keepon* t)
       (with-alien ((testfun (function int system-area-pointer int int)
                             :extern "call_thing_from_threads"))
-        (assert (eql (alien-funcall testfun (alien-sap testcb) n-threads n-calls)
+        (assert (eql (alien-funcall testfun (alien-sap (alien-callable-function 'testcb)) n-threads n-calls)
                      1)))
       (setq *keepon* nil)
       (sb-thread:barrier (:write))
       (let ((stop (get-internal-real-time)))
-        #+darwin
-        (with-alien ((count int :extern "sigwait_bug_mitigation_count"))
-          (when (plusp count)
-            (format t "Bug mitigation strategy applied ~D time~:P~%" count)
-            (setf count 0)))
         (sb-thread:join-thread watchdog-thread)
         (when gc-thr
           (sb-thread:join-thread gc-thr)
@@ -154,11 +178,11 @@
   (f 5 5 200 t))
 
 ;;; The next test hasn't been made to run on windows, but should.
-#+win32 (exit :code 104)
+#+win32 (invoke-restart 'run-tests::skip-file)
 
 ;;; Check that you get an error trying to join a foreign thread
 (defglobal *my-foreign-thread* nil)
-(sb-alien::define-alien-callback tryjointhis int ()
+(define-alien-callable tryjointhis int ()
   (setq *my-foreign-thread* sb-thread:*current-thread*)
   (dotimes (i 10)
     (write-char #\.) (force-output)
@@ -168,28 +192,30 @@
 (defun tryjoiner ()
   (setq *my-foreign-thread* nil)
   (sb-int:dx-let ((pthread (make-array 1 :element-type 'sb-vm:word)))
-    (alien-funcall
-     (extern-alien "pthread_create"
-                   (function int system-area-pointer unsigned
-                             system-area-pointer unsigned))
-     (sb-sys:vector-sap pthread) 0 (alien-sap tryjointhis) 0)
-    (format t "Alien pthread is ~x~%" (aref pthread 0))
-    (let (found)
-      (loop
-        (setq found *my-foreign-thread*)
-        (when found (return))
-        (sleep .05))
-      (format t "Got ~s~%" found)
-      (let ((result (handler-case (sb-thread:join-thread found)
-                      (sb-thread:join-thread-error () 'ok))))
-        (when (eq result 'ok)
-          ;; actually join it to avoid resource leak
-          (alien-funcall
-           (extern-alien "pthread_join" (function int unsigned unsigned))
-           (aref pthread 0)
-           0))
-        (format t "Pthread joined ~s~%" found)
-        result))))
+    (sb-sys:with-pinned-objects (pthread)
+      (alien-funcall
+       (extern-alien "pthread_create"
+                     (function int system-area-pointer unsigned
+                               system-area-pointer unsigned))
+       (sb-sys:vector-sap pthread) 0 (alien-sap (alien-callable-function 'tryjointhis)) 0)
+      (format t "Alien pthread is ~x~%" (aref pthread 0))
+      (let (found)
+        (loop
+         (setq found *my-foreign-thread*)
+         (when found (return))
+         (sleep .05))
+        (format t "Got ~s~%" found)
+        (let ((result (handler-case (sb-thread:join-thread found)
+                        (sb-thread:join-thread-error () 'ok))))
+          (when (eq result 'ok)
+            ;; actually join it to avoid resource leak
+            (assert (zerop
+                     (alien-funcall
+                      (extern-alien "pthread_join" (function int unsigned unsigned))
+                      (aref pthread 0)
+                      0))))
+          (format t "Pthread joined ~s~%" found)
+          result)))))
 
 (with-test (:name :try-join-foreign-thread)
   (assert (eq (tryjoiner) 'ok)))

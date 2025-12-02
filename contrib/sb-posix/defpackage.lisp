@@ -15,7 +15,7 @@
            ;; wrapper class accessors
            #:passwd-name #:passwd-passwd #:passwd-uid #:passwd-gid
            #:passwd-gecos #:passwd-dir #:passwd-shell
-           #:group-name #:group-gid #:group-passwd
+           #:group-name #:group-gid #:group-passwd #:group-mem
            #:stat-mode #:stat-ino #:stat-dev #:stat-nlink #:stat-uid
            #:stat-gid #:stat-size #:stat-atime #:stat-mtime #:stat-ctime
            #:stat-rdev
@@ -29,6 +29,3 @@
            ))
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (setf (sb-int:system-package-p (find-package "SB-POSIX")) t))
-
-#+win32
-(sb-alien:load-shared-object "msvcrt.dll")

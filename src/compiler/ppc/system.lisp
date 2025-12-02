@@ -13,6 +13,15 @@
 
 ;;;; Type frobbing VOPs
 
+(define-vop (descriptor-hash32)
+  (:translate descriptor-hash32)
+  (:args (arg :scs (any-reg descriptor-reg)))
+  (:results (res :scs (any-reg)))
+  (:result-types positive-fixnum)
+  (:policy :fast-safe)
+  (:generator 1
+    (inst rlwinm res arg 0 1 29)))
+
 (define-vop (widetag-of)
   (:translate widetag-of)
   (:policy :fast-safe)
@@ -60,7 +69,7 @@
   (:generator 4
     (let ((test-id (layout-id test-layout))
           (offset (+ (id-bits-offset)
-                     (ash (- (wrapper-depthoid test-layout) 2) 2)
+                     (ash (- (layout-depthoid test-layout) 2) 2)
                      (- instance-pointer-lowtag))))
       (inst lwz this-id x offset)
       ;; Always prefer 'cmpwi' if compiling to memory.
@@ -127,25 +136,8 @@
       (zero))
     (storew t1 x 0 other-pointer-lowtag)))
 
-
-(define-vop (pointer-hash)
-  (:translate pointer-hash)
-  (:args (ptr :scs (any-reg descriptor-reg)))
-  (:results (res :scs (any-reg descriptor-reg)))
-  (:policy :fast-safe)
-  (:generator 1
-    (inst clrrwi res ptr n-fixnum-tag-bits)))
-
 
 ;;;; Allocation
-
-(define-vop (dynamic-space-free-pointer)
-  (:results (int :scs (sap-reg)))
-  (:result-types system-area-pointer)
-  (:translate dynamic-space-free-pointer)
-  (:policy :fast-safe)
-  (:generator 1
-    (move int alloc-tn)))
 
 (define-vop (binding-stack-pointer-sap)
   (:results (int :scs (sap-reg)))
@@ -292,3 +284,18 @@
    ;; Can't convert index to a code-relative index until the boxed header length
    ;; has been determined.
    (inst store-coverage-mark index tmp)))
+
+(define-vop ()
+  (:translate sb-lockless:get-next)
+  (:policy :fast-safe)
+  (:args (node :scs (descriptor-reg)))
+  (:results (next-tagged :scs (descriptor-reg))
+            (next-bits :scs (descriptor-reg)))
+  (:temporary (:sc non-descriptor-reg :offset nl3-offset) pa-flag)
+  (:generator 10
+    ;; Read the first user-data slot and convert to a tagged pointer,
+    ;; also returning the raw value as a secondary result
+    (pseudo-atomic (pa-flag)
+      (loadw next-bits node (+ instance-slots-offset instance-data-start)
+             instance-pointer-lowtag)
+      (inst ori next-tagged next-bits instance-pointer-lowtag))))

@@ -14,26 +14,8 @@
 (defconstant arg-count-sc (make-sc+offset immediate-arg-scn nargs-offset))
 (defconstant closure-sc (make-sc+offset descriptor-reg-sc-number lexenv-offset))
 
-;;; Always wire the return PC location to the stack in its standard
-;;; location.
-(defun make-return-pc-passing-location (standard)
-  (declare (ignore standard))
-  (make-wired-tn *backend-t-primitive-type* control-stack-sc-number
-                 lra-save-offset))
-
 (defconstant return-pc-passing-offset
   (make-sc+offset control-stack-sc-number lra-save-offset))
-
-;;; This is similar to MAKE-RETURN-PC-PASSING-LOCATION, but makes a
-;;; location to pass OLD-FP in.
-;;;
-;;; This is wired in both the standard and the local-call conventions,
-;;; because we want to be able to assume it's always there. Besides,
-;;; the ARM doesn't have enough registers to really make it profitable
-;;; to pass it in a register.
-(defun make-old-fp-passing-location ()
-  (make-wired-tn *fixnum-primitive-type* control-stack-sc-number
-                 ocfp-save-offset))
 
 (defconstant old-fp-passing-offset
   (make-sc+offset control-stack-sc-number ocfp-save-offset))
@@ -41,21 +23,22 @@
 ;;; Make the TNs used to hold OLD-FP and RETURN-PC within the current
 ;;; function. We treat these specially so that the debugger can find
 ;;; them at a known location.
-(defun make-old-fp-save-location (env)
+(defun make-old-fp-save-location ()
   ;; Unlike the other backends, ARM function calling is designed to
   ;; pass OLD-FP within the stack frame rather than in a register.  As
   ;; such, in order for lifetime analysis not to screw up, we need it
   ;; to be a stack TN wired to the save offset, not a normal TN with a
   ;; wired SAVE-TN.
-  (physenv-debug-live-tn (make-wired-tn *fixnum-primitive-type*
-                                        control-stack-arg-scn
-                                        ocfp-save-offset)
-                         env))
-(defun make-return-pc-save-location (physenv)
-  (physenv-debug-live-tn
-   (make-wired-tn *backend-t-primitive-type* control-stack-sc-number
-                  lra-save-offset)
-   physenv))
+  (let ((tn (make-wired-tn *fixnum-primitive-type*
+                           control-stack-arg-scn
+                           ocfp-save-offset)))
+    (setf (tn-kind tn) :environment)
+    tn))
+(defun make-return-pc-save-location ()
+  (let ((tn (make-wired-tn *backend-t-primitive-type* control-stack-sc-number
+                           lra-save-offset)))
+    (setf (tn-kind tn) :environment)
+    tn))
 
 ;;; Make a TN for the standard argument count passing location.  We
 ;;; only need to make the standard location, since a count is never
@@ -144,15 +127,16 @@
   (:results (res :scs (any-reg))
             (nfp :scs (any-reg)))
   (:info callee)
+  (:temporary (:sc any-reg) temp)
   (:generator 2
     (load-csp res)
     (composite-immediate-instruction
-     add nfp res
-     (* (max 1 (sb-allocated-size 'control-stack))
+      add temp res
+      (* (max 1 (sb-allocated-size 'control-stack))
         n-word-bytes))
-    (store-csp nfp)
-    (when (ir2-physenv-number-stack-p callee)
-      (let* ((nbytes (bytes-needed-for-non-descriptor-stack-frame)))
+    (store-csp temp)
+    (when (ir2-environment-number-stack-p callee)
+      (let ((nbytes (bytes-needed-for-non-descriptor-stack-frame)))
         (inst sub nfp nsp-tn nbytes)
         (inst mov nsp-tn nfp)))))
 
@@ -367,9 +351,7 @@
     ;; here because it would conflict with the existing NFP if there
     ;; is a number-stack frame in play, but we only use it prior to
     ;; actually setting up the "real" NFP.
-    (let ((result (make-random-tn :kind :normal
-                                  :sc (sc-or-lose 'any-reg)
-                                  :offset nfp-offset)))
+    (let ((result (make-random-tn (sc-or-lose 'any-reg) nfp-offset)))
       ;; And we use ASSEMBLE here so that we get "implcit labels"
       ;; rather than having to use GEN-LABEL and EMIT-LABEL.
       (assemble ()
@@ -818,7 +800,7 @@
           '((old-fp)
             (return-pc)))
 
-      ,@(unless variable '((args :more t :scs (descriptor-reg)))))
+      ,@(unless variable '((args :more t :scs (descriptor-reg control-stack)))))
 
      ,@(when (eq return :fixed)
          '((:results (values :more t))))
@@ -858,7 +840,7 @@
                                    :offset ,offset
                                    :to :eval)
                          ,name))
-                 *register-arg-names* *register-arg-offsets*))
+                 register-arg-names *register-arg-offsets*))
      ,@(when (eq return :fixed)
          '((:temporary (:scs (descriptor-reg) :from :eval) move-temp)
            (:temporary (:sc non-descriptor-reg :from :eval :offset ocfp-offset) ocfp-temp)))
@@ -882,9 +864,7 @@
                        (list :load-nargs
                              ,@(if (eq return :tail)
                                    '((unless (location= return-pc
-                                                        (make-random-tn :kind :normal
-                                                                        :sc (sc-or-lose 'control-stack)
-                                                                        :offset lra-save-offset))
+                                                        (make-random-tn (sc-or-lose 'control-stack) lra-save-offset))
                                        :load-return-pc)
                                      (when cur-nfp
                                        :frob-nfp))
@@ -912,7 +892,7 @@
                                    (mapcar #'(lambda (name)
                                                `(loadw ,name new-fp
                                                     ,(incf index)))
-                                           *register-arg-names*))
+                                           register-arg-names))
                                (storew cfp-tn new-fp ocfp-save-offset))
                              '((load-immediate-word nargs-pass (fixnumize nargs)))))
                       ,@(if (eq return :tail)

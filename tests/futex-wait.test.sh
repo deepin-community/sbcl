@@ -5,7 +5,7 @@
 run_sbcl <<EOF
  ;; The desired output differs by many factors, but an arbitrary slop allowance
  ;; could let the old bug creep back in.
- #+(and linux sb-thread) (exit :code #+(or x86 x86-64) 45
+ #+(and linux sb-thread) (exit :code #+(or x86 x86-64) (+ 90 #+mark-region-gc 30)
                                      #-(or x86 x86-64) 100)
  ;; can't run the test
  (exit :code 0)
@@ -18,7 +18,7 @@ fi
 
 # Some distributions do not have strace by default or restrict the
 # ptrace system call.
-if which strace > /dev/null && ! strace ls > /dev/null 2>&1 ; then
+if ! which strace > /dev/null || ! strace ls > /dev/null 2>&1 ; then
     exit $EXIT_TEST_WIN
 fi
 

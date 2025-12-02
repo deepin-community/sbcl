@@ -59,17 +59,25 @@
                                    (initial-contents nil contentsp)
                                    (initial-element 0)
                                    (retain-specialization-for-after-xc-core))
-  (declare (notinline cl:make-array))
+  ;; ECL fails to compile MAKE-ARRAY when keyword args are not literal keywords. e.g.:
+  ;; (DEFUN TRY (DIMS SELECT VAL)
+  ;;   (MAKE-ARRAY DIMS (IF SELECT :INITIAL-CONTENTS :INITIAL-ELEMENT) VAL)) ->
+  ;; "The macro form (MAKE-ARRAY DIMS (IF SELECT :INITIAL-CONTENTS :INITIAL-ELEMENT) VAL)
+  ;;  was not expanded successfully.
+  ;;  Error detected:
+  ;;  The key (IF SELECT :INITIAL-CONTENTS :INITIAL-ELEMENT) is not allowed"
+  #+host-quirks-ecl (declare (notinline cl:make-array))
 
   (aver element-type)
   ;; Canonicalize
   (setq element-type (type-specifier (specifier-type element-type)))
   ;; Expressed type must be _exactly_ one of the supported ones.
-  (aver (find (case element-type
-                #-sb-unicode (base-char 'character)
-                (t element-type))
-              sb-vm:*specialized-array-element-type-properties*
-              :key #'sb-vm:saetp-specifier :test 'equal))
+  (unless (find (case element-type
+                  #-sb-unicode (base-char 'character)
+                  (t element-type))
+                sb-vm:*specialized-array-element-type-properties*
+                :key #'sb-vm:saetp-specifier :test 'equal)
+    (error "No specialized array element-type for: ~a" element-type))
 
   (let ((array (cl:make-array dims
                               :element-type element-type
@@ -90,8 +98,44 @@
 (deftype sb-xc:simple-vector ()
   '(and cl:simple-vector (not (satisfies target-specialized-array-p))))
 
+(defun %other-pointer-widetag (x)
+  (if (bit-vector-p x)
+      sb-vm:simple-bit-vector-widetag
+      (sb-vm:saetp-typecode
+       (find (array-element-type x)
+             sb-vm:*specialized-array-element-type-properties*
+             :key #'sb-vm:saetp-specifier :test #'equal))))
+
 (defun sb-cold::clear-specialized-array-registry ()
   (let ((registry *array-to-specialization*))
     (maphash (lambda (key value)
                (unless (cdr value) (remhash key registry))) ; cdr = "retain"
              registry)))
+
+(defun our-sharp-a-reader (stream char rank)
+  (declare (ignore char))
+  (assert (not rank))
+  (let ((contents (read stream t nil t)))
+    ;; Just like in src/code/sharpm
+    (destructuring-bind (dimensions type &rest contents) contents
+      (sb-xc:make-array dimensions :initial-contents contents :element-type type))))
+
+(defun sb-impl::read-ub8-vector (pathname)
+  (with-open-file (stream pathname :element-type '(unsigned-byte 8))
+    (let* ((length (file-length stream))
+           (array (sb-xc:make-array length :element-type '(unsigned-byte 8)
+                                           :retain-specialization-for-after-xc-core t)))
+      (read-sequence array stream)
+      array)))
+
+(defun sb-impl::ubN-array-from-octets (raw-bytes element-type raw-octets-per-elt)
+  (let* ((n raw-octets-per-elt)
+         (array (sb-xc:make-array (/ (length raw-bytes) n) :element-type element-type
+                                  :retain-specialization-for-after-xc-core t)))
+    (loop for i from 0 below (length raw-bytes) by n
+          do (loop with element = 0
+                   for offset from 0 below n
+                   do (incf element (ash (aref raw-bytes (+ i offset))
+                                         (* 8 (- n offset 1))))
+                   finally (setf (aref array (/ i n)) element)))
+    array))

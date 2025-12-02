@@ -18,11 +18,15 @@
 (define-alien-routine ("os_context_float_register_addr" context-float-register-addr)
   (* unsigned) (context (* os-context-t)) (index int))
 
+#+linux
+(define-alien-routine ("os_context_ymm_register_addr" context-ymm-register-addr)
+    (* unsigned) (context (* os-context-t)) (index int))
+
 ;;; This is like CONTEXT-REGISTER, but returns the value of a float
 ;;; register. FORMAT is the type of float to return.
 
-(defun context-float-register (context index format)
-  (declare (ignorable context index))
+(defun context-float-register (context index format &optional integer)
+  (declare (ignorable context index integer))
   #-(or darwin linux openbsd win32 sunos (and freebsd x86-64))
   (progn
     (warn "stub CONTEXT-FLOAT-REGISTER")
@@ -31,15 +35,24 @@
   (let ((sap (alien-sap (context-float-register-addr context index))))
     (ecase format
       (single-float
-       (sap-ref-single sap 0))
+       (if integer
+           (values (sap-ref-32 sap 0) 4)
+           (sap-ref-single sap 0)))
       (double-float
-       (sap-ref-double sap 0))
+       (if integer
+           (values (sap-ref-64 sap 0) 8)
+           (sap-ref-double sap 0)))
       (complex-single-float
        (complex (sap-ref-single sap 0)
                 (sap-ref-single sap 4)))
       (complex-double-float
-       (complex (sap-ref-double sap 0)
-                (sap-ref-double sap 8)))
+       (if integer
+           (values (dpb (sap-ref-64 sap 8)
+                        (byte 64 64)
+                        (sap-ref-64 sap 0))
+                   16)
+           (complex (sap-ref-double sap 0)
+                    (sap-ref-double sap 8))))
       #+sb-simd-pack
       (simd-pack-int
        (%make-simd-pack-ub64
@@ -59,29 +72,44 @@
         (sap-ref-double sap 8)))
       #+sb-simd-pack-256
       (simd-pack-256-int
-       (%make-simd-pack-256-ub64
-        (sap-ref-64 sap 0)
-        (sap-ref-64 sap 8)
-        (sap-ref-64 sap 16)
-        (sap-ref-64 sap 24)))
+       (let ((saph #+linux (alien-sap (context-ymm-register-addr context index))
+                   #-linux sap)) ;; Unimplemented
+         (if integer
+             (values (dpb (dpb (sap-ref-64 saph 8)
+                               (byte 64 64)
+                               (sap-ref-64 saph 0))
+                          (byte 128 128)
+                          (dpb (sap-ref-64 sap 8)
+                               (byte 64 64)
+                               (sap-ref-64 sap 0)))
+                     32)
+             (%make-simd-pack-256-ub64
+              (sap-ref-64 sap 0)
+              (sap-ref-64 sap 8)
+              (sap-ref-64 saph 0)
+              (sap-ref-64 saph 8)))))
       #+sb-simd-pack-256
       (simd-pack-256-single
-       (%make-simd-pack-256-single
-        (sap-ref-single sap 0)
-        (sap-ref-single sap 4)
-        (sap-ref-single sap 8)
-        (sap-ref-single sap 12)
-        (sap-ref-single sap 16)
-        (sap-ref-single sap 20)
-        (sap-ref-single sap 24)
-        (sap-ref-single sap 28)))
+       (let ((saph #+linux (alien-sap (context-ymm-register-addr context index))
+                   #-linux sap))
+         (%make-simd-pack-256-single
+          (sap-ref-single sap 0)
+          (sap-ref-single sap 4)
+          (sap-ref-single sap 8)
+          (sap-ref-single sap 12)
+          (sap-ref-single saph 0)
+          (sap-ref-single saph 4)
+          (sap-ref-single saph 8)
+          (sap-ref-single saph 12))))
       #+sb-simd-pack-256
       (simd-pack-256-double
-       (%make-simd-pack-256-double
-        (sap-ref-double sap 0)
-        (sap-ref-double sap 8)
-        (sap-ref-double sap 16)
-        (sap-ref-double sap 24))))))
+       (let ((saph #+linux (alien-sap (context-ymm-register-addr context index))
+                   #-linux sap))
+         (%make-simd-pack-256-double
+          (sap-ref-double sap 0)
+          (sap-ref-double sap 8)
+          (sap-ref-double saph 0)
+          (sap-ref-double saph 8)))))))
 
 (defun %set-context-float-register (context index format value)
   (declare (ignorable context index format))
@@ -160,6 +188,10 @@
 (define-alien-routine ("os_context_fp_control" context-floating-point-modes)
     (unsigned 32)
   (context (* os-context-t)))
+#+linux
+(define-alien-routine ("os_context_set_fp_control" context-set-floating-point-modes) void
+  (context (* os-context-t))
+  (value (unsigned 32)))
 
 (define-alien-routine
     ("arch_get_fp_modes" floating-point-modes) (unsigned 32))
@@ -199,164 +231,55 @@
            (sb-kernel::decode-internal-error-args (sap+ pc 1) trap-number)))))
 
 
-#+immobile-space
-(defun alloc-immobile-fdefn ()
-  (alloc-immobile-fixedobj fdefn-size
-                           (logior (ash undefined-fdefn-header 16)
-                                   fdefn-widetag))) ; word 0
+(defun write-funinstance-prologue (fin)
+  ;; Encode: MOV RAX,[RIP+9] / JMP [RAX-3] / NOP / MOV EBX, #x0
+  ;; and the #x0 is replaced with a hash code.
+  (with-pinned-objects (fin)
+    (let* ((sap (sap+ (int-sap (get-lisp-obj-address fin))
+                      (- (ash 2 word-shift) fun-pointer-lowtag))))
+      ;; Scavenging these words when you shouldn't is actually harmless
+      ;; because by a stroke of luck, they all look fixnum-tagged.
+      (setf (sap-ref-sap sap -8) sap
+            (sap-ref-word sap 0) #xFF00000009058B48
+            (sap-ref-word sap 8) #x00000000BB90FD60)))
+  (update-dynamic-space-code-tree fin)
+  fin)
 
-#+immobile-code
-(progn
-(defconstant trampoline-entry-offset n-word-bytes)
-(defun make-simplifying-trampoline (fun)
-  (let ((code (truly-the (values code-component &optional)
-                         (allocate-code-object :dynamic 0 3 24)))) ; KLUDGE
-    (setf (%code-debug-info code) fun)
-    (let ((sap (sap+ (code-instructions code) trampoline-entry-offset))
-          (ea (+ (logandc2 (get-lisp-obj-address code) lowtag-mask)
-                 (ash code-debug-info-slot word-shift))))
-      ;; For a funcallable-instance, the instruction sequence is:
-      ;;    MOV RAX, [RIP-n] ; load the function
-      ;;    MOV RAX, [RAX+5] ; load the funcallable-instance-fun
-      ;;    JMP [RAX-3]
-      ;; Otherwise just instructions 1 and 3 will do.
-      ;; We could use the #xA1 opcode to save a byte, but that would
-      ;; be another headache do deal with when relocating this code.
-      ;; There's precedent for this style of hand-assembly,
-      ;; in arch_write_linkage_table_entry() and arch_do_displaced_inst().
-      (setf (sap-ref-32 sap 0) #x058B48 ; REX MOV [RIP-n]
-            (signed-sap-ref-32 sap 3) (- ea (+ (sap-int sap) 7))) ; disp
-      (let ((i (if (/= (%fun-pointer-widetag fun) funcallable-instance-widetag)
-                   7
-                   (let ((disp8 (- (ash funcallable-instance-function-slot
-                                        word-shift)
-                                   fun-pointer-lowtag))) ; = 5
-                     (setf (sap-ref-32 sap 7) (logior (ash disp8 24) #x408B48))
-                     11))))
-        (setf (sap-ref-32 sap i) #xFD60FF))) ; JMP [RAX-3]
-    ;; Verify that the jump table size reads as  0.
-    (aver (zerop (code-jump-table-words code)))
-    ;; It is critical that there be a trailing 'uint16' of 0 in this object
-    ;; so that CODE-N-ENTRIES reports 0.  By luck, there is exactly enough
-    ;; room in the object to hold two 0 bytes. It would be easy enough to enlarge
-    ;; by 2 words if it became necessary. The assertions makes sure we stay ok.
-    (aver (zerop (code-n-entries code)))
-    code))
+(sb-kernel:!defstruct-with-alternate-metaclass closure-trampoline
+  :slot-names ()
+  :constructor %alloc-closure-trampoline
+  :superclass-name function
+  :metaclass-name static-classoid
+  :metaclass-constructor make-static-classoid
+  :dd-type funcallable-structure)
 
-;;; Return T if FUN can't be called without loading RAX with its descriptor.
-;;; This is true of any funcallable instance which is not a GF, and closures.
-(defun fun-requires-simplifying-trampoline-p (fun)
-  (case (%fun-pointer-widetag fun)
-    (#.sb-vm:closure-widetag t)
-    (#.sb-vm:funcallable-instance-widetag
-     ;; if the FIN has no raw words then it has no internal trampoline
-     (sb-kernel::bitmap-all-taggedp (%fun-layout fun)))))
+(defmethod print-object ((self closure-trampoline) stream)
+  (print-unreadable-object (self stream :identity t)
+    (let ((payload (%primitive slot self 'function
+                               funcallable-instance-function-slot fun-pointer-lowtag)))
+      (write-string (if (functionp payload) "Tramp " "Undefined-fun ") stream)
+      (prin1 payload stream))))
 
-;; TODO: put a trampoline in all fins and allocate them anywhere.
-;; Revision e7cd2bd40f5b9988 caused some FINs to go in dynamic space
-;; which is fine, but those fins need to have a default bitmap of -1 instead
-;; of a special bitmap because we examine the bitmap when deciding whether
-;; the FIN can be installed into an FDEFN without needing an external trampoline.
-;; The easiest way to achieve this intent is to default all bitmaps to -1,
-;; then change it in the layout when writing raw words. A better fix would
-;; try to allocate all FINs in immobile space until it is exhausted, then fallback
-;; to dynamic space. The address of the fin is no longer an issue, since fdefns
-;; can point to the entire address space, but the fixed-size immobile object
-;; allocator doesn't returns 0 - it calls the monitor if it fails.
+(defun ensure-simplistic (function name)
+  (when (and (functionp function) (not (closurep function)))
+    (return-from ensure-simplistic function))
+  (let ((tramp (%alloc-closure-trampoline)))
+    (with-pinned-objects (tramp)
+      (if (or (eql function 0) (null function))
+          (let* ((asm-code (sb-fasl::get-asm-routine 'undefined-tramp))
+                 (base (sap+ (int-sap (get-lisp-obj-address tramp)) (- fun-pointer-lowtag)))
+                 (sap (sap+ base 23)))
+            (setf (sap-ref-32 sap 0) #x24A4FF41 ; JMP [R12+disp]
+                  (signed-sap-ref-32 sap 4) (asm-routine-indirect-address asm-code)
+                  (sap-ref-32 sap 8) #x90
+                  ;; The undefined function name is stored in the "function" slot.
+                  ;; The slot setter doesn't like this of course.
+                  (sap-ref-lispobj base (ash funcallable-instance-function-slot word-shift))
+                  name))
+          (setf (%funcallable-instance-fun tramp) function)))
+    tramp))
 
-;; So ideally, all funcallable instances would resemble simple-funs for a
-;; small added cost of 2 words per object. It will be necessary to have the GC
-;; treat ambiguous interior pointers to the unboxed words in the same way as
-;; any code pointer. Placing FINs on pages marked as containing code will allow
-;; the conservative root check to be skipped for obviously non-code objects.
-
-;; Also we will need to write the embedded trampoline either in a word index
-;; that differs based on length of the FIN, or place the boxed slots after
-;; the trampoline. As of now, this can only deal with standard GFs.
-;; The primitive object has 2 descriptor slots (fin-fun and CLOS slot vector)
-;; and 2 non-descriptor slots containing machine instructions, after the
-;; self-pointer (trampoline) slot. Scavenging the self-pointer is unnecessary
-;; though harmless. This intricate and/or obfuscated calculation of #b110
-;; is insensitive to the index of the trampoline slot, probably.
-(defun make-immobile-funinstance (layout slot-vector)
-  (let ((gf (truly-the funcallable-instance
-             (alloc-immobile-fixedobj 6 ; KLUDGE
-                                      (logior (ash 5 n-widetag-bits)
-                                              funcallable-instance-widetag)))))
-    ;; Assert that raw bytes will not cause GC invariant lossage
-    (aver (not (sb-kernel::bitmap-all-taggedp layout)))
-    ;; Set layout prior to writing raw slots
-    (setf (%fun-wrapper gf) layout)
-    ;; just being pedantic - liveness is preserved by the stack reference.
-    (with-pinned-objects (gf)
-      (let* ((addr (logandc2 (get-lisp-obj-address gf) lowtag-mask))
-             (sap (int-sap addr))
-             (insts-offs (ash (1+ funcallable-instance-info-offset) word-shift)))
-        (setf (sap-ref-word sap (ash funcallable-instance-trampoline-slot word-shift))
-              (truly-the word (+ addr insts-offs))
-              (sap-ref-word sap insts-offs) #xFFFFFFE9058B48  ; MOV RAX,[RIP-23]
-              (sap-ref-32 sap (+ insts-offs 7)) #x00FD60FF))) ; JMP [RAX-3]
-    (%set-funcallable-instance-info gf 0 slot-vector)
-    gf))
-
-(defun fdefn-has-static-callers (fdefn)
-  (declare (type fdefn fdefn))
-  (with-pinned-objects (fdefn)
-    (logbitp 7 (sap-ref-8 (int-sap (get-lisp-obj-address fdefn))
-                          (- 1 other-pointer-lowtag)))))
-
-(defun set-fdefn-has-static-callers (fdefn newval)
-  (declare (type fdefn fdefn) (type bit newval))
-  (if (= newval 0)
-      (%primitive unset-fdefn-has-static-callers fdefn)
-      (%primitive set-fdefn-has-static-callers fdefn))
-  fdefn)
-
-(defun %set-fdefn-fun (fdefn fun)
-  (declare (type fdefn fdefn) (type function fun)
-           (values function))
-  (when (fdefn-has-static-callers fdefn)
-    (remove-static-links fdefn))
-  (let ((trampoline (when (fun-requires-simplifying-trampoline-p fun)
-                      (make-simplifying-trampoline fun)))) ; a newly made CODE object
-    (with-pinned-objects (fdefn trampoline fun)
-      (let* ((jmp-target
-              (if trampoline
-                  ;; Jump right to code-instructions + N. There's no simple-fun.
-                  (sap-int (sap+ (code-instructions trampoline)
-                                 trampoline-entry-offset))
-                  ;; CLOSURE-CALLEE accesses the self pointer of a funcallable
-                  ;; instance w/ builtin trampoline, or a simple-fun.
-                  ;; But the result is shifted by N-FIXNUM-TAG-BITS because
-                  ;; CELL-REF yields a descriptor-reg, not an unsigned-reg.
-                  (get-lisp-obj-address (%closure-callee fun)))))
-        (%primitive set-fdefn-fun fdefn fun jmp-target))))
-  fun)
-
-) ; end PROGN
-
-;;; Find an immobile FDEFN or FUNCTION given an interior pointer to it.
-#+immobile-space
-(defun find-called-object (address)
-  (let ((obj (alien-funcall (extern-alien "search_all_gc_spaces"
-                                          (function unsigned unsigned))
-                            address)))
-    (unless (eql obj 0)
-      (case (sap-ref-8 (int-sap obj) 0)
-        (#.code-header-widetag
-         (%simple-fun-from-entrypoint
-          (make-lisp-obj (logior obj other-pointer-lowtag))
-          address))
-        (#.fdefn-widetag
-         (make-lisp-obj (logior obj other-pointer-lowtag)))
-        (#.funcallable-instance-widetag
-         (make-lisp-obj (logior obj fun-pointer-lowtag)))))))
-
-;;; Compute the PC that FDEFN will jump to when called.
-#+immobile-code
-(defun fdefn-raw-addr (fdefn)
-  (sap-ref-word (int-sap (get-lisp-obj-address fdefn))
-                (- (ash fdefn-raw-addr-slot word-shift) other-pointer-lowtag)))
+(defun stepper-fun (closure) (ensure-simplistic closure nil))
 
 ;;; Undo the effects of XEP-ALLOCATE-FRAME
 ;;; and point PC to FUNCTION
@@ -375,99 +298,48 @@
                                             (- (ash simple-fun-self-slot word-shift)
                                                fun-pointer-lowtag))))))
 
-(defun singly-occurs-p (thing things &aux (len (length things)))
-  ;; Return T if THING occurs exactly once in vector THINGS,
-  ;; assuming that it occurs at all.
-  (declare (simple-vector things))
-  (dotimes (i len)
-    (when (eq (svref things i) thing)
-      ;; re-using I as the index is OK because we leave the outer loop
-      ;; after this.
-      (return (loop (cond ((>= (incf i) len) (return t))
-                          ((eq thing (svref things i)) (return nil))))))))
+(defconstant cf-bit 0)
+(defconstant sf-bit 7)
+(defconstant of-bit 11)
 
-;;; Allocate a code object.
-(defun alloc-dynamic-space-code (total-words)
-  (values (%primitive alloc-dynamic-space-code (the fixnum total-words))))
+(defun context-overflow-carry-flags (context)
+  (let ((flags (context-flags context)))
+    (values (logbitp of-bit flags)
+            (logbitp cf-bit flags))))
 
-;;; Remove calls via fdefns from CODE when compiling into memory.
-(defun statically-link-code-obj (code fixups)
-  (declare (ignorable code fixups))
-  (unless (immobile-space-obj-p code)
-    (return-from statically-link-code-obj code))
-  #+immobile-code
-  (let* ((fdefns-start (+ code-constants-offset
-                          (* code-slots-per-simple-fun (code-n-entries code))))
-         (fdefns-count (the index (code-n-named-calls code)))
-         (replacements (make-array fdefns-count :initial-element nil))
-         (ambiguous (make-array fdefns-count :initial-element 0 :element-type 'bit))
-         (any-replacements)
-         (any-ambiguous))
-    ;; For each fdefn, decide two things:
-    ;; * whether the fdefn can be replaced by its function - possible only when
-    ;;   that function is in immobile space and needs no trampoline.
-    ;; * whether the replacement creates ambiguitity - if #'F and #'G are the same
-    ;;   function, then substituting that function in for the fdefn of F and G
-    ;;   requires storing locations at which replacement was done
-    (dotimes (i fdefns-count)
-      (let* ((fdefn (code-header-ref code (+ fdefns-start i)))
-             (fun (when (fdefn-p fdefn) (fdefn-fun fdefn))))
-        (when (and (immobile-space-obj-p fun)
-                   (not (fun-requires-simplifying-trampoline-p fun)))
-          (setf any-replacements t (aref replacements i) fun))))
-    (dotimes (i fdefns-count)
-      (when (and (aref replacements i)
-                 (not (singly-occurs-p (aref replacements i) replacements)))
-        (setf any-ambiguous t (bit ambiguous i) 1)))
-    (unless any-replacements
-      (return-from statically-link-code-obj))
-    ;; Map each fixup to an index in REPLACEMENTS (which currently holds functions,
-    ;; not fdefns, so we have to scan the code header).
-    ;; This can be done outside the lock
-    (flet ((index-of (fdefn)
-             (dotimes (i fdefns-count)
-               (when (eq fdefn (code-header-ref code (+ fdefns-start i)))
-                 (return i)))))
-      (setq fixups (mapcar (lambda (fixup) ; = (offset . #<fdefn>)
-                             (cons (index-of (cdr fixup)) (car fixup)))
-                           fixups)))
-    (let ((insts (code-instructions code)))
-      ;; One final check: if any of the fixed-up instructions is "MOV EAX, #xNNNN"
-      ;; instead of a CALL or JMP, we can't fixup that particular fdefn for any
-      ;; of its call sites. (They should all use MOV if any one does).
-      ;; This happens when *COMPILE-TO-MEMORY-SPACE* is set to :AUTOMATIC.
-      ;; In that case we don't know that the code will be within an imm32 of
-      ;; the target address, because the code might have gone into dynamic space.
-      (dolist (fixup fixups)
-        (binding* ((fdefn-index (car fixup) :exit-if-null)
-                   (offset (cdr fixup)))
-          (when (and (aref replacements fdefn-index)
-                     (not (eql (logior (sap-ref-8 insts (1- offset)) 1) #xE9)))
-            (setf (aref replacements fdefn-index) nil))))
-      (let ((stored-locs (if any-ambiguous
-                             (make-array fdefns-count :initial-element nil))))
-        (with-system-mutex (sb-c::*static-linker-lock*)
-          (dolist (fixup fixups)
-            (binding* ((fdefn-index (car fixup) :exit-if-null)
-                       (offset (cdr fixup))
-                       (fdefn (code-header-ref code (+ fdefns-start fdefn-index)))
-                       (fun (aref replacements fdefn-index)))
-              (when fun
-                ;; Set the statically-linked flag
-                (sb-vm::set-fdefn-has-static-callers fdefn 1)
-                (when (= (bit ambiguous fdefn-index) 1)
-                  (push offset (aref stored-locs fdefn-index)))
-                ;; Change the machine instruction
-                ;; %CLOSURE-CALLEE reads the entry addresss word of any
-                ;; kind of function, but as if it were a tagged fixnum.
-                (let ((entry (descriptor-sap (%closure-callee fun))))
-                  (setf (signed-sap-ref-32 insts offset)
-                        (sap- entry (sap+ insts (+ offset 4))))))))
-          ;; Replace ambiguous elements of the code header while still holding the lock
-          (dotimes (i fdefns-count)
-            (when (= (bit ambiguous i) 1)
-              (let ((wordindex (+ fdefns-start i))
-                    (locs (aref stored-locs i)))
-                (setf (code-header-ref code wordindex)
-                      (cons (code-header-ref code wordindex) locs)))))))))
-  code)
+(def-cpu-feature :avx2
+    (plusp (sb-alien:extern-alien "avx2_supported" int)))
+
+(def-cpu-feature :ssse3+popcnt
+    (when (>= (sb-vm::%cpu-identification 0 0) 1)
+      (multiple-value-bind (eax ebx ecx) (sb-vm::%cpu-identification 1 0)
+        (declare (ignore eax ebx))
+        (= (logand #1=(logior (ash 1 9)   ;; ssse3
+                              (ash 1 23)) ;; popcnt
+                   ecx)
+           #1#))))
+
+(def-cpu-feature :bmi2
+    (multiple-value-bind (eax ebx) (sb-vm::%cpu-identification 7 0)
+      (declare (ignore eax))
+      (logtest ebx #x100)))
+
+(in-package :sb-bignum)
+
+(sb-vm::def-variant multiply-bignum-and-fixnum :bmi2 (bignum fixnum)
+  (declare (type bignum bignum) (type fixnum fixnum)
+           (optimize speed (safety 0)))
+  (let* ((bignum-plus-p (bignum-plus-p bignum))
+         (fixnum-plus-p (not (minusp fixnum)))
+         (bignum (if bignum-plus-p bignum (negate-bignum-not-fully-normalized bignum)))
+         (bignum-len (%bignum-length bignum))
+         (fixnum (if fixnum-plus-p fixnum (- fixnum)))
+         (result (%allocate-bignum (1+ bignum-len))))
+    (declare (type bignum bignum result)
+             (type bignum-element-type fixnum))
+    (sb-sys:%primitive sb-vm::bignum-mulx-and-add-word-loop bignum fixnum bignum-len result)
+    (unless (eq bignum-plus-p fixnum-plus-p)
+      (negate-bignum-in-place result))
+    (%normalize-bignum result (1+ bignum-len))))
+
+(in-package :sb-vm)

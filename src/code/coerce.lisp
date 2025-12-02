@@ -28,27 +28,31 @@
                            (vector '(aref in-object index))
                            (sequence '(elt in-object index))))))))
 
-  (def list-to-vector* (make-sequence type length) aref list t)
+  (def list-to-vector (make-sequence type length) aref list t)
 
-  (def vector-to-vector* (make-sequence type length) aref vector t)
+  (def vector-to-vector (make-sequence type length) aref vector t)
 
-  (def sequence-to-vector* (make-sequence type length) aref sequence))
+  (def sequence-to-vector (make-sequence type length) aref sequence))
 
-(defun vector-to-list* (object)
-  (declare (type vector object))
-  (dx-let ((result (list nil)))
-    (let ((splice result))
-      (do-vector-data (elt object (cdr result))
-        (let ((cell (list elt)))
-          (setf (cdr splice) cell splice cell))))))
+(defun vector-to-list (object)
+  (let (result)
+    (with-array-data ((object object)
+                      (start)
+                      (end) :check-fill-pointer t)
+      (cond-dispatch (simple-vector-p object)
+        (loop for i from (1- end) downto start
+              do (setf result (cons (aref object i) result)))))
+    result))
 
 (defun sequence-to-list (sequence)
   (declare (type sequence sequence))
-  (dx-let ((result (list nil)))
-    (let ((splice result))
-      (sb-sequence:dosequence (elt sequence (cdr result))
-        (let ((cell (list elt)))
-          (setf (cdr splice) cell splice cell))))))
+  (let* ((result (unaligned-dx-cons nil))
+         (splice result))
+    (declare (dynamic-extent result)
+             (sb-c::no-debug result splice))
+    (sb-sequence:dosequence (elt sequence (cdr result))
+      (let ((cell (list elt)))
+        (setf (cdr splice) cell splice cell)))))
 
 ;;; These are used both by the full DEFUN function and by various
 ;;; optimization transforms in the constant-OUTPUT-TYPE-SPEC case.
@@ -59,18 +63,11 @@
 (declaim (inline coerce-to-list))
 (declaim (inline coerce-to-vector))
 
-(defun coerce-symbol-to-fun (symbol)
-  ;; FIXME? I would think to use SYMBOL-FUNCTION here which does not strip off
-  ;; encapsulations. But Stas wrote FDEFINITION so ...
-  ;; [Also note, we won't encapsulate a macro or special-form, so this
-  ;; introspective technique to decide what kind something is works either way]
-  (let ((def (fdefinition symbol)))
-    (if (macro/special-guard-fun-p def)
-        (error (ecase (car (%fun-name def))
-                (:macro "~S names a macro.")
-                (:special "~S names a special operator."))
-               symbol)
-        def)))
+(defun coerce-to-extended-sequence (object class)
+  (let ((prototype (sb-mop:class-prototype
+                    (sb-pcl:ensure-class-finalized class))))
+    (sb-sequence:make-sequence-like
+     prototype (length object) :initial-contents object)))
 
 (defun coerce-to-fun (object)
   ;; (Unlike the other COERCE-TO-FOOs, this one isn't inline, because
@@ -105,20 +102,19 @@
 (defun coerce-to-list (object)
   (seq-dispatch object
                 object
-                (vector-to-list* object)
+                (vector-to-list object)
                 (sequence-to-list object)))
 
 (defun coerce-to-vector (object output-type-spec)
   (etypecase object
-    (list (list-to-vector* object output-type-spec))
-    (vector (vector-to-vector* object output-type-spec))))
+    (list (list-to-vector object output-type-spec))
+    (vector (vector-to-vector object output-type-spec))))
 
 ;;; old working version
 (defun coerce (object output-type-spec)
   "Coerce the Object to an object of type Output-Type-Spec."
   (declare (explicit-check))
   (flet ((coerce-error ()
-           (declare (optimize allow-non-returning-tail-call))
            (error 'simple-type-error
                   :format-control "~S can't be converted to type ~
                                     ~/sb-impl:print-type-specifier/."
@@ -198,7 +194,7 @@
          (if (vectorp object)
              (cond
                ((type= type (specifier-type 'list))
-                (vector-to-list* object))
+                (vector-to-list object))
                ((type= type (specifier-type 'null))
                 (if (= (length object) 0)
                     'nil
@@ -213,7 +209,7 @@
                           (sequence-type-length-mismatch-error type length))
                         (unless (>= length min)
                           (sequence-type-length-mismatch-error type length)))
-                    (vector-to-list* object))))
+                    (vector-to-list object))))
                (t (sequence-type-too-hairy (type-specifier type))))
              (if (sequencep object)
                  (cond
@@ -242,19 +238,17 @@
          (typecase object
            ;; FOO-TO-VECTOR* go through MAKE-SEQUENCE, so length
            ;; errors are caught there. -- CSR, 2002-10-18
-           (list (list-to-vector* object output-type-spec))
-           (vector (vector-to-vector* object output-type-spec))
-           (sequence (sequence-to-vector* object output-type-spec))
+           (list (list-to-vector object output-type-spec))
+           (vector (vector-to-vector object output-type-spec))
+           (sequence (sequence-to-vector object output-type-spec))
            (t
             (coerce-error))))
-        ((and (csubtypep type (specifier-type 'sequence))
-              (find-class output-type-spec nil))
-         (let ((prototype (sb-mop:class-prototype
-                           (sb-pcl:ensure-class-finalized
-                            (find-class output-type-spec)))))
-           (sb-sequence:make-sequence-like
-            prototype (length object) :initial-contents object)))
-        ((csubtypep type (specifier-type 'function))
+        ((csubtypep type (specifier-type 'sequence))
+         (let ((class (find-class output-type-spec nil)))
+           (if class
+               (coerce-to-extended-sequence object class)
+               (coerce-error))))
+        ((type= type (specifier-type 'function))
          (coerce-to-fun object))
         (t
          (coerce-error))))))

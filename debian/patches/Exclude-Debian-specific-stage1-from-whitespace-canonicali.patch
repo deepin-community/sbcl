@@ -1,0 +1,21 @@
+From: Sean Whitton <spwhitton@spwhitton.name>
+Date: Thu, 30 May 2024 21:33:41 +0100
+Subject: Exclude Debian-specific stage1/ from whitespace canonicalisation
+
+---
+ tools-for-build/canonicalize-whitespace.lisp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/tools-for-build/canonicalize-whitespace.lisp b/tools-for-build/canonicalize-whitespace.lisp
+index d9326fe..a2fe4b3 100644
+--- a/tools-for-build/canonicalize-whitespace.lisp
++++ b/tools-for-build/canonicalize-whitespace.lisp
+@@ -98,7 +98,7 @@
+                 (lambda (file)
+                   (if (not (or (pathname-name file)
+                                (pathname-type file)))
+-                      (unless (member (car (last (pathname-directory file))) '(".git" "ansi-test" "obj" "output") :test #'equal)
++                      (unless (member (car (last (pathname-directory file))) '(".git" "ansi-test" "obj" "output" "stage1") :test #'equal)
+                         (rec file))
+                       (when (and (member (pathname-type file) *source-types* :test #'equal)
+                                  (not (member (pathname-name file) *exceptions* :test #'string=)))

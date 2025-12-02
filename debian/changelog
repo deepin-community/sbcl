@@ -1,3 +1,234 @@
+sbcl (2:2.5.10-1) unstable; urgency=medium
+
+  * Update to new upstream version 2.5.10.
+  * Skip chill.impure.lisp tests under autopkgtest.
+
+ -- Sean Whitton <spwhitton@spwhitton.name>  Tue, 11 Nov 2025 15:26:30 +0000
+
+sbcl (2:2.5.8-1) unstable; urgency=medium
+
+  * Update to new upstream version 2.5.8.
+
+ -- Sean Whitton <spwhitton@spwhitton.name>  Thu, 04 Sep 2025 15:18:56 +0100
+
+sbcl (2:2.5.7-1) unstable; urgency=medium
+
+  * Update to new upstream version 2.5.7.
+
+ -- Sean Whitton <spwhitton@spwhitton.name>  Tue, 19 Aug 2025 12:01:59 +0100
+
+sbcl (2:2.5.2-1) unstable; urgency=medium
+
+  * Update to new upstream version 2:2.5.2.
+  * Add procps to autopkgtest deps.
+
+ -- Sean Whitton <spwhitton@spwhitton.name>  Sun, 02 Mar 2025 11:38:42 +0800
+
+sbcl (2:2.5.1-1) unstable; urgency=medium
+
+  * Update to new upstream version 2:2.5.1.
+  * Standardise sub-make invocation for doc/manual.
+  * Force non-parallel build for doc/manual (Closes: #1098645).
+
+ -- Sean Whitton <spwhitton@spwhitton.name>  Sun, 23 Feb 2025 18:11:31 +0800
+
+sbcl (2:2.5.0-1) unstable; urgency=medium
+
+  [ Peter Van Eynde ]
+  * New upstream version 2.5.0
+  * Refreshed patches
+  * Added myself as uploader
+  * Updated Standards-Version, no changes
+
+ -- Peter Van Eynde <pvaneynd@debian.org>  Sun, 05 Jan 2025 20:52:42 +0100
+
+sbcl (2:2.4.11-1) unstable; urgency=medium
+
+  * Update to new upstream version 2:2.4.11.
+
+ -- Sean Whitton <spwhitton@spwhitton.name>  Fri, 06 Dec 2024 11:32:00 +0800
+
+sbcl (2:2.4.10-2) unstable; urgency=medium
+
+  [ Bo YU ]
+  * Switch riscv64 to bootstrap with clisp (Closes: #1033731).
+
+ -- Sean Whitton <spwhitton@spwhitton.name>  Wed, 13 Nov 2024 18:57:27 +0800
+
+sbcl (2:2.4.10-1) unstable; urgency=medium
+
+  * Update to new upstream version 2:2.4.10.
+
+ -- Sean Whitton <spwhitton@spwhitton.name>  Fri, 08 Nov 2024 10:40:48 +0800
+
+sbcl (2:2.4.9+git20241010.1.465757f12-1) unstable; urgency=medium
+
+  * Update to new upstream snapshot 2:2.4.9+git20241010.1.465757f12.
+
+ -- Sean Whitton <spwhitton@spwhitton.name>  Thu, 10 Oct 2024 18:04:22 +0800
+
+sbcl (2:2.4.9-1) unstable; urgency=medium
+
+  * Update to new upstream version 2:2.4.9.
+
+ -- Sean Whitton <spwhitton@spwhitton.name>  Mon, 30 Sep 2024 13:31:20 +0800
+
+sbcl (2:2.4.8-1) unstable; urgency=medium
+
+  * Update to new upstream version 2:2.4.8.
+
+ -- Sean Whitton <spwhitton@spwhitton.name>  Thu, 26 Sep 2024 12:21:37 +0100
+
+sbcl (2:2.4.7-2) unstable; urgency=medium
+
+  * Enable debug printing in :WASTE-HEAP test.
+
+ -- Sean Whitton <spwhitton@spwhitton.name>  Thu, 08 Aug 2024 09:27:42 +0800
+
+sbcl (2:2.4.7-1) unstable; urgency=medium
+
+  * Update to new upstream version 2:2.4.7.
+
+ -- Sean Whitton <spwhitton@spwhitton.name>  Tue, 06 Aug 2024 11:01:13 +0800
+
+sbcl (2:2.4.7~git20240721.1.7a19681d9-1) unstable; urgency=medium
+
+  * Update to new upstream snapshot.
+
+ -- Sean Whitton <spwhitton@spwhitton.name>  Tue, 23 Jul 2024 13:27:48 +0900
+
+sbcl (2:2.4.6-1) unstable; urgency=medium
+
+  * Update to new upstream version 2:2.4.6.
+
+ -- Sean Whitton <spwhitton@spwhitton.name>  Mon, 22 Jul 2024 12:29:54 +0900
+
+sbcl (2:2.4.5-1) unstable; urgency=medium
+
+  * New upstream release.
+  * Switch to git-debrebase(1) git workflow.
+    - Add README.source pointing to dgit-maint-debrebase(7).
+    - Remove inactive team members from Uploaders.
+      Those still interested in the package should feel free to reinstate
+      themselves there, and thereby acknowledge the workflow change.
+  * d/rules: Don't install src/runtime/ldb to bin:sbcl-source.
+  * Drop disable-tests-traceroot.impure.lisp-on-arm64.patch.
+    Equivalent change made upstream.
+  * Patch tools-for-build/canonicalize-whitespace.lisp to exclude stage1/.
+  * Backport upstream commit dc890089a to fix hide-packages.test.sh.
+
+ -- Sean Whitton <spwhitton@spwhitton.name>  Fri, 31 May 2024 17:53:28 +0100
+
+sbcl (2:2.3.7-2) unstable; urgency=medium
+
+  * Disable genheaders.test.sh under autopkgtest.
+
+ -- Sean Whitton <spwhitton@spwhitton.name>  Wed, 02 Aug 2023 15:09:31 +0100
+
+sbcl (2:2.3.7-1) unstable; urgency=medium
+
+  * New upstream release.
+  * Refresh patches.
+
+ -- Sean Whitton <spwhitton@spwhitton.name>  Tue, 01 Aug 2023 11:26:51 +0100
+
+sbcl (2:2.3.6-2) unstable; urgency=medium
+
+  * Disable tests/traceroot.impure.lisp on arm64 to fix FTBFS there.
+
+ -- Sean Whitton <spwhitton@spwhitton.name>  Sat, 22 Jul 2023 17:56:30 +0100
+
+sbcl (2:2.3.6-1) unstable; urgency=medium
+
+  * New upstream release.
+  * Refresh patches.
+
+ -- Sean Whitton <spwhitton@spwhitton.name>  Fri, 14 Jul 2023 21:04:26 +0100
+
+sbcl (2:2.2.9-1) unstable; urgency=medium
+
+  [ Sean Whitton ]
+  * New upstream release.
+  * Drop Cargo-cult-some-linkable-runtime-stuff.patch.
+    Included in this release.
+  * Refresh remaining patches.
+
+  [ Sébastien Villemot ]
+  * Remove myself from Uploaders
+
+ -- Sean Whitton <spwhitton@spwhitton.name>  Wed, 05 Oct 2022 10:15:23 -0700
+
+sbcl (2:2.2.8-2) unstable; urgency=medium
+
+  * Add Cargo-cult-some-linkable-runtime-stuff.patch.
+    This should fix the build on armel, armhf and arm64.
+
+ -- Sean Whitton <spwhitton@spwhitton.name>  Sat, 17 Sep 2022 17:44:25 -0700
+
+sbcl (2:2.2.8-1) unstable; urgency=medium
+
+  * New upstream release.
+
+ -- Sean Whitton <spwhitton@spwhitton.name>  Sun, 04 Sep 2022 14:40:04 -0700
+
+sbcl (2:2.2.7-1) unstable; urgency=medium
+
+  * New upstream release.
+  * Drop patches applied upstream.
+
+ -- Sean Whitton <spwhitton@spwhitton.name>  Sun, 21 Aug 2022 15:46:32 -0700
+
+sbcl (2:2.2.6-2) unstable; urgency=medium
+
+  * Add take-contrib-blocklist-into-account-for-doc-generation.patch
+    (Closes: #1016045).
+
+ -- Sean Whitton <spwhitton@spwhitton.name>  Thu, 28 Jul 2022 14:09:44 -0700
+
+sbcl (2:2.2.6-1) unstable; urgency=medium
+
+  * New upstream release.
+    - Update build-dep zlib -> zstd for upstream change.
+  * Drop ignore-test-side-effect.patch.
+    Fixed upstream.
+  * Add Fix-hide-packages-test-if-configured-with-xref-for-intern.patch.
+  * Refresh remaining patches.
+
+ -- Sean Whitton <spwhitton@spwhitton.name>  Sun, 24 Jul 2022 22:06:26 -0700
+
+sbcl (2:2.2.3-2) unstable; urgency=medium
+
+  [ Michael Biebl ]
+  * Add support for systemd-binfmt (Closes: #1012354).
+
+  [ Sean Whitton ]
+  * Add myself to Uploaders.
+  * Drop d/source/local-options for dgit compatibility.
+
+ -- Sean Whitton <spwhitton@spwhitton.name>  Mon, 27 Jun 2022 17:20:48 -0700
+
+sbcl (2:2.2.3-1) unstable; urgency=medium
+
+  * New upstream release.
+  * vop-existsp-test.patch: drop patch, applied upstream
+  * ignore-test-side-effect.patch: new patch, fixes test failure
+  * Add myself to uploaders
+  * Add Salsa CI/CD configuration in debian/salsa-ci.yml
+  * Add --with-sb-linkable-runtime to armel armhf arm64
+  * Fix architecture detection during CI build on Salsa
+  * Add sbcl-source to list of autopkgtest deps
+  * Fix autopkgtest by setting C_INCLUDE_PATH for sbcl.h
+  * Disable failing Salsa CI tests
+
+ -- Kambiz Darabi <darabi@m-creations.net>  Tue, 26 Apr 2022 10:33:33 +0200
+
+sbcl (2:2.1.11-1) unstable; urgency=medium
+
+  * New upstream release
+  * vop-existsp-test.patch: new patch, fixes test failure
+
+ -- Sébastien Villemot <sebastien@debian.org>  Wed, 01 Dec 2021 11:44:18 +0100
+
 sbcl (2:2.1.10-1) unstable; urgency=medium
 
   * New upstream release

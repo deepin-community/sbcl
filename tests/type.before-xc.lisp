@@ -26,7 +26,7 @@
 ;;; memoization performed in SPECIFIER-TYPE, which is only a best effort
 ;;; to produce the EQ model object given an EQUAL specifier.
 (dolist (type sb-kernel::*special-union-types*)
-  (dolist (constituent-type (union-type-types (specifier-type type)))
+  (dolist (constituent-type (sb-kernel::flatten-numeric-union-types (specifier-type type)))
     (let ((specifier (type-specifier constituent-type)))
       (drop-all-hash-caches)
       (let ((parse (specifier-type specifier)))
@@ -38,8 +38,8 @@
                (specifier-type '(and (satisfies foo) fixnum))))
 (assert (type= (specifier-type '(member 1 2 3))
                (specifier-type '(member 2 3 1))))
-(assert (type= (specifier-type '(and (member $1.0 2 3) single-float))
-               (specifier-type '(member $1.0))))
+(assert (type= (specifier-type '(and (member 1.0 2 3) single-float))
+               (specifier-type '(member 1.0))))
 
 (assert (typep "hello" '(and array (not (array t)))))
 (assert (typep "hello" 'string))
@@ -266,16 +266,16 @@
   (assert (type= isect (type-intersection type2 type1 type2)))
   (assert (type= isect (type-intersection type1 type1 type2 type1)))
   (assert (type= isect (type-intersection type1 type2 type1 type2))))
-(assert (csubtypep (specifier-type '(or (single-float $-1.0 $1.0)
-                                        (single-float $0.1)))
+(assert (csubtypep (specifier-type '(or (single-float -1.0 1.0)
+                                        (single-float 0.1)))
                    (specifier-type '(or (real -1 7)
-                                        (single-float $0.1)
-                                        (single-float $-1.0 $1.0)))))
+                                        (single-float 0.1)
+                                        (single-float -1.0 1.0)))))
 (assert (not (csubtypep (specifier-type '(or (real -1 7)
-                                             (single-float $0.1)
-                                             (single-float $-1.0 $1.0)))
-                        (specifier-type '(or (single-float $-1.0 $1.0)
-                                             (single-float $0.1))))))
+                                             (single-float 0.1)
+                                             (single-float -1.0 1.0)))
+                        (specifier-type '(or (single-float -1.0 1.0)
+                                             (single-float 0.1))))))
 
 (assert (typep #\, 'character))
 (assert (typep #\@ 'character))
@@ -425,9 +425,9 @@
 
 #+x86-64
 (progn
-  (assert (= (sb-vm::immediate-constant-sc (complex $0.0f0 $0.0f0))
+  (assert (= (sb-vm::immediate-constant-sc #c(0.0f0 0.0f0))
              sb-vm::fp-complex-single-zero-sc-number))
-  (assert (= (sb-vm::immediate-constant-sc (complex $0.0d0 $0.0d0))
+  (assert (= (sb-vm::immediate-constant-sc #c(0.0d0 0.0d0))
              sb-vm::fp-complex-double-zero-sc-number)))
 
 ;;; Unparse a union of (up to) 3 things depending on :sb-unicode as 2 things.
@@ -506,3 +506,22 @@
       (csubtypep (find-classoid type) (specifier-type 'funcallable-instance))
     (assert (and (not answer) certain)))
   (aver (csubtypep (find-classoid type) (specifier-type 'instance))))
+
+(assert (sb-int:list-elts-eq '(a b 1) '(a b 1)))
+(assert (not (sb-int:list-elts-eq '(foo) '(foo bar))))
+(assert (not (sb-int:list-elts-eq '(foo bar) '(foo))))
+
+(assert (sb-int:list-elements-eql '(a b 1) '(a b 1)))
+(assert (sb-int:list-elements-eql '(1.0d0 x y) '(1.0d0 x y)))
+(assert (not (sb-int:list-elements-eql '(foo) '(foo bar))))
+(assert (not (sb-int:list-elements-eql '(foo bar) '(foo))))
+
+;;; I frankly have no idea whether we really care about the enumerable bit any more,
+;;; because while what it's supposed to mean is "could _this_ type which is not a MEMBER
+;;; type be internally represented as a MEMBER type?" Wwhat makes it questionable
+;;; is that we seldom or never represent numerics as MEMBER. I do not know if this is a
+;;; relic of days long past.
+(assert (sb-kernel::type-enumerable
+         (sb-kernel:specifier-type '(and integer (integer 1 5)))))
+(assert (sb-kernel::type-enumerable
+         (sb-kernel:specifier-type '(single-float 1.0 1.0))))

@@ -250,7 +250,7 @@ bootstrapping.
 
 (defmacro defgeneric (fun-name lambda-list &body options)
   (declare (type list lambda-list))
-  (check-designator fun-name defgeneric)
+  (check-designator fun-name 'defgeneric #'legal-fun-name-p "function name")
   (with-current-source-form (lambda-list)
     (check-gf-lambda-list lambda-list))
   (let ((initargs ())
@@ -433,7 +433,7 @@ bootstrapping.
 ;;; which means that checking of callers' arglists can only occur after called
 ;;; methods are actually loaded.
 (defmacro defmethod (name &rest args)
-  (check-designator name defmethod)
+  (check-designator name 'defmethod #'legal-fun-name-p "function name")
   (multiple-value-bind (qualifiers lambda-list body)
       (parse-defmethod args)
     `(progn
@@ -604,7 +604,7 @@ bootstrapping.
              (eq (car fn) 'function)
              (consp (setq fn-lambda (cadr fn)))
              (eq (car fn-lambda) 'lambda)
-             (bug "Really got here"))
+             (sb-impl::unreachable))
         (let* ((specls (mapcar (lambda (specl)
                                  (if (consp specl)
                                      ;; CONSTANT-FORM-VALUE?  What I
@@ -1185,8 +1185,8 @@ bootstrapping.
                    `(,type
                      (,function-name
                       proto-generic-function proto-method specializer))))
-               '(specializer symbol t class-eq-specializer eql-specializer
-                 structure-class system-class class)))))
+               '(specializer symbol t #|class-eq-specializer eql-specializer
+                 structure-class system-class class|#)))))
     (delegations)))
 
 (unless (fboundp 'specializer-type-specifier)
@@ -1272,7 +1272,9 @@ bootstrapping.
                                           rest-arg
                                           &rest lmf-options)
                                          &body body)
-  `(bind-fast-lexical-method-functions (,args ,rest-arg ,next-method-call ,lmf-options)
+  `(bind-fast-lexical-method-functions (,args ,rest-arg ,next-method-call
+                                        (,@lmf-options
+                                         :no-optionals ,(= (length args) (length lambda-list))))
      (bind-args (,(nthcdr (length args) lambda-list) ,rest-arg)
        ,@body)))
 
@@ -1311,7 +1313,12 @@ bootstrapping.
                                   (or cnm-args ,method-args))))))
                 (next-method-p () (not (null .next-method.))))
            (declare (ignorable #'next-method-p))
-           ,@body))))
+           ;; Compatibility with fast-lexical-method-functions
+           (macrolet ((call-next-method-n (&rest args)
+                        `(call-next-method ,@args))
+                      (call-next-method-0 ()
+                        `(call-next-method)))
+             ,@body)))))
 
 (defun call-no-next-method (method-cell &rest args)
   (let ((method (car method-cell)))
@@ -1358,11 +1365,6 @@ bootstrapping.
                              `(list ,@required-args+rest-arg))
                         (method-call-call-method-args ,method-call)))
 
-(defstruct (fast-method-call (:copier nil))
-  (function #'identity :type function)
-  pv
-  next-method-call
-  arg-info)
 (defstruct (constant-fast-method-call
              (:copier nil) (:include fast-method-call))
   value)
@@ -1382,8 +1384,7 @@ bootstrapping.
                                 ,@required-args+rest-arg))
 
 (defmacro invoke-fast-method-call/more (method-call
-                                        more-context
-                                        more-count
+                                        rest-arg
                                         &rest required-args)
   (macrolet ((generate-call (n)
                ``(funcall (fast-method-call-function ,method-call)
@@ -1391,7 +1392,7 @@ bootstrapping.
                           (fast-method-call-next-method-call ,method-call)
                           ,@required-args
                           ,@(loop for x below ,n
-                                  collect `(sb-c::%more-arg ,more-context ,x)))))
+                                  collect `(fast-&rest-nth ,x ,rest-arg)))))
     ;; The cases with only small amounts of required arguments passed
     ;; are probably very common, and special-casing speeds them up by
     ;; a factor of 2 with very little effect on the other
@@ -1400,7 +1401,7 @@ bootstrapping.
     ;; This is enough hardwired cases to handle the 0, 1, or 2 optional
     ;; arguments to STREAM-WRITE-STRING. If you change anything about this,
     ;; make sure to benchmark it.
-    `(case ,more-count
+    `(case (length ,rest-arg)
        (0 ,(generate-call 0))
        (1 ,(generate-call 1))
        (2 ,(generate-call 2))
@@ -1408,7 +1409,7 @@ bootstrapping.
             (values (fast-method-call-pv ,method-call))
             (values (fast-method-call-next-method-call ,method-call))
             ,@required-args
-            (sb-c:%more-arg-values ,more-context 0 ,more-count))))))
+            (values-list ,rest-arg))))))
 
 (defstruct (fast-instance-boundp (:copier nil))
   (index 0 :type fixnum))
@@ -1593,33 +1594,26 @@ bootstrapping.
     (fast-instance-boundp
      (if (or (null args) (cdr args))
          (%program-error "invalid number of arguments")
-         (let ((slots (get-slots (car args))))
-           (not (unbound-marker-p
-                 (clos-slots-ref slots (fast-instance-boundp-index emf)))))))
+         (let ((slots (get-slots (car args)))
+               (index (fast-instance-boundp-index emf)))
+           (if (minusp index)
+               (progn (setf (clos-slots-ref slots (lognot index)) +slot-unbound+)
+                      (car args))
+               (not (unbound-marker-p (clos-slots-ref slots index)))))))
     (function
      (apply emf args))))
 
 
-(defmacro fast-call-next-method-body ((args next-method-call rest-arg)
-                                      method-cell
-                                      cnm-args)
+(defmacro fast-call-next-method-body ((args next-method-call rest-arg) method-cell)
   `(if ,next-method-call
-       ,(let ((call `(invoke-narrow-effective-method-function
-                      ,next-method-call
-                      ,(not (null rest-arg))
-                      :required-args ,args
-                      :rest-arg ,(when rest-arg (list rest-arg)))))
-             `(if ,cnm-args
-                  (bind-args ((,@args
-                               ,@(when rest-arg
-                                       `(&rest ,rest-arg)))
-                              ,cnm-args)
-                    ,call)
-                  ,call))
-       (call-no-next-method ',method-cell
-                            ,@args
-                            ,@(when rest-arg
-                                    `(,rest-arg)))))
+       (invoke-narrow-effective-method-function
+        ,next-method-call
+        ,(not (null rest-arg))
+        :required-args ,args
+        :rest-arg ,(when rest-arg (list rest-arg)))
+       ,(if rest-arg
+            `(apply #'call-no-next-method ',method-cell ,@args ,rest-arg)
+            `(call-no-next-method ',method-cell ,@args))))
 
 (defmacro bind-fast-lexical-method-functions
     ((args rest-arg next-method-call (&key
@@ -1627,7 +1621,8 @@ bootstrapping.
                                       setq-p
                                       parameters-setqd
                                       method-cell
-                                      applyp))
+                                      applyp
+                                      no-optionals))
      &body body
      &environment env)
   (let* ((next-method-p-def
@@ -1640,20 +1635,35 @@ bootstrapping.
         `(flet ,next-method-p-def
            (declare (ignorable #'next-method-p))
            ,@body)
-        `(flet (,@(when call-next-method-p
-                    `((call-next-method (&rest cnm-args)
-                        (declare (dynamic-extent cnm-args)
-                                 (muffle-conditions code-deletion-note)
-                                 (optimize (sb-c:insert-step-conditions 0)))
-                        ,@(if (safe-code-p env)
-                              `((%check-cnm-args cnm-args (list ,@args)
-                                                 ',method-cell))
-                              nil)
-                        (fast-call-next-method-body (,args
-                                                     ,next-method-call
-                                                     ,rest-arg)
-                            ,method-cell
-                            cnm-args))))
+        `(labels (,@(when call-next-method-p
+                      (let ((cnm-req-args (make-gensym-list (length args))))
+                       `((call-next-method (&rest cnm-args)
+                           (declare (dynamic-extent cnm-args)
+                                    (muffle-conditions code-deletion-note)
+                                    (optimize (sb-c:insert-step-conditions 0)))
+                           (if cnm-args
+                               (apply #'call-next-method-n cnm-args)
+                               (call-next-method-0)))
+                         (call-next-method-0 ()
+                           (declare (muffle-conditions code-deletion-note)
+                                    (optimize (sb-c:insert-step-conditions 0)))
+                           (fast-call-next-method-body (,args
+                                                        ,next-method-call
+                                                        ,rest-arg)
+                                                       ,method-cell))
+                         (call-next-method-n (,@cnm-req-args ,@(unless no-optionals
+                                                                 `(&rest cnm-args)))
+                            (declare ,@(unless no-optionals
+                                         `((dynamic-extent cnm-args)))
+                                     (muffle-conditions code-deletion-note)
+                                     (optimize (sb-c:insert-step-conditions 0)))
+                            ,@(when (safe-code-p env)
+                                `((%check-cnm-args (list ,@cnm-req-args) (list ,@args) ',method-cell)))
+                            (fast-call-next-method-body (,cnm-req-args
+                                                         ,next-method-call
+                                                         ,(unless no-optionals
+                                                            'cnm-args))
+                                                        ,method-cell)))))
                 ,@next-method-p-def)
            (declare (ignorable #'next-method-p))
            (let ,rebindings
@@ -1778,22 +1788,23 @@ bootstrapping.
                     ;; hierarchy: nil -> :simple -> T.
                     (unless (eq call-next-method-p t)
                       (setq call-next-method-p (if (cdr form) t :simple)))
-                    form)
+                (if (cdr form)
+                    `(call-next-method-n ,@(cdr form))
+                    `(call-next-method-0)))
                (function
                 (when (equal (cdr form) '(call-next-method))
                   (setq call-next-method-p t))
                 form)
-               ((slot-value set-slot-value slot-boundp)
+               ((slot-value set-slot-value slot-boundp slot-makunbound)
                 (if (constantp (third form) env)
                     (let ((fun (ecase (car form)
                                  (slot-value #'optimize-slot-value)
                                  (set-slot-value #'optimize-set-slot-value)
-                                 (slot-boundp #'optimize-slot-boundp))))
-                      `(sb-c::with-source-form ,form
-                        ,(funcall fun form slots required-parameters env)))
+                                 (slot-boundp #'optimize-slot-boundp)
+                                 (slot-makunbound #'optimize-slot-makunbound))))
+                      (funcall fun form slots required-parameters env))
                     form))
                (t form))))
-
       (let* ((sb-walker::*walk-form-preserve-source* t)
              (walked-lambda (walk-form method-lambda env #'walk-function)))
         ;;; FIXME: the walker's rewriting of the source code causes
@@ -1837,21 +1848,37 @@ bootstrapping.
     (load-defmethod-internal class name quals specls
                              ll initargs source-location)))
 
+(define-condition find-method-length-mismatch
+    (reference-condition simple-error)
+  ()
+  (:default-initargs :references '((:ansi-cl :function find-method))))
+
 (defun load-defmethod-internal
     (method-class gf-spec qualifiers specializers lambda-list
                   initargs source-location)
-  (when (and (eq **boot-state** 'complete)
-             (fboundp gf-spec))
-    (let* ((gf (fdefinition gf-spec))
-           (method (and (generic-function-p gf)
-                        (generic-function-methods gf)
-                        (find-method gf qualifiers specializers nil))))
-      (when method
-        (warn 'sb-kernel:redefinition-with-defmethod
-              :name gf-spec
-              :new-location source-location
-              :old-method method
-              :qualifiers qualifiers :specializers specializers))))
+  (block nil
+    (when (and (eq **boot-state** 'complete)
+               (fboundp gf-spec))
+      (restart-bind
+          ((continue (lambda ()
+                       (fmakunbound gf-spec)
+                       (return))
+                     :report-function
+                     (lambda (stream)
+                       (format stream "Unbind the generic function"))
+                     :test-function
+                     (lambda (c)
+                       (typep c 'find-method-length-mismatch))))
+        (let* ((gf (fdefinition gf-spec))
+               (method (and (generic-function-p gf)
+                            (generic-function-methods gf)
+                            (find-method gf qualifiers specializers nil))))
+          (when method
+            (warn 'sb-kernel:redefinition-with-defmethod
+                  :name gf-spec
+                  :new-location source-location
+                  :old-method method
+                  :qualifiers qualifiers :specializers specializers))))))
   (let ((method (apply #'add-named-method
                        gf-spec qualifiers specializers lambda-list
                        'source source-location
@@ -1975,11 +2002,6 @@ bootstrapping.
                            macro.~@:>")
           :format-arguments (list fun-name)))
 
-(define-load-time-global *sgf-wrapper*
-  (!boot-make-wrapper (!early-class-size 'standard-generic-function)
-                      'standard-generic-function
-                      sb-kernel::standard-gf-primitive-obj-layout-bitmap))
-
 (define-load-time-global *sgf-slots-init*
   (mapcar (lambda (canonical-slot)
             (if (memq (getf canonical-slot :name) '(arg-info source))
@@ -2026,11 +2048,11 @@ bootstrapping.
   arg-info-metatypes
   arg-info-number-optional
   arg-info-key/rest-p
-  arg-info-keys   ;nil        no &KEY or &REST allowed
-                  ;(k1 k2 ..) Each method must accept these &KEY arguments.
-                  ;T          must have &KEY or &REST
+  arg-info-keys   ;nil                   no &KEY or &REST allowed
+                  ;(k1 k2 ..)            Each method must accept these &KEY arguments.
+                  ;T/:allow-other-keys   must have &KEY or &REST
 
-  gf-info-simple-accessor-type ; nil, reader, writer, boundp
+  gf-info-simple-accessor-type ; nil, reader, writer, boundp, makunbound
   (gf-precompute-dfun-and-emf-p nil) ; set by set-arg-info
 
   gf-info-static-c-a-m-emf
@@ -2113,7 +2135,7 @@ bootstrapping.
         (setf (arg-info-key/rest-p arg-info) (ll-keyp-or-restp llks))
         (setf (arg-info-keys arg-info)
               (if lambda-list-p
-                  (if (ll-kwds-allowp llks) t keywords)
+                  (if (ll-kwds-allowp llks) :allow-other-keys keywords)
                   (arg-info-key/rest-p arg-info)))))
     (when new-method
       (check-method-arg-info gf arg-info new-method))
@@ -2171,20 +2193,10 @@ bootstrapping.
   (aver (= (symbol-value (intern (format nil "+SM-~A-INDEX+" s)))
            (!bootstrap-slot-index 'standard-reader-method s)
            (!bootstrap-slot-index 'standard-writer-method s)
-           (!bootstrap-slot-index 'standard-boundp-method s)
            (!bootstrap-slot-index 'global-reader-method s)
            (!bootstrap-slot-index 'global-writer-method s)
-           (!bootstrap-slot-index 'global-boundp-method s))))
-
-(defconstant-eqx +standard-method-class-names+
-  '(standard-method standard-reader-method
-    standard-writer-method standard-boundp-method
-    global-reader-method global-writer-method
-    global-boundp-method)
-  #'equal)
-
-(declaim (list **standard-method-classes**))
-(defglobal **standard-method-classes** nil)
+           (!bootstrap-slot-index 'global-boundp-method s)
+           (!bootstrap-slot-index 'global-makunbound-method s))))
 
 (defun safe-method-specializers (method)
   (if (member (class-of method) **standard-method-classes** :test #'eq)
@@ -2202,6 +2214,12 @@ bootstrapping.
   (if (member (class-of method) **standard-method-classes** :test #'eq)
       (clos-slots-ref (std-instance-slots method) +sm-qualifiers-index+)
       (method-qualifiers method)))
+
+(defconstant +sgf-name-index+
+  (!bootstrap-slot-index 'standard-generic-function 'name))
+(declaim (inline !early-gf-name))
+(defun !early-gf-name (gf)
+  (clos-slots-ref (get-slots gf) +sgf-name-index+))
 
 (defun set-arg-info1 (gf arg-info new-method methods was-valid-p first-p)
   (let* ((existing-p (and methods (cdr methods) new-method))
@@ -2232,9 +2250,10 @@ bootstrapping.
                         ((or (eq class *the-class-standard-writer-method*)
                              (eq class *the-class-global-writer-method*))
                          'writer)
-                        ((or (eq class *the-class-standard-boundp-method*)
-                             (eq class *the-class-global-boundp-method*))
-                         'boundp)))))
+                        ((eq class *the-class-global-boundp-method*)
+                         'boundp)
+                        ((eq class *the-class-global-makunbound-method*)
+                         'makunbound)))))
           (setq metatypes (mapcar #'raise-metatype metatypes specializers))
           (setq type (cond ((null type) new-type)
                            ((eq type new-type) type)
@@ -2259,11 +2278,12 @@ bootstrapping.
               ((and (consp name)
                     (member (car name)
                             *internal-pcl-generalized-fun-name-symbols*))
-                nil)
+               nil)
               (t (let* ((symbol (fun-name-block-name name))
-                        (package (symbol-package symbol)))
-                   (and (or (eq package *pcl-package*)
-                            (memq package (package-use-list *pcl-package*)))
+                        (package (symbol-package symbol))
+                        (pcl-package #.(find-package "SB-PCL")))
+                   (and (or (eq package pcl-package)
+                            (memq package (package-use-list pcl-package)))
                         (not (eq package *cl-package*))
                         ;; FIXME: this test will eventually be
                         ;; superseded by the *internal-pcl...* test,
@@ -2390,12 +2410,6 @@ bootstrapping.
     (typecase state
       (function nil)
       (cons (cddr state)))))
-
-(defconstant +sgf-name-index+
-  (!bootstrap-slot-index 'standard-generic-function 'name))
-
-(defun !early-gf-name (gf)
-  (clos-slots-ref (get-slots gf) +sgf-name-index+))
 
 (defun gf-lambda-list (gf)
   (let ((arg-info (if (eq **boot-state** 'complete)
@@ -2655,8 +2669,7 @@ bootstrapping.
 (defun early-method-standard-accessor-p (early-method)
   (let ((class (first (fifth early-method))))
     (or (eq class 'standard-reader-method)
-        (eq class 'standard-writer-method)
-        (eq class 'standard-boundp-method))))
+        (eq class 'standard-writer-method))))
 
 (defun early-method-standard-accessor-slot-name (early-method)
   (eighth (fifth early-method)))
@@ -2720,6 +2733,9 @@ bootstrapping.
       (when existing (remove-method gf existing))
       (add-method gf new))))
 
+(defmacro skip-update-dfun-in-add/remove-method (f)
+  `(assoc (!early-gf-name ,f) *!generic-function-fixups* :test #'equal))
+
 ;;; This is the early version of ADD-METHOD. Later this will become a
 ;;; generic function. See !FIX-EARLY-GENERIC-FUNCTIONS which has
 ;;; special knowledge about ADD-METHOD.
@@ -2730,9 +2746,7 @@ bootstrapping.
     (error "Early ADD-METHOD didn't get an early method."))
   (push method (early-gf-methods generic-function))
   (set-arg-info generic-function :new-method method)
-  (unless (assoc (!early-gf-name generic-function)
-                 *!generic-function-fixups*
-                 :test #'equal)
+  (unless (skip-update-dfun-in-add/remove-method generic-function)
     (update-dfun generic-function)))
 
 ;;; This is the early version of REMOVE-METHOD. See comments on
@@ -2745,9 +2759,7 @@ bootstrapping.
   (setf (early-gf-methods generic-function)
         (remove method (early-gf-methods generic-function)))
   (set-arg-info generic-function)
-  (unless (assoc (!early-gf-name generic-function)
-                 *!generic-function-fixups*
-                 :test #'equal)
+  (unless (skip-update-dfun-in-add/remove-method generic-function)
     (update-dfun generic-function)))
 
 ;;; This is the early version of GET-METHOD. See comments on the early
@@ -2814,8 +2826,9 @@ bootstrapping.
                                   (apply #'real-make-a-method args)))
                               (early-gf-methods gf))))
         (setf (generic-function-method-class gf) *the-class-standard-method*)
-        (setf (generic-function-method-combination gf)
-              *standard-method-combination*)
+        (let ((mc *standard-method-combination*))
+          (setf (generic-function-method-combination gf) mc)
+          (add-to-weak-hashset gf (method-combination-%generic-functions mc)))
         (set-methods gf methods)))
 
     (dolist (fn *!early-functions*)
@@ -2826,25 +2839,19 @@ bootstrapping.
           for gf = (gdefinition fspec) do
           (labels ((translate-source-location (function)
                      ;; This is lifted from sb-introspect, OAOO and all that.
-                     (let* ((function-object (sb-kernel::%fun-fun function))
-                            (function-header (sb-kernel:fun-code-header function-object))
-                            (debug-info (sb-kernel:%code-debug-info function-header))
-                            (debug-source (sb-c::debug-info-source debug-info))
-                            (debug-fun (debug-info-debug-function function debug-info)))
+                     (let ((code (fun-code-header (sb-kernel::%fun-fun function)))
+                           (debug-fun (sb-di::fun-debug-fun function)))
                        (sb-c::%make-definition-source-location
-                        (sb-c::debug-source-namestring debug-source)
-                        (sb-c::compiled-debug-info-tlf-number debug-info)
-                        (sb-c::compiled-debug-fun-form-number debug-fun))))
-                   (debug-info-debug-function (function debug-info)
-
-                     (let ((map (sb-c::compiled-debug-info-fun-map debug-info))
-                           (name (sb-kernel:%simple-fun-name (sb-kernel:%fun-fun function))))
-                       (or (loop for fmap-entry = map then next
-                                 for next = (sb-c::compiled-debug-fun-next fmap-entry)
-                                 when (eq (sb-c::compiled-debug-fun-name fmap-entry) name)
-                                 return fmap-entry
-                                 while next)
-                           map)))
+                        (sb-c::debug-source-namestring
+                         (sb-c::debug-info-source (sb-kernel:%code-debug-info code)))
+                        (sb-c::compiled-debug-fun-tlf-number
+                         (sb-di::compiled-debug-fun-compiler-debug-fun debug-fun))
+                        (handler-case (sb-di::code-location-form-number
+                                       (sb-di::debug-fun-start-location debug-fun))
+                          (sb-di::unknown-code-location (cond)
+                            (declare (ignore cond))
+                            (sb-c::compiled-debug-fun-blocks
+                             (sb-di::compiled-debug-fun-compiler-debug-fun debug-fun)))))))
                    (make-method (spec)
                      (destructuring-bind
                          (lambda-list specializers qualifiers fun-name) spec
@@ -2860,29 +2867,16 @@ bootstrapping.
                           'standard-method
                           qualifiers lambda-list specializers initargs nil
                           'source (translate-source-location fun))))))
-            (setf (generic-function-method-class gf)
-                  *the-class-standard-method*
-                  (generic-function-method-combination gf)
-                  (ecase method-combination
-                    (standard *standard-method-combination*)
-                    (or *or-method-combination*)))
+            (let ((mc (ecase method-combination
+                        (standard *standard-method-combination*)
+                        (or *or-method-combination*))))
+              (setf (generic-function-method-class gf) *the-class-standard-method*
+                    (generic-function-method-combination gf) mc)
+              (add-to-weak-hashset gf (method-combination-%generic-functions mc)))
             (set-methods gf (mapcar #'make-method methods)))))
 
   (/show "leaving !FIX-EARLY-GENERIC-FUNCTIONS"))
 
-;;; PARSE-DEFMETHOD is used by DEFMETHOD to parse the &REST argument
-;;; into the 'real' arguments. This is where the syntax of DEFMETHOD
-;;; is really implemented.
-(defun parse-defmethod (cdr-of-form)
-  (declare (list cdr-of-form))
-  (let ((qualifiers ())
-        (spec-ll ()))
-    (loop (if (and (car cdr-of-form) (atom (car cdr-of-form)))
-              (push (pop cdr-of-form) qualifiers)
-              (return (setq qualifiers (nreverse qualifiers)))))
-    (setq spec-ll (pop cdr-of-form))
-    (values qualifiers spec-ll cdr-of-form)))
-
 (defun parse-specializers (generic-function specializers)
   (declare (list specializers))
   (flet ((parse (spec)
@@ -2903,46 +2897,6 @@ bootstrapping.
   (def 1 extract-lambda-list)
   (def 2 extract-specializer-names))
 
-(define-condition specialized-lambda-list-error
-    (reference-condition simple-program-error)
-  ()
-  (:default-initargs :references '((:ansi-cl :section (3 4 3)))))
-
-(defun specialized-lambda-list-error (format-control &rest format-arguments)
-  (error 'specialized-lambda-list-error
-         :format-control format-control
-         :format-arguments format-arguments))
-
-;; Return 3 values:
-;; - the bound variables, without defaults, supplied-p vars, or &AUX vars.
-;; - the lambda list without specializers.
-;; - just the specializers
-(defun parse-specialized-lambda-list (arglist)
-  (binding* (((llks specialized optional rest key aux)
-              (parse-lambda-list
-               arglist
-               :context 'defmethod
-               :accept (lambda-list-keyword-mask
-                        '(&optional &rest &key &allow-other-keys &aux))
-               :silent t         ; never signal &OPTIONAL + &KEY style-warning
-               :condition-class 'specialized-lambda-list-error))
-             (required (mapcar (lambda (x) (if (listp x) (car x) x)) specialized))
-             (specializers (mapcar (lambda (x) (if (listp x) (cadr x) t)) specialized)))
-    (check-lambda-list-names
-     llks required optional rest key aux nil nil
-     :context "a method lambda list" :signal-via #'specialized-lambda-list-error)
-    (values (append required
-                    (mapcar #'parse-optional-arg-spec optional)
-                    rest
-                    ;; Preserve keyword-names when given as (:KEYWORD var)
-                    (mapcar (lambda (x)
-                              (if (typep x '(cons cons))
-                                  (car x)
-                                  (parse-key-arg-spec x)))
-                            key))
-            (make-lambda-list llks nil required optional rest key aux)
-            specializers)))
-
 (setq **boot-state** 'early)
 
 ;;; FIXME: In here there was a #-CMU definition of SYMBOL-MACROLET

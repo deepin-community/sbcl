@@ -32,7 +32,7 @@
     ;; rank 1 is stored as 0, 2 is stored as 1, ...
     (inst lea header (make-ea :dword :disp (fixnumize -1) :base rank))
     (inst and header (fixnumize array-rank-mask))
-    (inst shl header array-rank-byte-pos)
+    (inst shl header array-rank-position)
     (inst or  header type)
     (inst shr header n-fixnum-tag-bits)
     (pseudo-atomic ()
@@ -48,43 +48,36 @@
   array-dimensions-offset other-pointer-lowtag
   (any-reg) positive-fixnum %set-array-dimension)
 
+(symbol-macrolet ((rank-disp
+                    (- (/ array-rank-position n-byte-bits) other-pointer-lowtag)))
 (define-vop ()
-  (:translate %array-rank)
+  (:translate array-rank)
   (:policy :fast-safe)
   (:args (x :scs (descriptor-reg)))
   (:results (res :scs (unsigned-reg)))
   (:result-types positive-fixnum)
   (:generator 6
-    (inst movzx res (make-ea :byte :disp (- 2 other-pointer-lowtag) :base x))
-    ;; not all registers have an addressable low byte,
-    ;; so the simple trick used on x86-64 won't work.
+    (inst movzx res (make-ea :byte :disp rank-disp :base x))
+    ;; not all registers have an addressable low byte, so the simple trick
+    ;; used on x86-64 of adding 1 to the 8-bit register won't work.
     (inst inc res)
     (inst and res array-rank-mask)))
 
 (define-vop ()
-  (:translate %array-rank=)
+  (:translate array-rank=)
   (:policy :fast-safe)
   (:args (array :scs (descriptor-reg)))
   (:info rank)
   (:arg-types * (:constant t))
   (:conditional :e)
   (:generator 2
-    (inst cmp (make-ea :byte :disp (- 2 other-pointer-lowtag) :base array)
-          (encode-array-rank rank))))
-
-(define-vop (array-vectorp simple-type-predicate)
-  ;; SIMPLE-TYPE-PREDICATE says that it takes stack locations, but that's no good.
-  (:args (array :scs (any-reg descriptor-reg)))
-  (:translate vectorp)
-  (:conditional :z)
-  (:info)
-  (:guard (lambda (node)
-            (let ((arg (car (sb-c::combination-args node))))
-              (csubtypep (sb-c::lvar-type arg) (specifier-type 'array)))))
-  (:generator 1
-    (inst cmp (make-ea :byte :disp (- 2 other-pointer-lowtag) :base array)
-          (encode-array-rank 1))))
+    (inst cmp (make-ea :byte :disp rank-disp :base array) (encode-array-rank rank)))))
 
+
+(defun power-of-two-limit-p (x)
+  (and (fixnump x)
+       (= (logcount (1+ x)) 1)))
+
 ;;;; bounds checking routine
 (define-vop (check-bound)
   (:translate %check-bound)
@@ -249,10 +242,10 @@
 
 (define-vop (data-vector-ref-with-offset/simple-bit-vector dvref)
   (:args (object :scs (descriptor-reg))
-         (index :scs (unsigned-reg)))
+         (index :scs (signed-reg unsigned-reg)))
   (:info addend)
   (:ignore addend)
-  (:arg-types simple-bit-vector positive-fixnum (:constant (integer 0 0)))
+  (:arg-types simple-bit-vector tagged-num (:constant (integer 0 0)))
   (:results (result :scs (any-reg)))
   (:result-types positive-fixnum)
   (:generator 4
@@ -270,10 +263,10 @@
       ,@(unless (= bits 1)
        `((define-vop (,(symbolicate 'data-vector-ref-with-offset/ type) dvref)
          (:args (object :scs (descriptor-reg))
-                (index :scs (unsigned-reg)))
+                (index :scs (signed-reg unsigned-reg)))
          (:info addend)
          (:ignore addend)
-         (:arg-types ,type positive-fixnum (:constant (integer 0 0)))
+         (:arg-types ,type tagged-num (:constant (integer 0 0)))
          (:results (result :scs (unsigned-reg) :from (:argument 0)))
          (:result-types positive-fixnum)
          (:temporary (:sc unsigned-reg :offset ecx-offset) ecx)
@@ -309,11 +302,11 @@
                (inst and result ,(1- (ash 1 bits)))))))))
        (define-vop (,(symbolicate 'data-vector-set-with-offset/ type) dvset)
          (:args (object :scs (descriptor-reg) :to (:argument 2))
-                (index :scs (unsigned-reg) :target ecx)
+                (index :scs (signed-reg unsigned-reg) :target ecx)
                 (value :scs (unsigned-reg immediate)))
          (:info addend)
          (:ignore addend)
-         (:arg-types ,type positive-fixnum (:constant (integer 0 0))
+         (:arg-types ,type tagged-num (:constant (integer 0 0))
                      positive-fixnum)
          (:temporary (:sc unsigned-reg) word-index)
          (:temporary (:sc unsigned-reg) old)
@@ -677,6 +670,11 @@
 (define-full-setter set-vector-raw-bits * vector-data-offset other-pointer-lowtag
  (unsigned-reg) unsigned-num %set-vector-raw-bits)
 
+;;; Weak vectors
+(define-full-reffer %weakvec-ref * vector-data-offset other-pointer-lowtag
+  (any-reg descriptor-reg) * %weakvec-ref)
+(define-full-setter %weakvec-set * vector-data-offset other-pointer-lowtag
+  (any-reg descriptor-reg) * %weakvec-set)
 
 ;;;; ATOMIC-INCF for arrays
 

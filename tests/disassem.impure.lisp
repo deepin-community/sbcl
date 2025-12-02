@@ -1,7 +1,6 @@
-
 ;;; Assert that save-lisp-and-die didn't accidentally recreate the inst space.
 ;;; Fails in parallel-exec which uses PURE-RUNNER which performs ENCAPSULATE
-;;; which calls REMOVE-STATIC-LINKS which invokes the disassembler
+;;; which calls UNDO-STATIC-LINKAGE which invokes the disassembler
 ;;; which constructs the inst-space.
 (with-test (:name :inst-space-jit-constructed
                   :fails-on :parallel-test-runner)
@@ -44,7 +43,9 @@
 (with-test (:name :disassemble-method
             :skipped-on :interpreter)
   (with-output-to-string (s)
-    (sb-c:dis (defmethod hello ((self cons)) "here i am") s)))
+    (sb-c:dis (defmethod hello ((self cons)) "here i am") s)
+    (disassemble (sb-mop:method-function (car (sb-mop:generic-function-methods #'documentation)))
+                 :stream s)))
 
 (with-test (:name :lp-bug-1861418)
   (disassemble '(lambda ()
@@ -91,7 +92,8 @@
                (declare (type dchunk chunk) (type instruction inst))
                (awhen (inst-printer inst)
                  (funcall it chunk inst nil dstate)
-                 (setf (dstate-n-operands dstate) 0)))
+                 (setf (dstate-n-operands dstate) 0
+                       (dstate-notes dstate) nil)))
              seg dstate nil))))))
   (when show-progress
     (format t " done~%")))
@@ -100,12 +102,12 @@
 (defun install-counting-wrapper (discount)
   (declare (ignorable discount))
   #+x86-64
-  (sb-int:encapsulate
-   'sb-x86-64-asm::print-mem-ref 'test
-   (lambda (realfun &rest args)
-     ;; Each mem ref disassembled is one cons cell
-     (incf (car discount) (* sb-vm:cons-size sb-vm:n-word-bytes))
-     (apply realfun args))))
+  (flet ((wrap (realfun &rest args)
+           ;; Each mem ref disassembled to a model costs one cons cell
+           (incf (car discount) (* sb-vm:cons-size sb-vm:n-word-bytes))
+           (apply realfun args)))
+    (sb-int:encapsulate 'sb-x86-64-asm::print-mem-ref 'test #'wrap)
+    (sb-int:encapsulate 'sb-x86-64-asm::lea-print-ea 'test #'wrap)))
 (compile 'install-counting-wrapper)
 
 ;;; Disassembling everything takes around .8 seconds and conses ~14MB for me.
@@ -116,7 +118,8 @@
                       ;; Only the x86-64 disassembler is able to disassemble
                       ;; with output into the dstate rather than a stream.
                       ;; The others choke with "NIL is not of type STREAM"
-                            :skipped-on (:not :x86-64))
+                      :skipped-on (:not :x86-64)
+                      :broken-on :gc-stress)
   (let ((code (list-all-code)) ;; Avoid counting bytes consed in the list
         (discount (list 0)))
     (install-counting-wrapper discount)

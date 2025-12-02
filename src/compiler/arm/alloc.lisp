@@ -12,7 +12,7 @@
 (in-package "SB-VM")
 
 (define-vop (list)
-  (:args (things :more t :scs (control-stack)))
+  (:args (things :more t :scs (any-reg descriptor-reg null control-stack)))
   (:temporary (:scs (descriptor-reg)) ptr)
   (:temporary (:scs (any-reg)) temp)
   (:temporary (:scs (descriptor-reg) :to (:result 0) :target result)
@@ -98,11 +98,10 @@
 (define-vop (make-value-cell)
   (:args (value :to :save :scs (descriptor-reg any-reg)))
   (:temporary (:sc non-descriptor-reg :offset ocfp-offset) pa-flag)
-  (:info stack-allocate-p)
   (:results (result :scs (descriptor-reg)))
   (:generator 10
     (with-fixed-allocation (result pa-flag value-cell-widetag
-                            value-cell-size :stack-allocate-p stack-allocate-p)
+                            value-cell-size)
       (storew value result value-cell-value-slot other-pointer-lowtag))))
 
 ;;;; Automatic allocators for primitive objects.
@@ -112,17 +111,6 @@
   (:results (result :scs (descriptor-reg any-reg)))
   (:generator 1
     (inst mov result unbound-marker-widetag)))
-
-(define-vop (make-funcallable-instance-tramp)
-  (:args)
-  (:results (result :scs (any-reg)))
-  (:temporary (:sc interior-reg) lip)
-  (:generator 1
-    (let ((fixup (gen-label)))
-      (inst load-from-label result lip fixup)
-      (assemble (:elsewhere)
-        (emit-label fixup)
-        (inst word (make-fixup 'funcallable-instance-tramp :assembly-routine))))))
 
 (define-vop (fixed-alloc)
   (:args)

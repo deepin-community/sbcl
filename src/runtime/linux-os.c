@@ -23,8 +23,7 @@
 #include <stdio.h>
 #include <sys/param.h>
 #include <sys/file.h>
-#include "sbcl.h"
-#include "./signal.h"
+#include "genesis/sbcl.h"
 #include "os.h"
 #include "arch.h"
 #include "globals.h"
@@ -33,7 +32,7 @@
 #include "lispregs.h"
 #include "runtime.h"
 #include "genesis/static-symbols.h"
-#include "genesis/fdefn.h"
+#include "genesis/symbol.h"
 
 #include <errno.h>
 
@@ -47,8 +46,12 @@
 
 #include "validate.h"
 #include "thread.h"
-#include "gc-internal.h"
+#include "gc.h"
 #include <fcntl.h>
+#include <sys/prctl.h>
+
+// gettid() was added in glibc 2.30 but we support older glibc
+int sb_GetTID() { return syscall(SYS_gettid); }
 
 #ifdef LISP_FEATURE_X86
 /* Prototype for personality(2). Done inline here since the header file
@@ -64,93 +67,6 @@ int personality (unsigned long);
 #include <unistd.h>
 #include <errno.h>
 
-#ifdef MUTEX_EVENTRECORDING
-#include "genesis/mutex.h"
-#define MAXEVENTS 200
-static struct {
-    struct thread* th;
-    struct timespec ts;
-    char *label;
-    char *mutex_name;
-    sword_t timeout;
-} events[MAXEVENTS];
-static int record_mutex_events;
-static int eventcount;
-
-void lisp_mutex_event(char *string) {
-    if (record_mutex_events) {
-        int id = __sync_fetch_and_add(&eventcount, 1);
-        if (id >= MAXEVENTS) lose("event buffer overflow");
-        clock_gettime(CLOCK_REALTIME, &events[id].ts);
-        events[id].th = get_sb_vm_thread();
-        events[id].label = string;
-        events[id].mutex_name = 0;
-        events[id].timeout = -1;
-    }
-}
-void lisp_mutex_event1(char *string, char *string2) {
-    if (record_mutex_events) {
-        int id = __sync_fetch_and_add(&eventcount, 1);
-        if (id >= MAXEVENTS) lose("event buffer overflow");
-        clock_gettime(CLOCK_REALTIME, &events[id].ts);
-        events[id].th = get_sb_vm_thread();
-        events[id].label = string;
-        events[id].mutex_name = string2;
-        events[id].timeout = -1;
-    }
-}
-void lisp_mutex_event2(char *string, char *string2, uword_t usec) {
-    if (record_mutex_events) {
-        int id = __sync_fetch_and_add(&eventcount, 1);
-        if (id >= MAXEVENTS) lose("event buffer overflow");
-        clock_gettime(CLOCK_REALTIME, &events[id].ts);
-        events[id].th = get_sb_vm_thread();
-        events[id].label = string;
-        events[id].mutex_name = string2;
-        events[id].timeout = usec;
-    }
-}
-void lisp_mutex_start_eventrecording() {
-    eventcount = 0;
-    record_mutex_events = 1;
-}
-void lisp_mutex_done_eventrecording() {
-    record_mutex_events = 0;
-    int i;
-    fprintf(stderr, "event log:\n");
-    struct timespec basetime = events[0].ts;
-    for(i=0; i<eventcount;++i) {
-        struct thread *th = events[i].th;
-        struct thread_instance *ti = (void*)native_pointer(th->lisp_thread);
-        struct timespec rel_time = events[i].ts;
-        rel_time.tv_sec -= basetime.tv_sec;
-        rel_time.tv_nsec -= basetime.tv_nsec;
-        if (rel_time.tv_nsec<0) rel_time.tv_nsec += 1000 * 1000 * 1000, rel_time.tv_sec--;
-        lispobj threadname = ti->name;
-        if (events[i].timeout >= 0) // must also have mutex_name in this case
-            fprintf(stderr, "[%d.%09ld] %s: %s '%s' timeout %ld\n",
-                    (int)rel_time.tv_sec, rel_time.tv_nsec,
-                    (char*)VECTOR(threadname)->data,
-                    events[i].label, events[i].mutex_name, events[i].timeout);
-        else if (events[i].mutex_name)
-            fprintf(stderr, "[%d.%09ld] %s: %s '%s'\n",
-                    (int)rel_time.tv_sec, rel_time.tv_nsec,
-                    (char*)VECTOR(threadname)->data,
-                    events[i].label, events[i].mutex_name);
-        else
-            fprintf(stderr, "[%d.%09ld] %s: %s\n",
-                    (int)rel_time.tv_sec, rel_time.tv_nsec,
-                    (char*)VECTOR(threadname)->data,
-                    events[i].label);
-    }
-    fprintf(stderr, "-----\n");
-}
-#else
-#define lisp_mutex_event(x)
-#define lisp_mutex_event1(x,y)
-#define lisp_mutex_event2(x,y,z)
-#endif
-
 /* values taken from the kernel's linux/futex.h.  This header file
    doesn't exist in userspace, which is our excuse for not grovelling
    them automatically */
@@ -163,7 +79,7 @@ void lisp_mutex_done_eventrecording() {
 #define FUTEX_WAKE_PRIVATE (1+128)
 
 /* Not static so that Lisp may query it. */
-boolean futex_private_supported_p;
+bool futex_private_supported_p;
 
 static inline int
 futex_wait_op()
@@ -196,7 +112,6 @@ futex_init()
         futex_private_supported_p = 1;
     } else {
         futex_private_supported_p = 0;
-        SHOW("No futex private suppport\n");
     }
 }
 
@@ -208,9 +123,8 @@ char* futex_name(int *lock_word)
 {
     // If there is a Lisp string at lock_word+1, return that, otherwise NULL.
     lispobj name = ((lispobj*)lock_word)[1];
-    if (lowtag_of(name) == OTHER_POINTER_LOWTAG &&
-        header_widetag(VECTOR(name)->header) == SIMPLE_BASE_STRING_WIDETAG)
-        return (char*)VECTOR(name)->data;
+    if (lowtag_of(name) == OTHER_POINTER_LOWTAG && simple_base_string_p(name))
+        return vector_sap(name);
     return 0;
 }
 
@@ -220,21 +134,14 @@ futex_wait(int *lock_word, int oldval, long sec, unsigned long usec)
   struct timespec timeout;
   int t;
 
-#ifdef MUTEX_EVENTRECORDING
-    struct mutex* m = (void*)((char*)lock_word - offsetof(struct mutex,state));
-    char *name = m->name != NIL ? (char*)VECTOR(m->name)->data : "(unnamed)";
-#endif
   if (sec<0) {
-      lisp_mutex_event1("start futex wait", name);
       t = sys_futex(lock_word, futex_wait_op(), oldval, 0);
   }
   else {
       timeout.tv_sec = sec;
       timeout.tv_nsec = usec * 1000;
-      lisp_mutex_event2("start futex timedwait", name, usec);
       t = sys_futex(lock_word, futex_wait_op(), oldval, &timeout);
   }
-  lisp_mutex_event1("back from sys_futex", name);
   if (t==0)
       return 0;
   else if (errno==ETIMEDOUT)
@@ -249,21 +156,18 @@ futex_wait(int *lock_word, int oldval, long sec, unsigned long usec)
 int
 futex_wake(int *lock_word, int n)
 {
-#ifdef MUTEX_EVENTRECORDING
-    struct mutex* m = (void*)((char*)lock_word - offsetof(struct mutex,state));
-    char *name = m->name != NIL ? (char*)VECTOR(m->name)->data : "(unnamed)";
-    lisp_mutex_event1("waking futex", name);
-#endif
     return sys_futex(lock_word, futex_wake_op(),n,0);
 }
 #endif
 
 
-void os_init(char __attribute__((unused)) *argv[],
-             char __attribute__((unused)) *envp[])
+void os_init()
 {
 #ifdef LISP_FEATURE_SB_FUTEX
     futex_init();
+#endif
+#ifdef LISP_FEATURE_SB_DEVEL
+    prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY);
 #endif
 }
 
@@ -274,8 +178,31 @@ void os_init(char __attribute__((unused)) *argv[],
 # define ALLOW_PERSONALITY_CHANGE 0
 #endif
 
+extern char **environ;
 int os_preinit(char *argv[], char *envp[])
 {
+#ifdef LISP_FEATURE_RISCV
+    extern int riscv_user_emulation, mmap_does_not_zero, sigaction_does_not_mask;
+    /* Accomodate buggy mmap() emulation, but detect up front whether it may be.
+     * Full system emulation running a RISCV kernel is generally fine. User mode is not.
+     * There's no way to know what it _will_ do, so we have to guess based on
+     * whether the emulation looks bad. */
+    char buf[100];
+    FILE *f = fopen("/proc/cpuinfo", "r");
+    ignore_value(fgets(buf, sizeof buf, f));
+    ignore_value(fgets(buf, sizeof buf, f));
+    if (!strstr(buf, "hart")) { // look for "hardware thread" string
+        fprintf(stderr, "WARNING: enabling mmap() workaround. GC time may be affected\n");
+        rewind(f);
+        fprintf(stderr, "Contents of /proc/cpuinfo:\n");
+        while (fgets(buf, sizeof buf, f) && strlen(buf)>1) fprintf(stderr, " | %s", buf);
+        fprintf(stderr, "----\n");
+        riscv_user_emulation = 1;
+        mmap_does_not_zero = 1;
+        sigaction_does_not_mask = 1;
+    }
+    fclose(f);
+#endif
 
 #if ALLOW_PERSONALITY_CHANGE
     if (getenv("SBCL_IS_RESTARTING")) {
@@ -323,6 +250,7 @@ int os_preinit(char *argv[], char *envp[])
             char runtime[PATH_MAX+1];
             int i = readlink("/proc/self/exe", runtime, PATH_MAX);
             if (i != -1) {
+                // Why is this needed? env surely was initialized from environ wasn't it?
                 environ = envp;
                 setenv("SBCL_IS_RESTARTING", "T", 1);
                 runtime[i] = '\0';
@@ -334,22 +262,6 @@ int os_preinit(char *argv[], char *envp[])
     }
 #endif
     return 0;
-}
-
-void
-os_protect(os_vm_address_t address, os_vm_size_t length, os_vm_prot_t prot)
-{
-    if (mprotect(address, length, prot)) {
-        if (errno == ENOMEM) {
-            lose("An mprotect call failed with ENOMEM. This probably means that the maximum amount\n"
-                 "of separate memory mappings was exceeded. To fix the problem, either increase\n"
-                 "the maximum with e.g. 'echo 262144 > /proc/sys/vm/max_map_count' or recompile\n"
-                 "SBCL with a larger value for GENCGC-CARD-BYTES in\n"
-                 "'src/compiler/"SBCL_TARGET_ARCHITECTURE_STRING"/parms.lisp'.");
-        } else {
-            perror("mprotect");
-        }
-    }
 }
 
 /*
@@ -380,9 +292,16 @@ sigsegv_handler(int signal, siginfo_t *info, os_context_t *context)
 #endif
 
 #ifdef LISP_FEATURE_GENCGC
-    if (gencgc_handle_wp_violation(addr)) return;
-#else
-    if (cheneygc_handle_wp_violation(context, addr)) return;
+    if (gencgc_handle_wp_violation(context, addr)) return;
+#endif
+
+#ifdef LISP_FEATURE_NONSTOP_FOREIGN_CALL
+    if (handle_foreign_call_trigger(context, addr)) return;
+#endif
+
+    extern int diagnose_arena_fault(os_context_t*,char*);
+#ifdef LISP_FEATURE_SYSTEM_TLABS
+    if (diagnose_arena_fault(context, addr)) return;
 #endif
     if (!handle_guard_page_triggered(context, addr))
             sbcl_fallback_sigsegv_handler(signal, info, context);

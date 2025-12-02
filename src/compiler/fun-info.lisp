@@ -20,11 +20,6 @@
 ;;; breakdown of side effects, since we do very little code motion on
 ;;; IR1. We are interested in some deeper semantic properties such as
 ;;; whether it is safe to pass stack closures to.
-;;;
-;;; FIXME: This whole notion of "bad" explicit attributes is bad for
-;;; maintenance. How confident are we that we have no defknowns for functions
-;;; with functional arguments that are missing the CALL attribute? Much better
-;;; to have NO-CALLS, as it is much less likely to break accidentally.
 (!def-boolean-attribute ir1
   ;; may call functions that are passed as arguments. In order to
   ;; determine what other effects are present, we must find the
@@ -87,14 +82,29 @@
   ;; as a consistency checking mechanism inside the compiler during IR2
   ;; transformation.
   always-translatable
-  ;; Function's funarg can safely skip its argument count check.
-  callee-omit-arg-count-check
   ;; If a function is called with two arguments and the first one is a
   ;; constant, then the arguments will be swapped.
-  commutative)
+  commutative
+  ;; Reoptimize this function if the node that follows it gets unlinked.
+  reoptimize-when-unlinking
+  ;; The function does not verify the arg count and must be always
+  ;; called with the right arguments and can avoid passing NARGS.
+  no-verify-arg-count
+  ;; Arguments can be passed unboxed, no type checking on entry is
+  ;; performed, and the number of arguments passed in registers can be
+  ;; greater than the standard number. Only fixed arguments can be used.
+  fixed-args
+  unboxed-return
+  ;; Can be constant-folded if it's not retained or modified
+  foldable-read-only
+  ;; The type deriver can be called on multiple value calls
+  mv-deriver)
 
 (defstruct (fun-info (:copier nil)
-                     #-sb-xc-host (:pure t))
+                     #-sb-xc-host (:pure t)
+                     (:constructor make-fun-info
+                         (attributes derive-type optimizer
+                          result-arg call-type-deriver annotation folder read-only-args)))
   ;; boolean attributes of this function.
   (attributes (missing-arg) :type attributes)
   ;; TRANSFORM structures describing transforms for this function
@@ -142,6 +152,10 @@
   ;; each constraint flips the meaning of the constraint if it is
   ;; non-NIL.
   (constraint-propagate nil :type (or function null))
+  ;; Propagating stuff back to the arguments based on the constraints on
+  ;; the result of this combination.
+  (constraint-propagate-back nil :type (or function null))
+  (constraint-propagate-result nil :type (or function null))
   ;; If true, the function can add flow-sensitive type information
   ;; depending on the truthiness of its return value.  Returns two
   ;; values, a LVAR and a CTYPE. The LVAR is of that CTYPE iff the
@@ -162,7 +176,20 @@
   (result-arg nil :type (or index null))
   ;; Customizing behavior of ASSERT-CALL-TYPE
   (call-type-deriver nil :type (or function null))
-  annotation)
+  annotation
+  ;; For functions with unboxed args/returns
+  (folder nil :type (or function null))
+  ;; Must have a FOLDABLE attribute to invoke this
+  (fold-p nil :type (or function null))
+  ;; :FULL means it behaves like a full call despite being implemented
+  ;; via VOPs or ir2-convert.
+  (externally-checkable-type nil :type (or function null (eql :full)))
+  (constants nil :type (or function null))
+  ;; A description of read-only arguments that can be constant folded.
+  ;; An integer bitmap for positional arguments.
+  ;; Sign-extended into a negative integer for &rest arguments.
+  (read-only-args nil :type (or null sb-xc:fixnum))
+  (rewrite-full-call nil :type (or function null)))
 
 (defprinter (fun-info)
   (attributes :test (not (zerop attributes))

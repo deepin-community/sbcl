@@ -11,25 +11,26 @@
 
 #ifndef _INTERR_H_
 #define _INTERR_H_
+#include <stdbool.h>
 #include "os.h"
 extern void lose(char *fmt, ...)
 #ifndef LISP_FEATURE_WIN32
  __attribute__((format(printf,1,2))) // clang and gcc support this, MSVC doesn't
 #endif
  never_returns;
-extern void tprintf(char *fmt, ...);
-extern boolean lose_on_corruption_p;
+extern int lose_on_corruption_p;
 extern void corruption_warning_and_maybe_lose(char *fmt, ...);
+extern void corruption_warning(char *fmt, ...);
+extern void maybe_lose();
 extern void enable_lossage_handler(void);
 extern void disable_lossage_handler(void);
 extern void describe_internal_error(os_context_t *context);
 extern void skip_internal_error (os_context_t *context);
 
 #ifdef LISP_FEATURE_WIN32
-/* thread ID is a more useful identifer than thread handle */
 #define UNKNOWN_STACK_POINTER_ERROR(function_name, thread) \
-    lose(function_name": no SP known for thread %p (ID %p)", \
-         thread, (void*)thread->os_kernel_tid);
+    lose(function_name": no SP known for thread %p (handle %lx)", \
+         thread, (long)thread->os_thread);
 #else
 /* Portably printf()ing a pthread_t is tricky. It has to be printed
  * as opaque bytes by taking &id and sizeof id.

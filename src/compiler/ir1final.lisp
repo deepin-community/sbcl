@@ -30,7 +30,14 @@
             (compiler-notify "~@<unable to ~2I~_~A ~I~_because: ~2I~_~?~:>"
                              note (first what) (rest what)))
            ((valid-fun-use node what
-                           :argument-test #'types-equal-or-intersect
+                           :argument-test (lambda (arg-type type)
+                                            ;; Don't bother with LIST not matching (OR NULL ...)
+                                            (unless (and (eq arg-type (specifier-type 'list))
+                                                         (neq type (specifier-type 'list))
+                                                         (and (union-type-p type)
+                                                              (find (specifier-type 'null)
+                                                                    (union-type-types type))))
+                                              (types-equal-or-intersect arg-type type)))
                            :result-test #'values-types-equal-or-intersect)
             (collect ((messages))
               (flet ((give-grief (string &rest stuff)
@@ -117,40 +124,61 @@
             (setq atype (note-fun-use dest atype)))))
       (setf (info :function :assumed-type name) atype))))
 
-;;; Merge CASTs with preceding/following nodes.
-(defun ir1-merge-casts (component)
+(defun ir1-finalize-nodes (component)
   (do-blocks-backwards (block component)
     (do-nodes-backwards (node lvar block :restart-p t)
       (let ((dest (when lvar (lvar-dest lvar))))
-        (cond ((and (cast-p dest)
-                    (not (cast-type-check dest))
-                    (almost-immediately-used-p lvar node))
-               (let ((dtype (node-derived-type node))
-                     (atype (node-derived-type dest)))
-                 (when (values-types-equal-or-intersect
-                        dtype atype)
-                   ;; FIXME: We do not perform pathwise CAST->type-error
-                   ;; conversion, and type errors can later cause
-                   ;; backend failures. On the other hand, this version
-                   ;; produces less efficient code.
-                   ;;
-                   ;; This is sorta DERIVE-NODE-TYPE, but does not try
-                   ;; to optimize the node.
-                   (setf (node-derived-type node)
-                         (values-type-intersection dtype atype)))))
-              ((and (cast-p node)
-                    (eq (cast-type-check node) :external))
-               (aver (basic-combination-p dest))
-               (delete-filter node lvar (cast-value node))))))))
+        ;; Merge CASTs with preceding/following nodes.
+        (when (and (cast-p dest)
+                   (not (cast-type-check dest)))
+          (let ((dtype (node-derived-type node))
+                (atype (node-derived-type dest)))
+            (when (values-types-equal-or-intersect
+                   dtype atype)
+              ;; FIXME: We do not perform pathwise CAST->type-error
+              ;; conversion, and type errors can later cause
+              ;; backend failures. On the other hand, this version
+              ;; produces less efficient code.
+              ;;
+              ;; This is sorta DERIVE-NODE-TYPE, but does not try
+              ;; to optimize the node.
+              (setf (node-derived-type node)
+                    (values-type-intersection dtype atype)))))
+        (typecase node
+          (cast
+           (cond
+             ((eq (cast-type-check node) :external)
+              (aver (basic-combination-p dest))
+              (delete-filter node lvar (cast-value node)))
+             ((and (not (delay-p node))
+                   (not (cast-type-check node))
+                   (return-p dest))
+              (let ((value (cast-value node))
+                    (type (node-derived-type node)))
+                (setf (lvar-%derived-type (cast-value node))
+                      type)
+                (do-uses (use value)
+                  (let ((type (values-type-intersection (node-derived-type use) type)))
+                    (unless (eq type *empty-type*)
+                      (setf (node-derived-type use) type))))
+                (delete-filter node lvar (cast-value node))))))
+          (combination
+           (when (eq (combination-kind node) :known)
+             (ir1-optimize-functional-arguments node))))))))
 
 (defglobal *two-arg-functions*
-    `((* two-arg-* (,(specifier-type 'fixnum) ,(specifier-type 'fixnum)) multiply-fixnums)
+    `((* two-arg-*
+         ,@(sb-c::unless-vop-existsp (:named sb-vm::*/signed=>integer)
+             `((,(specifier-type 'fixnum) ,(specifier-type 'fixnum))
+               multiply-fixnums)))
       (+ two-arg-+)
       (- two-arg--)
       (/ two-arg-/ (,(specifier-type 'integer) ,(specifier-type 'integer)) sb-kernel::integer-/-integer)
       (< two-arg-<)
       (= two-arg-=)
       (> two-arg->)
+      (<= two-arg-<=)
+      (>= two-arg->=)
       (char-equal two-arg-char-equal)
       (char-greaterp two-arg-char-greaterp)
       (char-lessp two-arg-char-lessp)
@@ -192,117 +220,232 @@
 (def-two-arg-funs (character character)
   char= char/= char< char> char<= char>=)
 (def-two-arg-funs (number number)
-  >= <= /=)
+  /=)
 
-;;; A list of function which always call their functional argument correctly,
-;;; meaning that no arg-count-error can occur in the callee
-;;; and therefore the callee can skip the check.
-(dolist (fun '(sb-thread::call-with-mutex
-               sb-thread::call-with-recursive-lock
-               sb-thread::call-with-system-mutex
-               sb-thread::call-with-system-mutex/allow-with-interrupts
-               sb-thread::call-with-system-mutex/without-gcing
-               sb-thread::call-with-recursive-system-lock
-               ;; wish we had a little more commonality to these names
-               sb-impl::%with-standard-io-syntax
-               sb-impl::%with-rebound-io-syntax
-               sb-debug::funcall-with-debug-io-syntax
-               sb-impl::call-with-sane-io-syntax
-               ;; there are others, maybe %with-compilation-unit
-               sb-impl::%print-unreadable-object
-               ))
-  (let ((info (info :function :info fun)))
-    (when info
-      (setf (ir1-attributep (fun-info-attributes info) callee-omit-arg-count-check)
-            t))))
+;;; Unwrap predicates to enable tail calls
+(defun unwrap-predicates (combination)
+  (let ((info (combination-fun-info combination)))
+    (when (and info
+               (ir1-attributep (fun-info-attributes info) predicate))
+      (let ((if (node-dest combination)))
+        (when (and (if-p if)
+                   (immediately-used-p (node-lvar combination) combination t))
+          (let* ((con (if-consequent if))
+                 (alt (if-alternative if))
+                 (con-ref (next-node con :type :ref :single-predecessor t))
+                 (alt-ref (next-node alt :type :ref :single-predecessor t)))
+            (when (and con-ref alt-ref)
+              (let ((ref-lvar (node-lvar con-ref))
+                    (block (node-block if))
+                    (next (next-node con-ref)))
+                (when (and (constant-p (ref-leaf con-ref))
+                           (constant-p (ref-leaf alt-ref))
+                           (eq (constant-value (ref-leaf con-ref)) t)
+                           (eq (constant-value (ref-leaf alt-ref)) nil)
+                           (eq ref-lvar
+                               (node-lvar alt-ref))
+                           (eq next
+                               (next-node alt-ref)))
+                  (loop for succ in (block-succ block)
+                        do (unlink-blocks block succ))
+                  (unlink-node if)
+                  (%delete-lvar-use combination)
+                  (use-lvar combination ref-lvar)
+                  (push "unwrap-predicates" (node-source-path con-ref))
+                  (push "unwrap-predicates" (node-source-path alt-ref))
+                  (link-blocks block (node-block next)))))))))))
 
 ;;; Convert function designators to functions in calls to known functions
 ;;; Also convert to TWO-ARG- variants
-(defun ir1-optimize-functional-arguments (component)
-  (do-blocks (block component)
-    (do-nodes (node nil block)
-      (when (and (combination-p node)
-                 (eq (combination-kind node) :known)
-                 ;; REDUCE can call with zero arguments.
-                 (neq (lvar-fun-name (combination-fun node) t) 'reduce))
-        (map-callable-arguments
-           (lambda (lvar args results &key no-function-conversion &allow-other-keys)
-             (declare (ignore results))
-             (unless no-function-conversion
-               (let ((ref (lvar-uses lvar))
-                     (arg-count (length args)))
-                 (labels ((translate-two-args (name)
-                            (and (eql arg-count 2)
-                                 (not (fun-lexically-notinline-p name (node-lexenv node)))
-                                 (cadr (assoc name *two-arg-functions*))))
-                          (translate (ref)
-                            (let* ((leaf (ref-leaf ref))
-                                   (fun-name (and (constant-p leaf)
-                                                  (constant-value leaf)))
-                                   (replacement
-                                     (cond ((and fun-name (symbolp fun-name))
-                                            (translate-two-args fun-name))
-                                           ((and (global-var-p leaf)
-                                                 (eq (global-var-kind leaf) :global-function))
-                                            (translate-two-args (global-var-%source-name leaf)))))
-                                   (*compiler-error-context* node))
-                              (and replacement
-                                   (find-free-fun replacement "ir1-finalize")))))
-                   (cond ((ref-p ref)
-                          (let ((replacement (translate ref)))
-                            (when replacement
-                              (change-ref-leaf ref replacement))))
-                         ((cast-p ref)
-                          (let* ((cast ref)
-                                 (ref (lvar-uses (cast-value cast))))
-                            (when (ref-p ref)
-                              (let ((replacement (translate ref)))
-                                (when replacement
-                                  (change-ref-leaf ref replacement :recklessly t)
-                                  (setf (node-derived-type cast)
-                                        (lvar-derived-type (cast-value cast)))))))))))))
-           node)
-        ;; One more thing: builtin higher-order functions utilized by builtin macros
-        ;; can impart a policy change to the callee, but it can't (easily) be done
-        ;; strictly lexically, because the policy would leak downward.
-        ;; e.g. (WITH-SOME-STUFF () ..) ->
-        ;; -> (DX-FLET ((THUNK () <user-code>)) (CALL-WITH-STUFF #'THUNK))
-        ;; should not inject (OPTIMIZE (VERIFY-ARG-COUNT 0)) at the top of <user-code>
-        ;; because every lambda therein would omit the arg-count check.
-        (when (ir1-attributep (fun-info-attributes (combination-fun-info node))
-                              callee-omit-arg-count-check)
-          (let* ((args (combination-args node))
-                 (arg (if (eq (lvar-fun-name (combination-fun node) t)
-                              'sb-impl::%print-unreadable-object)
-                          (fourth args)
-                          (first args)))
-                 (ref (and arg (lvar-uses arg))))
-            (when (and (ref-p ref) (lambda-p (ref-leaf ref)))
-              ;; It seems impolite (un-debuggable too) to alter the lexenv-policy
-              ;; of functional-lexenv, so annotate this differently.
-              (setf (getf (functional-plist (ref-leaf ref)) 'verify-arg-count)
-                    nil))))))))
+(defun ir1-optimize-functional-arguments (node)
+  (unless (eq (lvar-fun-name (combination-fun node) t) 'reduce) ;; REDUCE can call with zero arguments.
+    (when-vop-existsp (:named  sb-vm::move-conditional-result)
+      (unwrap-predicates node))
+    (map-callable-arguments
+     (lambda (lvar args results &key no-function-conversion &allow-other-keys)
+       (declare (ignore results))
+       ;; Process annotations while the original values are still there.
+       (process-annotations lvar)
+       (unless no-function-conversion
+         (let ((ref (lvar-uses lvar))
+               (arg-count (length args)))
+           (labels ((translate-two-args (name)
+                      (and (eql arg-count 2)
+                           (not (fun-lexically-notinline-p name (node-lexenv node)))
+                           (cadr (assoc (uncross name) *two-arg-functions*))))
+                    (translate (ref)
+                      (let* ((leaf (ref-leaf ref))
+                             (fun-name (and (constant-p leaf)
+                                            (constant-value leaf)))
+                             (replacement
+                               (cond ((and fun-name (symbolp fun-name))
+                                      (or (translate-two-args fun-name)
+                                          (and (not (memq (info :function :kind fun-name)
+                                                          '(:macro :special-form)))
+                                               fun-name)))
+                                     ((and (global-var-p leaf)
+                                           (eq (global-var-kind leaf) :global-function))
+                                      (translate-two-args (global-var-%source-name leaf)))))
+                             (*compiler-error-context* node))
+                        (and replacement
+                             (prog1
+                                 (find-global-fun replacement t)
+                               (record-late-xref :calls replacement ref))))))
+             (cond ((ref-p ref)
+                    (let ((replacement (translate ref)))
+                      (when replacement
+                        (change-ref-leaf ref replacement))))
+                   ((cast-p ref)
+                    (let* ((cast ref)
+                           (ref (lvar-uses (cast-value cast))))
+                      (when (ref-p ref)
+                        (let ((replacement (translate ref)))
+                          (when replacement
+                            (change-ref-leaf ref replacement :recklessly t)
+                            (setf (node-derived-type cast)
+                                  (lvar-derived-type (cast-value cast)))))))))))))
+     node)
+    (when-vop-existsp (:named sb-vm::load-other-pointer-widetag)
+      (reorder-type-tests node))))
+
+(defun change-full-call (combination new-fun-name &key recklessly)
+  (let ((ref (lvar-uses (combination-fun combination))))
+    (when (ref-p ref)
+      (when (combination-fun-info combination)
+        (setf (combination-fun-info combination)
+              (fun-info-or-lose new-fun-name)))
+      (change-ref-leaf
+       ref
+       (find-free-fun new-fun-name "")
+       :recklessly recklessly)
+      t)))
+
+(macrolet ((def ()
+             `(progn
+                ,@(loop for (name two-arg types typed) in *two-arg-functions*
+                        collect
+                        (if typed
+                            `(defoptimizer (,name rewrite-full-call) ((a b) node)
+                               (if (and (csubtypep (lvar-type a) (specifier-type  ',(type-specifier (first types))))
+                                        (csubtypep (lvar-type b) (specifier-type  ',(type-specifier (second types)))))
+                                   ',typed
+                                   ',two-arg))
+                            `(defoptimizer (,name rewrite-full-call) ((a b) node)
+                               ',two-arg))))))
+  (def))
 
 (defun rewrite-full-call (combination)
-  (let ((combination-name (lvar-fun-name (combination-fun combination) t))
-        (args (combination-args combination)))
-    (let ((two-arg (assoc combination-name *two-arg-functions*))
-          (ref (lvar-uses (combination-fun combination))))
-      (when (and two-arg
-                 (ref-p ref)
-                 (= (length args) 2)
-                 (not (fun-lexically-notinline-p combination-name
-                                                 (node-lexenv combination))))
-        (destructuring-bind (name two-arg &optional types typed-two-arg) two-arg
-          (declare (ignore name))
-          (when (and types
-                     (loop for arg in args
-                           for type in types
-                           always (csubtypep (lvar-type arg) type)))
-            (setf two-arg typed-two-arg))
-          (change-ref-leaf
-           ref
-           (find-free-fun two-arg "rewrite-full-call")))))))
+  (case (combination-kind combination)
+    (:known
+     (let ((rewrite (fun-info-rewrite-full-call (combination-fun-info combination))))
+       (when rewrite
+         (let ((new (funcall rewrite combination)))
+           (when new
+             (change-full-call combination new))))))
+    (:full
+     (let* ((combination-name (lvar-fun-name (combination-fun combination) t))
+            (specialized (or (info :function :specialized-xep combination-name)
+                             (let ((specialized (assoc 'sb-impl::specialized-xep
+                                                       (lexenv-user-data (node-lexenv combination)))))
+                               (when (eq (cadr specialized) combination-name)
+                                 (cddr specialized))))))
+       (when (and specialized
+                  (= (length (combination-args combination))
+                     (length (first specialized)))
+                  (not (fun-lexically-notinline-p combination-name (node-lexenv combination))))
+         (change-full-call combination `(sb-impl::specialized-xep ,combination-name ,@specialized)))))))
+
+;;; The %other-pointer-subtype-p optimizer in ir2opt combines multiple
+;;; checks for other-pointer into a single widetag load.
+;;; Reorder type tests so that e.g.
+;;; (typecase u
+;;;   (double-float 0)
+;;;   (single-float 1)
+;;;   (bignum 2))
+;;;
+;;; gets turned into
+;;; (typecase u
+;;;  (double-float 0)
+;;;  (bignum 2)
+;;;  (single-float 1))
+;;; for the ir2 optimization to get triggered.
+(defun reorder-type-tests (node)
+  (flet ((type-check-p (node other-pointer-p)
+           (let ((name (combination-fun-source-name node nil)))
+             (and
+              (eq (and (getf sb-vm::*other-pointer-type-vops* name) t)
+                  other-pointer-p)
+              (gethash name *backend-predicate-types*))))
+         (var (pred)
+           (let* ((arg (car (combination-args pred)))
+                  (use (lvar-uses arg)))
+             (and (ref-p use)
+                  (lambda-var-p (ref-leaf use))
+                  (ref-leaf use)))))
+    (when (type-check-p node t)
+      (let* ((block (node-block node))
+             (if (block-last block))
+             (var (var node)))
+        (when (and var
+                   (if-p if)
+                   (eq (if-test if) (node-lvar node)))
+          (flet ((if-to-typecheck (if other-pointer-p)
+                   (let* ((block (if-alternative if))
+                          (next-if (block-last block))
+                          fun-lvar
+                          arg
+                          result
+                          type)
+                     (when (and (if-p next-if)
+                                (not (cdr (block-pred block)))
+                                (only-harmless-cleanups (node-block if)
+                                                        block))
+                       (do-nodes (node lvar block)
+                         (typecase node
+                           (ref
+                            (cond ((and (eq (ref-leaf node) var)
+                                        (not arg))
+                                   (setf arg lvar))
+                                  ((not fun-lvar)
+                                   (setf fun-lvar lvar))
+                                  (t
+                                   (return-from if-to-typecheck))))
+                           (combination
+                            (unless (and (eq (car (combination-args node)) arg)
+                                         (eq (combination-fun node) fun-lvar)
+                                         (setf type (type-check-p node other-pointer-p)))
+                              (return-from if-to-typecheck))
+                            (setf result (node-lvar node)))
+                           (cif
+                            (unless (eq (if-test node) result)
+                              (return-from if-to-typecheck)))
+                           (t
+                            (return-from if-to-typecheck))))
+                       (values block arg type)))))
+            (multiple-value-bind (next-block next-lvar next-type) (if-to-typecheck if nil)
+              (when next-block
+                (let ((next-if (block-last next-block)))
+                  (multiple-value-bind (next-next-block next-next-lvar next-next-type) (if-to-typecheck next-if t)
+                    (when (and next-next-block
+                               (not (types-equal-or-intersect next-type next-next-type)))
+                      (let* ((next-next-if (block-last next-next-block))
+                             (end (if-alternative next-next-if)))
+                        (when (only-harmless-cleanups next-next-block end)
+                          (change-block-successor block next-block next-next-block)
+                          (change-block-successor next-next-block end next-block)
+                          (change-block-successor next-block next-next-block end)
+                          ;; A different type from constraint propagation.
+                          ;; It's important to change the type if ir2
+                          ;; doesn't optimize these series of type tests
+                          ;; for some reason.
+                          (derive-node-type (lvar-use next-next-lvar)
+                                            (node-derived-type (lvar-use next-lvar))
+                                            :from-scratch t)
+                          ;; Both branches now might go to the same block
+                          ;; this will delete the IF and the test.
+                          (ir1-optimize-if next-if t)
+                          (when (block-flush-p next-block)
+                            (flush-dead-code next-block)))))))))))))))
 
 ;;; Do miscellaneous things that we want to do once all optimization
 ;;; has been done:
@@ -313,10 +456,10 @@
 (defun ir1-finalize (component)
   (declare (type component component))
   (dolist (fun (component-lambdas component))
-    (case (functional-kind fun)
-      (:external
+    (functional-kind-case fun
+      (external
        (finalize-xep-definition fun))
-      ((nil :toplevel)
+      ((nil toplevel)
        (setf (leaf-type fun) (definition-type fun)))))
 
   (maphash #'note-failed-optimization
@@ -326,6 +469,5 @@
              (note-assumed-types component k v))
            (free-funs *ir1-namespace*))
 
-  (ir1-merge-casts component)
-  (ir1-optimize-functional-arguments component)
+  (ir1-finalize-nodes component)
   (values))

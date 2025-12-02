@@ -9,7 +9,7 @@
 
 (in-package "SB-KERNEL")
 
-#-sb-devel(declaim (start-block))
+(declaim (start-block))
 
 ;;; (Note that when cross-compiling, SB-XC:TYPEP is interpreted as a
 ;;; test that the host Lisp object OBJECT translates to a target SBCL
@@ -34,9 +34,6 @@
   (declare (explicit-check))
   (%%typep object (specifier-type specifier)))
 
-;;; probably not the right place for this declamation. The benefits
-;;; should be more widespread.
-(declaim (freeze-type ctype))
 (defun %%typep (object type &optional (strict t))
  (declare (type ctype type))
  (typep-impl-macro (object :defaults nil)
@@ -47,7 +44,7 @@
        ((funcallable-instance) (funcallable-instance-p object))
        ((extended-sequence) (extended-sequence-p object))
        ((nil) nil)))
-    (numeric-type (number-typep object type))
+    (numeric-union-type (numeric-union-typep object type))
     (array-type
      (and (arrayp object)
           (or (eq (array-type-complexp type) :maybe)
@@ -86,7 +83,7 @@
          (funcall (built-in-classoid-predicate type) object)
          (and (or (%instancep object)
                   (functionp object))
-              (classoid-typep (wrapper-of object) type object))))
+              (classoid-typep (layout-of object) type object))))
     (union-type
      (some (lambda (union-type-type) (recurse object union-type-type))
            (union-type-types type)))
@@ -100,15 +97,11 @@
     #+sb-simd-pack
     (simd-pack-type
      (and (simd-pack-p object)
-          (let* ((tag (%simd-pack-tag object))
-                 (name (nth tag *simd-pack-element-types*)))
-            (not (not (member name (simd-pack-type-element-type type)))))))
+          (logbitp (%simd-pack-tag object) (simd-pack-type-tag-mask type))))
     #+sb-simd-pack-256
     (simd-pack-256-type
      (and (simd-pack-256-p object)
-          (let* ((tag (%simd-pack-256-tag object))
-                 (name (nth tag *simd-pack-element-types*)))
-            (not (not (member name (simd-pack-256-type-element-type type)))))))
+          (logbitp (%simd-pack-256-tag object) (simd-pack-256-type-tag-mask type))))
     (character-set-type
      (test-character-type type))
     (negation-type
@@ -154,8 +147,8 @@
                       (block nil
                         (classoid-typep
                          (typecase object
-                           (instance (%instance-wrapper object))
-                           (funcallable-instance (%fun-wrapper object))
+                           (instance (%instance-layout object))
+                           (funcallable-instance (%fun-layout object))
                            (t (return)))
                          (cdr (truly-the cons cache))
                          object)))
@@ -165,19 +158,6 @@
           (sb-thread:barrier (:write))
           (setf (car cache) fun)
           (funcall fun cache object)))))
-
-;;; Do a type test from a class cell, allowing forward reference and
-;;; redefinition.
-(defun classoid-cell-typep (cell object)
-  (let ((layout (typecase object
-                  (instance (%instance-layout object))
-                  (funcallable-instance (%fun-layout object))
-                  (t (return-from classoid-cell-typep))))
-        (classoid (classoid-cell-classoid cell)))
-    (unless classoid
-      (error "The class ~S has not yet been defined."
-             (classoid-cell-name cell)))
-    (classoid-typep (layout-friend layout) classoid object)))
 
 ;;; Return true of any object which is either a funcallable-instance,
 ;;; or an ordinary instance that is not a structure-object.
@@ -195,9 +175,9 @@
 ;;; Try to ensure that the object's layout is up-to-date only if it is an instance
 ;;; or funcallable-instance of other than a static or structure classoid type.
 (defun update-object-layout (object)
-  (wrapper-friend (if (%pcl-instance-p object)
-                      (sb-pcl::check-wrapper-validity object)
-                      (wrapper-of object))))
+  (if (%pcl-instance-p object)
+      (sb-pcl::check-wrapper-validity object)
+      (layout-of object)))
 
 ;;; Test whether OBJ-LAYOUT is from an instance of CLASSOID.
 
@@ -229,7 +209,7 @@
 ;;; of thousands of iterations of 'classoid-typep.impure.lisp'
 
 (defun classoid-typep (obj-layout classoid object)
-  (declare (type wrapper obj-layout))
+  (declare (type layout obj-layout))
   ;; FIXME & KLUDGE: We could like to grab the *WORLD-LOCK* here (to ensure that
   ;; class graph doesn't change while we're doing the typep test), but in
   ;; practice that causes trouble -- deadlocking against the compiler
@@ -244,27 +224,40 @@
              ;; that we're testing against. Whether obj-layout is "valid" has no relevance.
              ;; This is racy though because %ENSURE-CLASSOID-VALID should return
              ;; the most up-to-date layout for the classoid, but it doesn't. Oh well.
-             (%ensure-classoid-valid classoid (classoid-wrapper classoid) "typep")
-             (values obj-layout (classoid-wrapper classoid)))
+             (%ensure-classoid-valid classoid (classoid-layout classoid) "typep")
+             (values obj-layout (classoid-layout classoid)))
             (t
              ;; And this case is even more racy, naturally.
-             (do ((layout (classoid-wrapper classoid) (classoid-wrapper classoid))
+             (do ((layout (classoid-layout classoid) (classoid-layout classoid))
                   (i 0 (+ i 1))
                   (obj-layout obj-layout))
-                 ((and (not (wrapper-invalid obj-layout))
-                       (not (wrapper-invalid layout)))
+                 ((and (not (layout-invalid obj-layout))
+                       (not (layout-invalid layout)))
                   (values obj-layout layout))
                (aver (< i 2))
                (%ensure-classoid-valid classoid layout "typep")
-               (when (zerop (wrapper-clos-hash obj-layout))
+               (when (zerop (layout-clos-hash obj-layout))
                  (setq obj-layout (sb-pcl::check-wrapper-validity object))))))
     ;; FIXME: if LAYOUT is for a structure, use the STRUCTURE-IS-A test
     ;; which avoids iterating.
     (or (eq obj-layout layout)
-        (let ((obj-inherits (wrapper-inherits obj-layout)))
+        (let ((obj-inherits (layout-inherits obj-layout)))
           (dotimes (i (length obj-inherits) nil)
             (when (eq (svref obj-inherits i) layout)
               (return t)))))))
+
+;;; Do a type test from a class cell, allowing forward reference and
+;;; redefinition.
+(defun classoid-cell-typep (cell object)
+  (let ((layout (typecase object
+                  (instance (%instance-layout object))
+                  (funcallable-instance (%fun-layout object))
+                  (t (return-from classoid-cell-typep))))
+        (classoid (classoid-cell-classoid (truly-the classoid-cell cell))))
+    (unless classoid
+      (error "The class ~S has not yet been defined."
+             (classoid-cell-name cell)))
+    (classoid-typep layout classoid object)))
 
 (declaim (end-block))
 
@@ -280,7 +273,7 @@
 (defun ctypep (obj type)
   (declare (type ctype type))
   (typep-impl-macro (obj)
-    ((or numeric-type
+    ((or numeric-union-type
          named-type
          member-type
          character-set-type
@@ -301,7 +294,7 @@
          (if (if (csubtypep type (specifier-type 'function))
                  (funcallable-instance-p obj)
                  (%instancep obj))
-             (if (eq (classoid-wrapper type)
+             (if (eq (classoid-layout type)
                      (info :type :compiler-layout (classoid-name type)))
                  (values (sb-xc:typep obj type) t)
                  (values nil nil))
@@ -320,17 +313,10 @@
      ;; to happen in more places too. (Like the array hairy type
      ;; testing.)
      (if (unknown-type-p type)
-         (let ((spec (unknown-type-specifier type)))
-           ;; KLUDGE: Work around the fact that we load PCL after we
-           ;; type test certain things defined there. This is somewhat
-           ;; suboptimal because this is really only a concern during
-           ;; warm load.
-           (if (member spec '(class sb-pcl::condition-class))
+         (let ((type (specifier-type (unknown-type-specifier type))))
+           (if (unknown-type-p type)
                (values nil nil)
-               (let ((type (specifier-type spec)))
-                 (if (unknown-type-p type)
-                     (values nil nil)
-                     (ctypep obj type)))))
+               (ctypep obj type)))
          ;; Now the tricky stuff.
          (let ((predicate (cadr (hairy-type-specifier type))))
            (case predicate
@@ -346,125 +332,8 @@
 ;;; :SB-XREF-FOR-INTERNALS hangs on to more symbols. It is not also the intent
 ;;; to retain all toplevel definitions whether subsequently needed or not.
 ;;; That's an unfortunate side-effect; this macro is done being used now.
+#-sb-devel
 (fmakunbound 'typep-impl-macro)
-
-;;;; miscellaneous interfaces
-
-;;; Clear memoization of all type system operations that can be
-;;; altered by type definition/redefinition.
-;;;
-(defun clear-type-caches ()
-  ;; FIXME: We would like to differentiate between different cache
-  ;; kinds, but at the moment all our caches pretty much are type
-  ;; caches.
-  (drop-all-hash-caches)
-  (values))
-
-;;; This is like TYPE-OF, only we return a CTYPE structure instead of
-;;; a type specifier, and we try to return the type most useful for
-;;; type checking, rather than trying to come up with the one that the
-;;; user might find most informative.
-;;;
-;;; To avoid inadvertent memory retention we avoid using arrays
-;;; and functions as keys.
-;;; During cross-compilation, the CTYPE-OF function is not memoized.
-;;; Constants get their type stored in their LEAF, so it's ok.
-
-(defun-cached (ctype-of :hash-bits 7 :hash-function #'sxhash
-                        :memoizer memoize)
-;; an unfortunate aspect of using EQ is that several appearances
-;; of the = double-float can be in the cache, but it's
-;; probably more efficient overall to use object identity.
-    ((x eq))
-  (flet ((try-cache (x)
-           (memoize
-            ;; For functions, the input is a type specifier
-            ;; of the form (FUNCTION (...) ...)
-            (cond ((listp x) (specifier-type x)) ; NIL can't occur
-                  ((symbolp x) (make-eql-type x))
-                  (t (ctype-of-number x))))))
-    (typecase x
-      (function
-       (if (funcallable-instance-p x)
-           (classoid-of x)
-           (let ((type (sb-impl::%fun-ftype x)))
-             (if (typep type '(cons (eql function))) ; sanity test
-                 (try-cache type)
-                 (classoid-of x)))))
-      (symbol (if x (try-cache x) (specifier-type 'null)))
-      (number (try-cache x))
-      (array (ctype-of-array x))
-      (cons (specifier-type 'cons))
-      (character
-       (typecase x
-         (standard-char (specifier-type 'standard-char))
-         (base-char (specifier-type 'base-char))
-         ;; If the last case were expressed as EXTENDED-CHAR,
-         ;; we wrongly get "this is not a (VALUES CTYPE): NIL"
-         ;; because the compiler is too naive to see that
-         ;; the last 2 cases partition CHARACTER.
-         (t (specifier-type 'extended-char))))
-      #+sb-simd-pack
-      (simd-pack
-       (let ((tag (%simd-pack-tag x)))
-         (svref (load-time-value
-                 (coerce (cons (specifier-type 'simd-pack)
-                               (mapcar (lambda (x) (specifier-type `(simd-pack ,x)))
-                                       *simd-pack-element-types*))
-                         'vector)
-                 t)
-                (if (<= 0 tag #.(1- (length *simd-pack-element-types*)))
-                    (1+ tag)
-                    0))))
-      #+sb-simd-pack-256
-      (simd-pack-256
-       (let ((tag (%simd-pack-256-tag x)))
-         (svref (load-time-value
-                 (coerce (cons (specifier-type 'simd-pack-256)
-                               (mapcar (lambda (x) (specifier-type `(simd-pack-256 ,x)))
-                                       *simd-pack-element-types*))
-                         'vector)
-                 t)
-                (if (<= 0 tag #.(1- (length *simd-pack-element-types*)))
-                    (1+ tag)
-                    0))))
-      (t
-       (classoid-of x)))))
-
-;; Helper function that implements (CTYPE-OF x) when X is an array.
-(defun-cached (ctype-of-array
-               :values (ctype) ; Bind putative output to this when probing.
-               :hash-bits 7
-               :hash-function (lambda (a &aux (hash cookie))
-                                (if header-p
-                                    (dotimes (axis rank hash)
-                                      (mixf hash (%array-dimension a axis)))
-                                    (mixf hash (length a)))))
-    ;; "type-key" is a perfect hash of rank + widetag + simple-p.
-    ;; If it matches, then compare dims, which are read from the output.
-    ;; The hash of the type-key + dims can have collisions.
-    ((array (lambda (array type-key)
-              (and (eq type-key cookie)
-                   (let ((dims (array-type-dimensions ctype)))
-                     (if header-p
-                         (dotimes (axis rank t)
-                           (unless (eq (pop (truly-the list dims))
-                                       (%array-dimension array axis))
-                             (return nil)))
-                         (eq (length array) (car dims))))))
-            cookie) ; Store COOKIE as the single key.
-     &aux (rank (array-rank array))
-          (simple-p (if (simple-array-p array) 1 0))
-          (header-p (array-header-p array)) ; non-simple or rank <> 1 or both
-          (cookie (the fixnum (logior (ash (logior (ash rank 1) simple-p)
-                                           sb-vm:n-widetag-bits)
-                                      (array-underlying-widetag array)))))
-  ;; The value computed on cache miss.
-  (let ((etype (sb-vm::array-element-ctype array)))
-    (make-array-type (array-dimensions array)
-                     :complexp (not (simple-array-p array))
-                     :element-type etype
-                     :specialized-element-type etype)))
 
 
 ;;;; Some functions for examining the type system
@@ -527,3 +396,120 @@ Experimental."
   ;; just deem it invalid.
   (not (null (ignore-errors
                (type-or-nil-if-unknown type-specifier t)))))
+
+;;; This is like TYPE-OF, only we return a CTYPE structure instead of
+;;; a type specifier, and we try to return the type most useful for
+;;; type checking, rather than trying to come up with the one that the
+;;; user might find most informative.
+;;;
+;;; The result is always hash-consed, and in most cases there is only a very tiny amount
+;;; of work to decide what to return. Also, constants get their type stored in their LEAF,
+;;; so there is little to no advantage to using DEFUN-CACHED for this.
+(defun ctype-of (x)
+  (macrolet (#+sb-simd-pack
+             (simd-subtype (tag base-type &aux (n-ets (length +simd-pack-element-types+)))
+               `(let ((tag ,tag))
+                  (svref ,(map-into (make-array (1+ n-ets)
+                                                :initial-element (specifier-type base-type))
+                                    (lambda (x) (specifier-type `(,base-type ,x)))
+                                    +simd-pack-element-types+)
+                         (if (<= 0 tag ,(1- n-ets)) tag ,n-ets)))))
+    (typecase x
+      (function
+       (if (funcallable-instance-p x)
+           (classoid-of x)
+           ;; This is the only case that conses now. Apparently %FUN-FTYPE has to TYPEXPAND
+           ;; the type as stored, which generally uses SFUNCTION so that we can represent
+           ;; the strict number of return values. TYPEXPAND of course conses.
+           ;; But I seriously doubt that this function is often called on functions.
+           (let ((type (sb-impl::%fun-ftype x)))
+             (if (typep type '(cons (eql function))) ; sanity test
+                 (specifier-type type) ; cached
+                 (classoid-of x)))))
+      (symbol (make-eql-type x)) ; hash-consed
+      (number (ctype-of-number x)) ; hash-consed
+      (array
+       ;; The main difficulty here is that DIMENSIONS have to be constructed
+       ;; to pass to %MAKE-ARRAY-TYPE but with care we can usually avoid consing.
+       (let ((etype (sb-vm::array-element-ctype x))
+             (rank (array-rank x))
+             (complexp (and (not (simple-array-p x))
+                            :maybe)))
+         ;; Complex arrays get turned into simple arrays when compiling to a fasl.
+         (if complexp
+             (%make-array-type (make-list rank :initial-element '*) complexp etype etype)
+             (case rank
+               (0 (%make-array-type '() complexp etype etype))
+               ((1 2 3)
+                (dx-let ((dims (list (array-dimension x 0) nil nil)))
+                  (case rank
+                    (1 (setf (cdr dims) nil))
+                    (2 (setf (cadr dims) (array-dimension x 1)
+                             (cddr dims) nil))
+                    (t (setf (cadr dims) (array-dimension x 1)
+                             (caddr dims) (array-dimension x 2))))
+                  (%make-array-type dims complexp etype etype)))
+               (t
+                (let ((dims (make-list rank)))
+                  (declare (dynamic-extent dims))
+                  (dotimes (i rank)
+                    (setf (nth i dims) (array-dimension x i)))
+                  (%make-array-type dims complexp etype etype)))))))
+      (cons
+       (let ((car (car x))
+             (cdr (cdr x)))
+         (make-cons-type (cond ((eq car x)
+                                (specifier-type 'cons))
+                               ;; Creates complicated unions
+                               ((functionp car)
+                                (specifier-type 'function))
+                               (t
+                                (ctype-of car)))
+                         (cond ((consp cdr)
+                                (specifier-type 'cons))
+                               ((functionp cdr)
+                                (specifier-type 'function))
+                               (t
+                                (ctype-of cdr))))))
+      (character
+       (character-set-type-from-characters (list x)))
+      #+sb-simd-pack
+      (simd-pack (simd-subtype (%simd-pack-tag x) simd-pack))
+      #+sb-simd-pack-256
+      (simd-pack-256 (simd-subtype (%simd-pack-256-tag x) simd-pack-256))
+      (t
+       (classoid-of x)))))
+
+;;; The stub for sb-c::%structure-is-a should really use layout-id in the same way
+;;; that the vop does, however, because the all 64-bit architectures other than
+;;; x86-64 need to use with-pinned-objects to extract a layout-id, it is cheaper not to.
+;;; I should add a vop for uint32 access to raw slots.
+(defun sb-c::%structure-is-a (object-layout test-layout)
+  (or (eq object-layout test-layout)
+      (let ((depthoid (layout-depthoid test-layout))
+            (inherits (layout-inherits object-layout)))
+        (and (> (length inherits) depthoid)
+             (eq (svref inherits depthoid) test-layout)))))
+
+(defun sb-c::structure-typep (object test-layout)
+  (and (%instancep object)
+       (let ((object-layout (%instance-layout object)))
+        (or (eq object-layout test-layout)
+            (let ((depthoid (layout-depthoid test-layout))
+                  (inherits (layout-inherits object-layout)))
+              (and (> (length inherits) depthoid)
+                   (eq (svref inherits depthoid) test-layout)))))))
+
+;;; TODO: this could be further generalized to handle any type where layout-of correctly
+;;; chooses a clause. It would of course not work for types like MEMBER or (MOD 5)
+(defun %typecase-index (layout-lists object sealed)
+  (declare (ignore sealed))
+  (when (%instancep object)
+    (let ((object-layout (%instance-layout object)))
+      (let ((clause-index 1))
+        (dovector (layouts layout-lists)
+          (dolist (layout layouts)
+            (when (sb-c::%structure-is-a object-layout layout)
+              (return-from %typecase-index clause-index)))
+          (incf clause-index)))))
+  0)

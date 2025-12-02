@@ -207,11 +207,10 @@
   (:ignore eax)
   (:generator 1
    (inst movsx res
-         (make-random-tn :kind :normal
-                         :sc (sc-or-lose (ecase size
-                                           (8 'byte-reg)
-                                           (16 'word-reg)))
-                         :offset (tn-offset val)))))
+         (make-random-tn (sc-or-lose (ecase size
+                                       (8 'byte-reg)
+                                       (16 'word-reg)))
+           (tn-offset val)))))
 
 #-sb-xc-host
 (defun sign-extend (x size)
@@ -287,7 +286,8 @@
            (inst lea edi (make-ea :dword :base ebp-tn
                                   :disp (frame-byte-offset (tn-offset pc-save))))
            (move eax function)
-           (inst call (make-fixup "call_into_c" :foreign))
+           (pseudo-atomic (:elide-if (not (call-out-pseudo-atomic-p vop)))
+             (inst call (make-fixup "call_into_c" :foreign)))
            (when (and results
                       (location= (tn-ref-tn results) fr0-tn))
              (force-x87-to-mem (tn-ref-tn results) fp-temp)))
@@ -301,7 +301,8 @@
            ;; this, and it should not hurt others either.
            (inst cld)
 
-           (inst call function)
+           (pseudo-atomic (:elide-if (not (call-out-pseudo-atomic-p vop)))
+             (inst call function))
            ;; To give the debugger a clue. FIXME: not really internal-error?
            (note-this-location vop :internal-error)
 
@@ -379,17 +380,6 @@
               delta)))
     (load-symbol-value result *alien-stack-pointer*)))
 
-;;; not strictly part of the c-call convention, but needed for the
-;;; WITH-PINNED-OBJECTS macro used for "locking down" lisp objects so
-;;; that GC won't move them while foreign functions go to work.
-(define-vop (touch-object)
-  (:translate touch-object)
-  (:args (object))
-  (:ignore object)
-  (:policy :fast-safe)
-  (:arg-types t)
-  (:generator 0))
-
 #-sb-xc-host
 (defun alien-callback-accessor-form (type sp offset)
   `(deref (sap-alien (sap+ ,sp ,offset) (* ,type))))
@@ -417,17 +407,8 @@ pointer to the arguments."
               (inst push eax)                       ; arg1
               (inst push (ash index 2))             ; arg0
 
-              #+sb-thread
-              (progn
-                (inst mov eax (foreign-symbol-address "callback_wrapper_trampoline"))
-                (inst call eax))
-
-              #-sb-thread
-              (progn
-                (inst push (make-ea :dword ; function
-                                    :disp (static-fdefn-fun-addr 'enter-alien-callback)))
-                (inst mov  eax (foreign-symbol-address "funcall3"))
-                (inst call eax))
+              (inst mov eax (foreign-symbol-address "callback_wrapper_trampoline"))
+              (inst call eax)
 
               ;; now put the result into the right register
               (cond

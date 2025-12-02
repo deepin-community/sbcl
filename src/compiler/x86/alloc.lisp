@@ -13,6 +13,22 @@
 
 ;;;; allocation helpers
 
+(defun generate-stack-overflow-check (vop size)
+  (let ((overflow (generate-error-code
+                   vop
+                   'stack-allocated-object-overflows-stack-error
+                   size)))
+        (inst sub esp-tn size)
+        (inst cmp esp-tn
+              #-sb-thread
+              (make-ea-for-symbol-value *control-stack-start* :dword)
+              #+sb-thread
+              (make-ea :dword :disp (* 4 thread-control-stack-start-slot))
+              #+sb-thread :fs)
+        ;; avoid clearing condition codes
+        (inst lea esp-tn (make-ea :dword :base esp-tn :index size))
+        (inst jmp :le overflow)))
+
 ;;; Allocation within alloc_region (which is thread local) can be done
 ;;; inline.  If the alloc_region is overflown allocation is done by
 ;;; calling the C alloc() function.
@@ -75,21 +91,21 @@
          #+(and sb-thread win32) (scratch-tn (pop scratch-tns))
          #+(and sb-thread win32) (swap-tn (pop scratch-tns))
          (free-pointer
-           ;; thread->boxed_tlab.free_pointer
+           ;; thread->mixed_tlab.free_pointer
            (make-ea :dword
                     :base (or #+(and sb-thread win32)
                               scratch-tn)
                     :disp
-                    #+sb-thread (* n-word-bytes thread-boxed-tlab-slot)
-                    #-sb-thread boxed-region))
+                    #+sb-thread (* n-word-bytes thread-mixed-tlab-slot)
+                    #-sb-thread (+ static-space-start mixed-region-offset)))
          (end-addr
-            ;; thread->boxed_tlab.end_addr
+            ;; thread->mixed_tlab.end_addr
            (make-ea :dword
                     :base (or #+(and sb-thread win32)
                               scratch-tn)
                     :disp
-                    #+sb-thread (* n-word-bytes (1+ thread-boxed-tlab-slot))
-                    #-sb-thread (+ boxed-region n-word-bytes))))
+                    #+sb-thread (* n-word-bytes (1+ thread-mixed-tlab-slot))
+                    #-sb-thread (+ static-space-start mixed-region-offset n-word-bytes))))
     (unless (and (tn-p size) (location= alloc-tn size))
       (inst mov alloc-tn size))
     #+(and sb-thread win32)
@@ -178,18 +194,18 @@
 ;;; Allocate an other-pointer object of fixed SIZE with a single word
 ;;; header having the specified WIDETAG value. The result is placed in
 ;;; RESULT-TN.
-(defun alloc-other (result-tn widetag size node &optional stack-allocate-p)
-  (pseudo-atomic (:elide-if stack-allocate-p)
-      (allocation nil (* (pad-data-block size)
-                         #+bignum-assertions (if (eql widetag bignum-widetag) 2 1))
-                  other-pointer-lowtag
-                  node stack-allocate-p result-tn)
-      (storew (compute-object-header size widetag)
-              result-tn 0 other-pointer-lowtag)))
+(defun alloc-other (result-tn widetag size node)
+  (pseudo-atomic ()
+    (allocation nil (* (pad-data-block size)
+                       #+bignum-assertions (if (eql widetag bignum-widetag) 2 1))
+                other-pointer-lowtag
+                node nil result-tn)
+    (storew (compute-object-header size widetag)
+            result-tn 0 other-pointer-lowtag)))
 
 ;;;; CONS, LIST and LIST*
 (define-vop (list)
-  (:args (things :more t))
+  (:args (things :more t :scs (descriptor-reg any-reg control-stack)))
   (:temporary (:sc unsigned-reg) ptr temp)
   (:temporary (:sc unsigned-reg :to (:result 0) :target result) res)
   (:info star cons-cells)
@@ -240,7 +256,10 @@
    (flet ((store-widetag (value ptr slot lowtag)
              (inst mov (object-slot-ea
                         ptr slot lowtag
-                        (if (typep value '(and integer (not (unsigned-byte 8)))) :word :byte))
+                        (typecase value
+                          ((unsigned-byte 8) :byte)
+                          ((unsigned-byte 16) :word)
+                          (t :dword)))
                    value)))
     (let ((size (sc-case words
                   (immediate
@@ -259,7 +278,6 @@
        (allocation nil size other-pointer-lowtag node nil result)
        (sc-case type
          (immediate
-          (aver (typep (tn-value type) '(unsigned-byte 9)))
           (store-widetag (tn-value type) result 0 other-pointer-lowtag))
          (t
           (storew type result 0 other-pointer-lowtag)))
@@ -278,29 +296,29 @@
 
 (define-vop (allocate-vector-on-stack)
   (:args (type :scs (unsigned-reg immediate) :to :save)
-         (length :scs (any-reg) :to :eval :target zero)
+         (length :scs (any-reg) :to :eval :target res)
          (words :scs (any-reg) :target ecx))
   (:temporary (:sc any-reg :offset ecx-offset :from (:argument 2)) ecx)
-  (:temporary (:sc any-reg :offset eax-offset :from :eval) zero)
-  (:temporary (:sc any-reg :offset edi-offset) res)
+  (:temporary (:sc unsigned-reg :offset eax-offset) bytes)
+  (:temporary (:sc any-reg :offset edi-offset :from :eval) res)
+  (:node-var node)
+  (:vop-var vop)
   (:results (result :scs (descriptor-reg) :from :load))
   (:arg-types positive-fixnum
               positive-fixnum
               positive-fixnum)
   (:policy :fast-safe)
   (:generator 100
-    (inst lea result (make-ea :byte :base words :disp
-                              (+ (1- (ash 1 n-lowtag-bits))
-                                 (* vector-data-offset n-word-bytes))))
-    (inst and result (lognot lowtag-mask))
-    ;; FIXME: It would be good to check for stack overflow here.
+    (inst lea bytes (make-ea :byte :base words :disp
+                             (+ (1- (ash 1 n-lowtag-bits))
+                                (* vector-data-offset n-word-bytes))))
+    (inst and bytes (lognot lowtag-mask))
     (move ecx words)
     (inst shr ecx n-fixnum-tag-bits)
-    (stack-allocation result result other-pointer-lowtag)
+    (when (sb-c::make-vector-check-overflow-p node)
+      (generate-stack-overflow-check vop bytes))
+    (stack-allocation result bytes other-pointer-lowtag)
     (inst cld)
-    (inst lea res
-          (make-ea :byte :base result :disp (- (* vector-data-offset n-word-bytes)
-                                               other-pointer-lowtag)))
     (sc-case type
       (immediate
        (aver (typep (tn-value type) '(unsigned-byte 8)))
@@ -308,9 +326,12 @@
       (t
        (storew type result 0 other-pointer-lowtag)))
     (storew length result vector-length-slot other-pointer-lowtag)
-    (inst xor zero zero)
+    (inst lea res
+          (make-ea :byte :base result :disp (- (* vector-data-offset n-word-bytes)
+                                               other-pointer-lowtag)))
+    (inst xor bytes bytes)
     (inst rep)
-    (inst stos zero)))
+    (inst stos bytes)))
 
 
 (define-vop (make-fdefn)
@@ -349,10 +370,9 @@
 (define-vop (make-value-cell)
   (:args (value :scs (descriptor-reg any-reg) :to :result))
   (:results (result :scs (descriptor-reg) :from :eval))
-  (:info stack-allocate-p)
   (:node-var node)
   (:generator 10
-    (alloc-other result value-cell-widetag value-cell-size node stack-allocate-p)
+    (alloc-other result value-cell-widetag value-cell-size node)
     (storew value result value-cell-value-slot other-pointer-lowtag)))
 
 ;;;; automatic allocators for primitive objects
@@ -363,48 +383,17 @@
   (:generator 1
     (inst mov result unbound-marker-widetag)))
 
-(define-vop (make-funcallable-instance-tramp)
-  (:args)
-  (:results (result :scs (any-reg)))
-  (:generator 1
-    (inst mov result (make-fixup 'funcallable-instance-tramp :assembly-routine))))
-
 (define-vop (fixed-alloc)
-  (:args)
   (:info name words type lowtag stack-allocate-p)
   (:ignore name)
   (:results (result :scs (descriptor-reg)))
   (:node-var node)
   (:generator 50
-    ;; We special case the allocation of conses, because they're
-    ;; extremely common and because the pseudo-atomic sequence on x86
-    ;; is relatively heavyweight.  However, if the user asks for top
-    ;; speed, we accomodate him.  The primary reason that we don't
-    ;; also check for (< SPEED SPACE) is because we want the space
-    ;; savings that these out-of-line allocation routines bring whilst
-    ;; compiling SBCL itself.  --njf, 2006-07-08
-    (if (and (not stack-allocate-p)
-             (= lowtag list-pointer-lowtag) (policy node (< speed 3)))
-        (let ((dst
-               ;; FIXME: out-of-line dx-allocation
-               #.(loop for offset in *dword-regs*
-                    collect `(,offset
-                              ',(intern (format nil "ALLOCATE-CONS-TO-~A"
-                                                (svref +dword-register-names+
-                                                       offset)))) into cases
-                    finally (return `(case (tn-offset result)
-                                       ,@cases)))))
-          (aver (null type))
-          (inst call (make-fixup dst :assembly-routine)))
-        (pseudo-atomic (:elide-if stack-allocate-p)
-         (let ((nbytes (* (pad-data-block words)
-                          #+bignum-assertions (if (eql type bignum-widetag) 2 1))))
-           (allocation nil nbytes lowtag node stack-allocate-p result))
-         (when type
-           (storew (compute-object-header words type)
-                   result
-                   0
-                   lowtag))))))
+    (pseudo-atomic (:elide-if stack-allocate-p)
+      (let ((nbytes (* (pad-data-block words)
+                       #+bignum-assertions (if (eql type bignum-widetag) 2 1))))
+        (allocation nil nbytes lowtag node stack-allocate-p result))
+      (storew (compute-object-header words type) result 0 lowtag))))
 
 (define-vop (var-alloc)
   (:args (extra :scs (any-reg)))

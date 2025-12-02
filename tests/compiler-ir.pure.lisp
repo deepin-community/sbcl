@@ -11,6 +11,9 @@
 
 (enable-test-parallelism)
 
+#-sb-devel
+(invoke-restart 'run-tests::skip-file)
+
 (import '(sb-c::combination-fun-debug-name
           sb-c::combination-fun-source-name
           sb-c::*compile-component-hook*
@@ -23,9 +26,7 @@
           sb-c::%check-bound
           sb-kernel:%bit-pos-fwd/1))
 
-(defun inspect-ir (form fun &rest checked-compile-args)
-  (let ((*compile-component-hook* fun))
-    (apply #'test-util:checked-compile form checked-compile-args)))
+(import 'ctu:inspect-ir)
 
 (defun ir-full-calls (form)
   (let (calls)
@@ -50,7 +51,19 @@
              (push node calls))))))
     calls))
 
-(test-util:with-test (:name :%bit-pos-fwd/1-tail-called)
+(defun ir2-vops (form)
+  (let (vops)
+    (inspect-ir
+     form
+     (lambda (component)
+       (sb-c::do-ir2-blocks (block component)
+         (do ((vop (sb-c::ir2-block-start-vop block)
+                   (sb-c:vop-next vop)))
+             ((null vop))
+           (push (sb-c:vop-name vop) vops)))))
+    vops))
+
+(with-test (:name :%bit-pos-fwd/1-tail-called)
   (destructuring-bind (combination)
       (ir-full-calls `(lambda (x)
                         (declare (optimize (debug 2)))
@@ -58,16 +71,7 @@
     (assert (eql (combination-fun-debug-name combination) '%bit-pos-fwd/1))
     (assert (node-tail-p combination))))
 
-(test-util:with-test (:name :bounds-check-constants)
-  (assert (= (count '%check-bound
-                    (ir-calls
-                     `(lambda (v)
-                        (declare (simple-vector v))
-                        (setf (aref v 0) (aref v 1))))
-                    :key (lambda (x) (combination-fun-source-name x nil)))
-             1)))
-
-(test-util:with-test (:name :local-call-tail-call)
+(with-test (:name :local-call-tail-call)
   (destructuring-bind (combination)
       (ir-full-calls `(lambda ()
                         (flet ((x ()
@@ -78,7 +82,7 @@
     (assert (eql (combination-fun-debug-name combination) 'terpri))
     (assert (node-tail-p combination))))
 
-(test-util:with-test (:name :fold-derived-logand)
+(with-test (:name :fold-derived-logand)
   (assert (not (find 'logand
                      (ir-calls `(lambda (x)
                                   (declare ((integer 1 4) x))
@@ -95,13 +99,13 @@
                                   (logand #xFF (ash 1 x))))
                      :key #'combination-fun-debug-name))))
 
-(test-util:with-test (:name :mod-ash
+(with-test (:name :mod-ash
                       :skipped-on (not (or :arm64 :x86-64)))
   (assert (not (ir-full-calls `(lambda (x y)
                                  (declare (fixnum x y))
                                  (logand #xFF (ash x y)))))))
 
-(test-util:with-test (:name :exit-reoptimize-uses)
+(with-test (:name :exit-reoptimize-uses)
   (assert (not (find 'cdr
                      (ir-calls `(lambda (a b)
                                   (/ (unwind-protect (if a
@@ -112,3 +116,532 @@
                      :key (lambda (x)
                             (and (combination-p x)
                                  (combination-fun-debug-name x)))))))
+
+(with-test (:name :no-arg-count-checking)
+  (assert (not (find 'sb-c:verify-arg-count
+                     (ir2-vops '(lambda (&rest args)
+                                 (block nil
+                                   (handler-bind ((error (lambda (c) (return c))))
+                                     (funcall (car args)))))))))
+  (assert (not (find 'sb-c:verify-arg-count
+                     (ir2-vops '(lambda (&rest args)
+                                 (reduce #'+
+                                  (car args)
+                                  :key (lambda (x) (sqrt x))))))))
+  (assert (not (find 'sb-c:verify-arg-count
+                     (ir2-vops '(lambda (&rest args)
+                                 (map 'list (lambda (x &optional z)
+                                              (declare (ignore z))
+                                              x)
+                                  (car args)))))))
+  (assert (not (find 'sb-c:verify-arg-count
+                     (ir2-vops '(lambda (&rest args)
+                                 (find 0 (car args)
+                                  :key
+                                  (lambda (x &rest z)
+                                    (declare (ignore z))
+                                    x)))))))
+  (assert (not (find 'sb-c:verify-arg-count
+                     (ir2-vops '(lambda (&rest args)
+                                 (remove 0 (car args)
+                                  :key
+                                  (lambda (&optional z)
+                                    z))))))))
+
+#+sb-devel
+(with-test (:name (:assignment-convert :iterative-tail))
+  (let ((converted nil))
+    (let ((fun (inspect-ir
+                '(lambda (n)
+                  (labels ((fact (n acc)
+                             (if (zerop n)
+                                 acc
+                                 (fact (1- n) (* acc n)))))
+                    (fact n 1)))
+                (lambda (component)
+                  (dolist (lambda (sb-c::component-lambdas component))
+                    (dolist (lambda-let (sb-c::lambda-lets lambda))
+                      (when (sb-c::functional-kind-eq lambda-let sb-c::assignment)
+                        (setq converted t))))))))
+      (assert (= (funcall fun 9) 362880))
+      (assert converted))))
+
+(with-test (:name (:assignment-convert :iterative-non-tail))
+  (let ((converted nil))
+    (let ((fun (inspect-ir
+                '(lambda (n)
+                  (labels ((fact (n acc)
+                             (if (zerop n)
+                                 acc
+                                 (fact (1- n) (* acc n)))))
+                    (1+ (fact n 1))))
+                (lambda (component)
+                  (dolist (lambda (sb-c::component-lambdas component))
+                    (dolist (lambda-let (sb-c::lambda-lets lambda))
+                      (when (sb-c::functional-kind-eq lambda-let sb-c::assignment)
+                        (setq converted t))))))))
+      (assert (= (funcall fun 9) 362881))
+      (assert converted))))
+
+(with-test (:name (:assignment-convert :multiple-use))
+  (let ((converted nil))
+    (let ((fun (inspect-ir
+                '(lambda (b x y)
+                  (labels ((f (n x)
+                             (if (zerop n)
+                                 x
+                                 (f (1- n) (1+ x)))))
+                    (+ 2 (if (= b 5)
+                             (f x x)
+                             (f b y)))))
+                (lambda (component)
+                  (dolist (lambda (sb-c::component-lambdas component))
+                    (dolist (lambda-let (sb-c::lambda-lets lambda))
+                      (when (sb-c::functional-kind-eq lambda-let sb-c::assignment)
+                        (setq converted t))))))))
+      (assert (= (funcall fun 5 3 4) 8))
+      (assert (= (funcall fun 6 3 4) 12))
+      (assert converted))))
+
+(with-test (:name (:assignment-convert :optional-dispatch))
+  (let ((converted 0))
+    (let ((fun (inspect-ir
+                '(lambda (mod r/m)
+                  (flet ((make-machine-ea (base &optional disp index scale)
+                           (list base
+                                 disp
+                                 index
+                                 scale)))
+                    (cond ((= r/m #b100)
+                           (make-machine-ea :so :here :we :are))
+                          ((/= mod #b00) (make-machine-ea :full-reg :tbf))
+                          ((= r/m #b101) (make-machine-ea :rip :another))
+                          (t (make-machine-ea :full-reg)))))
+                (lambda (component)
+                  (dolist (lambda (sb-c::component-lambdas component))
+                    (dolist (lambda-let (sb-c::lambda-lets lambda))
+                      (when (sb-c::functional-kind-eq lambda-let sb-c::assignment)
+                        (incf converted))))))))
+      (assert (equal (funcall fun 0 5) '(:rip :another nil nil)))
+      ;; There should be two converted :ASSIGNMENT lambdas: one for
+      ;; (BASE DISP), and one for (BASE DISP INDEX SCALE). The latter
+      ;; gets assignment converted because it is also tail called by
+      ;; the entry point for (BASE DISP INDEX), which in turn was let
+      ;; converted into the entry point for (BASE DISP).
+      (assert (= converted 2)))))
+
+(with-test (:name (:assignment-convert :no-self-tr))
+  (let ((converted nil))
+    (let ((fun (inspect-ir
+                '(lambda (n)
+                  (labels ((id (n)
+                             n))
+                    (case n
+                      ((a b c d e f g)
+                       (id 1))
+                      ((h i j k l m n)
+                       (id 2))
+                      ((o p q r s t u)
+                       (id 3))
+                      ((v w x y z)
+                       (id 4)))))
+                (lambda (component)
+                  (dolist (lambda (sb-c::component-lambdas component))
+                    (dolist (lambda-let (sb-c::lambda-lets lambda))
+                      (when (sb-c::functional-kind-eq lambda-let sb-c::assignment)
+                        (setf converted t))))))))
+      (assert (= (funcall fun 'a) 1))
+      (assert (= (funcall fun 'l) 2))
+      (assert (= (funcall fun 's) 3))
+      (assert (= (funcall fun 'w) 4))
+      (assert converted))))
+
+;;; Check that we are able to promote assignment lambdas into LETs.
+(with-test (:name (:assignment-convert :can-become-let))
+  (let ((assignment nil)
+        (let nil))
+    (inspect-ir
+     '(lambda (x)
+       (labels ((id (n)
+                  (+ n n)))
+         (1+ (if t
+                 (id (read))
+                 (id (+ x x))))))
+     (lambda (component)
+       (dolist (lambda (sb-c::component-lambdas component))
+         (dolist (lambda-let (sb-c::lambda-lets lambda))
+           (when (sb-c::functional-kind-eq lambda-let sb-c::assignment)
+             (setf assignment t))
+           (when (sb-c::functional-kind-eq lambda-let let)
+             (setf let t))))))
+    (assert (not assignment))
+    (assert let)))
+
+;;; Check assignment conversion of functions which don't return.
+(with-test (:name (:assignment-convert :non-local-exit))
+  (let ((assignment nil))
+    (let* ((*standard-output* (make-broadcast-stream))
+           (fun (inspect-ir
+                 '(lambda (z)
+                   (block hey
+                     (flet ((f (x)
+                              (print x)
+                              (return-from hey (values 'GOOD (+ x x)))))
+                       (values
+                        'BAD
+                        (if (plusp z)
+                            (f z)
+                            (+ 1 (f (+ z z))))))))
+                 (lambda (component)
+                   (dolist (lambda (sb-c::component-lambdas component))
+                     (dolist (lambda-let (sb-c::lambda-lets lambda))
+                       (when (sb-c::functional-kind-eq lambda-let sb-c::assignment)
+                         (setf assignment t))))))))
+      (assert (eq (funcall fun 3) 'GOOD))
+      (assert (eq (funcall fun -3) 'GOOD))
+      (assert assignment))))
+
+(with-test (:name :empty-special-bindings)
+  (assert (not (find 'sb-c::%special-unbind
+                     (ir-calls
+                      `(lambda ()
+                         (let (*))
+                         10))
+                     :key (lambda (x) (combination-fun-source-name x nil))))))
+
+(with-test (:name :flushable-alien-fp-math)
+  (assert (not (find 'sb-c:%alien-funcall
+                     (ir-calls
+                      `(lambda (x)
+                         (declare (double-float x))
+                         (exp x)
+                         10))
+                     :key (lambda (x) (combination-fun-source-name x nil))))))
+
+(with-test (:name :values-let-conversion-reoptimization)
+  (assert (not (find 'list
+                     (ir-calls
+                      `(lambda (a)
+                         (values
+                          (flet ((f ()
+                                   (values a (catch 'c)
+                                           (list 1))))
+                            (f)))))
+                     :key (lambda (x) (combination-fun-source-name x nil))))))
+
+(defun count-type-checks (lambda)
+  (count-if (lambda (name)
+              (member name '(sb-c::%type-check-error/c sb-c::%type-check-error)))
+         (ir-calls lambda)
+         :key (lambda (x) (combination-fun-source-name x nil))))
+
+(with-test (:name :instance-constraint-intersection)
+  (assert (zerop (count-type-checks
+                  `(lambda (x)
+                     (typecase x
+                       (stream 2)
+                       (hash-table 1)))))))
+
+(with-test (:name :aref-full-call-no-type-check)
+  (assert (zerop (count-type-checks
+                  `(lambda (x)
+                     (aref x 0))))))
+
+(with-test (:name :call-full-like-p-constants)
+  (assert (zerop (count-type-checks
+                  `(lambda (a b)
+                     (< (truly-the double-float a) b))))))
+
+(with-test (:name :constant-substitution)
+  (let ((calls (ir-calls
+                `(lambda (a b)
+                   (or (eq a 2)
+                       (eq b 10))))))
+    (assert (not (find-if
+                  (lambda (call)
+                    (let ((fun (sb-c::ref-leaf (sb-c::lvar-uses (sb-c::combination-fun call)))))
+                      (and (sb-c::functional-p fun)
+                           (sb-c::functional-kind-eq fun let))))
+                  calls)))))
+
+(with-test (:name :unused-flet-values)
+  (let ((calls (ir-full-calls
+                `(lambda (x y)
+                   (flet ((f ()
+                            (values x (+ x y))))
+                     (declare (notinline f))
+                     (values (f)))))))
+    (assert (not calls))))
+
+(with-test (:name :overflow-arith
+            :skipped-on (not (or :arm64 :x86-64)))
+  (let* ((types '(sb-vm:word sb-vm:signed-word))
+         (the-types `(fixnum (unsigned-byte 16) (signed-byte 16) ,@types)))
+    (loop
+      for op in '(+ - * negate)
+      do
+      (loop
+        for a-type in types
+        do
+        (loop
+          for b-type in types
+          do
+          (loop for the-type in the-types
+                for lambda = (if (eq op 'negate)
+                                 `(lambda (a)
+                                    (declare (,a-type a))
+                                    (the ,the-type (- a)))
+                                 `(lambda (a b)
+                                    (declare (,a-type a)
+                                             (,b-type b))
+                                    (the ,the-type (,op a b))))
+                do (unless (find-if (lambda (x)
+                                      (eql (search "OVERFLOW" (string x)) 0))
+                                    (ir2-vops lambda))
+                     (cerror "" "~s" lambda))))))))
+
+(with-test (:name :type-diff-testing)
+  (assert
+   (= (count 'sb-int:double-float-p
+             (ir2-vops '(lambda (x)
+                         (declare ((or fixnum double-float) x))
+                         (typep x 'double-float))))
+      1))
+  (assert
+   (= (count 'numberp
+             (ir2-vops '(lambda (x)
+                         (declare ((or double-float array) x))
+                         (typep x 'number))))
+      0))
+  (assert
+   (= (count 'integerp
+             (ir2-vops '(lambda (x)
+                         (declare ((or array (signed-byte 8)) x))
+                         (typep x 'integer))))
+      0)))
+
+(with-test (:name :let-no-typecheck)
+  (assert (zerop (count-type-checks
+                  `(lambda (x)
+                     (let ((m (the sequence x)))
+                       (values (length m)
+                               m))))))
+  (assert (eql (count-type-checks
+                `(lambda (x l)
+                   (let ((m (the sequence x))
+                         (l (the integer l)))
+                     (values (length m)
+                             l))))
+               1)))
+
+(with-test (:name :pop-special-once)
+  (assert
+   (= (count 'symbol-value
+             (ir2-vops '(lambda (s)
+                         (declare (special s))
+                         (pop s))))
+      1)))
+
+#+(or x86-64 arm64)
+(with-test (:name :overflow+make-array)
+  (assert
+   (= (count 'sb-vm::overflow+t
+             (ir2-vops '(lambda (y)
+                         (make-array (1+ y)))))
+      1)))
+
+(with-test (:name :other-pointer-p)
+  (assert (zerop (count-type-checks
+                  `(lambda (x)
+                     (when (and (stringp (truly-the (or simple-string (member #\a)) x))
+                                (zerop (length x)))
+                       x))))))
+
+(with-test (:name :external-type-checks-across-functions)
+  (assert (zerop (count-type-checks
+                  `(lambda (a b)
+                     (declare (number a b)
+                              (optimize speed))
+                     (+ a b))))))
+
+(with-test (:name :consecutive-casts)
+  (assert (= (count-type-checks
+              `(lambda (x)
+                 (the fixnum (the integer x))))
+             1))
+  #+(or arm64 x86-64)
+  (assert (= (count-type-checks
+              `(lambda (x)
+                 (logand (the number x) 2)))
+             0))
+  (assert (= (count-type-checks
+              `(lambda (x)
+                 (the integer (the (real 5) x))))
+             1)))
+
+(with-test (:name :sign-extend)
+  (assert (= (count 'sb-c::mask-signed-field
+                    (ir-calls
+                     `(lambda (a)
+                        (declare ((unsigned-byte 32) a))
+                        (logior a (- (mask-field (byte 1 31) a)))))
+                    :key (lambda (x) (combination-fun-source-name x nil)))
+             1))
+  (assert (= (count 'sb-c::mask-signed-field
+                    (ir-calls
+                     `(lambda (a)
+                        (declare ((unsigned-byte 32) a))
+                        (logior (- (mask-field (byte 1 31) a)) a)))
+                    :key (lambda (x) (combination-fun-source-name x nil)))
+             1))
+  #+64-bit
+  (assert (= (count 'sb-c::mask-signed-field
+                    (ir-calls
+                     `(lambda (a)
+                        (declare ((unsigned-byte 64) a))
+                        (logior a (- (mask-field (byte 1 63) a)))))
+                    :key (lambda (x) (combination-fun-source-name x nil)))
+             1)))
+
+(with-test (:name :optional-type-checks)
+  (assert (= (count-type-checks
+              `(lambda (&optional x y)
+                 (declare (list x))
+                 (values x y)))
+             1)))
+
+(with-test (:name :flush-multiple-callables)
+  (assert (not (ir-full-calls
+                `(lambda (a b c)
+                   (declare (vector b))
+                   (find a b :test (if c #'eq #'eql))
+                   10)))))
+
+(with-test (:name :stack-allocate-make-array-reverse)
+  (let ((vops (ir2-vops `(lambda (l)
+                           (let ((j (make-array 5 :initial-contents (nreverse l))))
+                             (declare (dynamic-extent j))
+                             (opaque-identity j)
+                             10)))))
+    (assert (= (count 'sb-vm::allocate-vector-on-stack vops) 1))
+    (assert (= (count 'sb-vm::allocate-vector-on-heap vops) 0))))
+
+
+(with-test (:name :no-type-check-tail-call)
+  (destructuring-bind (combination)
+      (ir-full-calls `(lambda (x)
+                        (truly-the fixnum (funcall (the function x)))))
+    (assert (node-tail-p combination))))
+
+(with-test (:name :evenp+arithmetic)
+  (assert (not (ir-full-calls `(lambda (x)
+                                 (evenp (+ x 3))))))
+  (assert (not (ir-full-calls `(lambda (x)
+                                 (logbitp 0 (+ x 3)))))))
+
+(with-test (:name :modarith-unknown-types)
+  (assert (not (ir-full-calls `(lambda (x)
+                                 (logand (+ x 10) 20)))))
+  (assert (not (ir-full-calls `(lambda (m x)
+                                 (logand (if m (+ x 3) (- x 2)) 20))))))
+
+(with-test (:name :reoptimize-complement)
+  (assert (not (ir-full-calls `(lambda (x)
+                                 (declare ((simple-array fixnum (*)) x)
+                                          (optimize speed))
+                                 (position 1 x :test-not #'=))))))
+
+(with-test (:name :complement-multiple-calls)
+  (assert (= (count 'complement
+                    (ir-calls
+                     `(lambda (m n)
+                        (let ((c (complement #'=)))
+                          (values (funcall c 1 m)
+                                  (funcall c 3 n)))))
+                    :key (lambda (x) (combination-fun-source-name x nil)))
+             0))
+  (assert (= (count 'complement
+                    (ir-calls
+                     `(lambda (l)
+                        (declare (list l)
+                                 (optimize speed))
+                        (position 10 l :test (complement #'=))))
+                    :key (lambda (x) (combination-fun-source-name x nil)))
+             0)))
+
+(with-test (:name :local-calls-to-&rest)
+  (assert (not (ir-full-calls
+                `(lambda (a)
+                   (flet ((a (&rest args)
+                            (apply #'eql args)))
+                     (list (a a 1)
+                           (a a 2))))))))
+
+(with-test (:name :inline-local-call-with-casts)
+  (assert (not (ir-full-calls
+                `(lambda (n)
+                   (funcall (the (function (fixnum) fixnum)
+                                 (lambda (x) (1+ x)))
+                            n))))))
+
+(with-test (:name :truncate-signed-word-error)
+  (assert (not (find 'sb-vm::move-from-signed
+                     (ir2-vops '(lambda (x d)
+                                 (declare ((signed-byte 64) x d))
+                                 (values (the fixnum (truncate x d)))))))))
+
+(with-test (:name :cast-movement)
+  (assert (not (find 'sb-vm::move-from-unsigned
+                     (ir2-vops '(lambda (d x c)
+                                 (declare ((simple-array word (4)) x))
+                                 (let* ((b (aref x 1))
+                                        (a (if d c b)))
+                                   (> (the word a) 10)))))))
+  (assert (find 'sb-vm::move-from-unsigned
+                (ir2-vops '(lambda (d x c)
+                            (declare ((simple-array word (4)) x))
+                            (let* ((b (aref x 1))
+                                   (a (if d c b)))
+                              (print 1)
+                              (> (the word a) 10)))))))
+
+(with-test (:name :overflow-svref
+            :skipped-on (not (or :arm64 :x86-64)))
+  (assert (not (ir-full-calls
+                `(lambda (x n)
+                   (svref x (+ n 1)))))))
+
+(with-test (:name :setf-aref-type-checks)
+  (assert (= (count-type-checks
+              `(lambda (a n)
+                 (setf (aref (the (OR (ARRAY SINGLE-FLOAT) (ARRAY DOUBLE-FLOAT)) a) 0)
+                       n)))
+             1)))
+
+(with-test (:name :constant-fold-multiple-value-uses)
+  (assert (not (ir-full-calls
+                `(lambda (a)
+                   (1+ (if a
+                           1
+                           2d0))))))
+  (assert (not (ir-full-calls
+                `(lambda (b)
+                   (truncate (if b
+                                 10 20d0)
+                             2)))))
+  (assert (not
+           (ir-full-calls
+            `(lambda (d)
+               (multiple-value-bind (v w) (if d
+                                              (values 1 6)
+                                              (values 2 5))
+                 (values v
+                         (+ w 1/2)))))))
+  (assert (not
+           (ir-full-calls
+            `(lambda (d)
+               (let ((x (if d
+                            20
+                            40)))
+                 (setf * 20)
+                 (values (truncate x 1/3))))))))

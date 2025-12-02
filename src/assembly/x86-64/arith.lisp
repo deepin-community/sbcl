@@ -21,30 +21,7 @@
 (defun some-fixnum-p (temp x y)
   (inst mov :dword temp x)
   (inst and :dword temp y)
-  (inst test :byte temp fixnum-tag-mask))
-
-(defun static-fun-addr (name)
-  #+immobile-code (make-fixup name :static-call)
-  #-immobile-code (ea (+ nil-value (static-fun-offset name))))
-
-(defun call-static-fun (fun arg-count)
-  (inst push rbp-tn)
-  (inst mov rbp-tn rsp-tn)
-  (inst sub rsp-tn (* n-word-bytes 2))
-  (inst mov (ea rsp-tn) rbp-tn)
-  (inst mov rbp-tn rsp-tn)
-  (inst mov rcx-tn (fixnumize arg-count))
-  (inst call (static-fun-addr fun))
-  (inst pop rbp-tn))
-
-(defun tail-call-static-fun (fun arg-count)
-  (inst push rbp-tn)
-  (inst mov rbp-tn rsp-tn)
-  (inst sub rsp-tn n-word-bytes)
-  (inst push (ea (frame-byte-offset return-pc-save-offset) rbp-tn))
-  (inst mov rcx-tn (fixnumize arg-count))
-  (inst jmp (static-fun-addr fun))))
-
+  (inst test :byte temp fixnum-tag-mask)))
 
 ;;;; addition, subtraction, and multiplication
 
@@ -52,9 +29,9 @@
 (defun return-single-word-bignum (dest alloc-tn source)
   (let ((header (logior (ash 1 n-widetag-bits) bignum-widetag))
         (nbytes #+bignum-assertions 32 #-bignum-assertions 16))
-    (instrument-alloc bignum-widetag nbytes nil alloc-tn)
-    (pseudo-atomic ()
-      (allocation bignum-widetag nbytes 0 alloc-tn nil nil nil)
+    (emit-instrument-alloc nil thread-tn bignum-widetag nbytes alloc-tn)
+    (allocating ()
+      (emit-allocation nil thread-tn bignum-widetag nbytes 0 alloc-tn nil)
       (storew* header alloc-tn 0 0 t)
       (storew source alloc-tn bignum-digits-offset 0)
       (if (eq dest alloc-tn)
@@ -133,7 +110,7 @@
     (inst cmp x rcx)
     (inst jmp :e SINGLE-WORD-BIGNUM)
 
-    (alloc-other bignum-widetag (+ bignum-digits-offset 2) res nil nil nil)
+    (emit-alloc-other nil thread-tn bignum-widetag (+ bignum-digits-offset 2) res)
     (storew rax res bignum-digits-offset other-pointer-lowtag)
     (storew rcx res (1+ bignum-digits-offset) other-pointer-lowtag)
     (inst clc) (inst ret)
@@ -150,22 +127,25 @@
                           (:translate %negate)
                           (:save-p t))
                          ((:arg x (descriptor-reg any-reg) rdx-offset)
-                          (:res res (descriptor-reg any-reg) rdx-offset)
-                          (:temp rcx unsigned-reg rcx-offset))
+                          (:res res (descriptor-reg any-reg) rdx-offset))
   (inst test :byte x fixnum-tag-mask)
   (inst jmp :nz GENERIC)
   (move res x)
   (inst neg res)                        ; (- most-negative-fixnum) is BIGNUM
-  (inst jmp :o BIGNUM)
-  (inst clc) (inst ret)
-  BIGNUM
-  (inst shr res n-fixnum-tag-bits)      ; sign bit is data - remove type bits
-  (return-single-word-bignum res rcx res)
+  ;; This constant isn't really a fixup, but it's easiest for me to think about it
+  ;; that way for now. It should really do whatever EMIT-EA does for a CONSTANT.
+  (inst cmov :o res (ea (make-fixup nil :code-object
+                                    (+ (ash code-constants-offset word-shift)
+                                       (- other-pointer-lowtag)))
+                        rip-tn))
   (inst clc) (inst ret)
   GENERIC
   (tail-call-static-fun '%negate 1))
 
 ;;;; comparison
+
+(eval-when (:compile-toplevel)
+  (assert (minusp (static-symbol-offset t))))
 
 (macrolet ((define-cond-assem-rtn (name translate static-fn test)
              `(define-assembly-routine (,name
@@ -187,12 +167,12 @@
 
                 DO-STATIC-FUN
                 (call-static-fun ',static-fn 2)
-                ;; HACK: We depend on NIL having the lowest address of all
-                ;; static symbols (including T)
+                ;; X now holds T or NIL corresponding to the answer but it needs
+                ;; to be returned as :L or :G in EFLAGS. We rely on address of T
+                ;; being less address of NIL (asserted above)
                 ,@(ecase test
-                    (:l `((inst mov y (1+ nil-value))
-                          (inst cmp y x)))
-                    (:g `((inst cmp x (1+ nil-value))))))))
+                    (:l `((inst cmp x null-tn)))
+                    (:g `((inst cmp null-tn x)))))))
   (define-cond-assem-rtn generic-< < two-arg-< :l)
   (define-cond-assem-rtn generic-> > two-arg-> :g))
 
@@ -215,7 +195,8 @@
 
   DO-STATIC-FUN
   (call-static-fun 'two-arg-= 2)
-  (inst cmp x (+ nil-value (static-symbol-offset t))))
+  (inst sub x null-tn)
+  (inst cmp x (static-symbol-offset t)))
 
 #+sb-assembling
 (define-assembly-routine (logcount)
@@ -351,12 +332,15 @@
 ;;;   (define-assembly-routine ... ((:temp ...)) (:let ((c (register-inline-constant ...)))))
 ;;; It just doesn't seem worth the effort to do all that.
 (defparameter eql-dispatch nil)
-(define-assembly-routine (generic-eql (:return-style :none))
+(define-assembly-routine (generic-eql (:return-style :none)
+                                      (:export generic-eql* eql-ratio))
     ((:temp rcx unsigned-reg rcx-offset)  ; callee-saved
      (:temp rax unsigned-reg rax-offset)  ; vop temps
      (:temp rsi unsigned-reg rsi-offset)
      (:temp rdi unsigned-reg rdi-offset)
      (:temp r11 unsigned-reg r11-offset))
+  (inst mov :byte rax (ea (- other-pointer-lowtag) rdi))
+  (inst sub :byte rax bignum-widetag)
   ;; SINGLE-FLOAT is included in this table because its widetag within the range
   ;; of accepted widetags in the precondition for calling this routine.
   ;; Technically it would be an error to see an other-pointer object with that tag.
@@ -377,6 +361,7 @@
   ;; widetags are spaced 4 apart, and we've subtracted BIGNUM_WIDETAG,
   ;; so scaling by 2 gets a multiple of 8 with bignum at offset 0 etc.
   ;; But the upper 3 bytes of EAX hold junk presently, so clear them.
+  GENERIC-EQL*
   (inst and :dword rax #x7f)
   (inst lea r11 eql-dispatch)
   (inst jmp (ea r11 rax 2))
@@ -435,19 +420,12 @@
   EQL-BIGNUM
   (inst mov rax (ea (- other-pointer-lowtag) rdi))
   (inst xor rax (ea (- other-pointer-lowtag) rsi))
-  ;; kill the GC mark bit by shifting out (as if we'd actually get fullcgc
-  ;; to concurrently mark the heap. Well, I can hope can't I?)
-  (inst shl rax 1)
   (inst jmp :ne done) ; not equal
-  ;; Preserve rcx and compute the header length in words.
-  ;; Maybe we should deem that bignums have at most (2^32-1) payload words
-  ;; so that I can use an unaligned 'movl'. Or, maybe I should put the length
-  ;; in the high 4 bytes of the header so that the same GC mark bit would work
-  ;; as for all other objects (in byte index 3 of the header)
+  ;; Preserve rcx and compute the length in words.
+  ;; MAXIMUM-BIGNUM-LENGTH is a 4-byte quantity. Probably better if this would use
+  ;; the high 4 bytes of the header to naturally align the load.
   (inst push rcx)
-  (inst mov rcx (ea (- other-pointer-lowtag) rdi))
-  (inst shl rcx 1) ; shift out GC mark bit
-  (inst shr rcx (1+ n-widetag-bits))
+  (inst mov :dword rcx (ea (- 1 other-pointer-lowtag) rdi))
   #+bignum-assertions
   (progn (inst mov r11 rcx)
          (inst or r11 1)) ; align to start of ubsan bits
@@ -518,13 +496,14 @@
 ;; the same widetag, but not bignum-widetag, the behavior is undefined.
 ;;
 (define-assembly-routine (%eql/integer
-                          (:translate %eql/integer)
+                          (:translate eql)
                           ;; :safe would imply signaling an error
                           ;; if the args are not integer, which this doesn't.
                           (:policy :fast-safe)
                           (:conditional :e)
-                          (:cost 10))
-                         ((:arg x (descriptor-reg any-reg) rdx-offset)
+                          (:cost 10)
+                          (:arg-types (:or integer bignum) *))
+                         ((:arg x (descriptor-reg) rdx-offset)
                           (:arg y (descriptor-reg any-reg) rdi-offset)
                           (:temp rcx unsigned-reg rcx-offset)
                           (:temp rax unsigned-reg rax-offset))
@@ -554,3 +533,9 @@
   (inst jmp :ne loop)
   ;; If the Z flag is set, the integers were EQL
   done)
+
+#-sb-assembling
+(define-vop (%eql/integer2 %eql/integer)
+  (:args (x :scs (descriptor-reg any-reg) :target x-arg-temp)
+         (y :scs (descriptor-reg) :target y-arg-temp))
+  (:arg-types * (:or integer bignum)))

@@ -539,6 +539,27 @@
                      (atomic-pop (symbol-value 'x))))))
       1)))
 
+(defclass cas-fsc (generic-function)
+  ((a :initform 2))
+  (:metaclass sb-mop:funcallable-standard-class))
+
+(with-test (:name :cas-funcallable-instance)
+  (let ((x (make-instance 'cas-fsc)))
+    (assert
+     (= (funcall (compile nil
+                          `(lambda (x)
+                             (cas (slot-value x 'a) 0 1)))
+                 x)
+        2))
+    (assert (eql (slot-value x 'a) 2))
+    (assert
+     (= (funcall (compile nil
+                          `(lambda (x)
+                             (cas (slot-value x 'a) 2 3)))
+                 x)
+        2))
+    (assert (eql (slot-value x 'a) 3))))
+
 (in-package "SB-VM")
 
 ;;; This file defines a structure, so is an 'impure' test
@@ -580,7 +601,7 @@
     t))
 
 (test-util:with-test (:name :wide-compare-and-exchange
-                      :skipped-on (or :interpreter (not (or :x86 :x86-64))))
+                      :skipped-on (not (or :x86 :x86-64)))
   (multiple-value-bind (a b c d) (%cpu-identification 0 0)
     (declare (ignore b c d))
     ;; paranoidly check for whether we can execute function ID 1
@@ -594,7 +615,8 @@
         (format t "Double-width compare-and-swap NOT TESTED~%"))))
 
 (test-util:with-test (:name :cas-sap-ref-smoke-test
-                            :skipped-on (not (and :sb-thread (or :ppc64 :x86-64))))
+                            :fails-on :riscv ; unsigned-32-bit gets the wrong answer
+                            :skipped-on (not :sb-thread))
   (let ((data (make-array 1 :element-type 'sb-vm:word)))
     (sb-sys:with-pinned-objects (data)
       (let ((sap (sb-sys:vector-sap data)))
@@ -603,12 +625,10 @@
         ;;  1. it was using a :dword move where it should have used a :qword
         ;;  2. it was emitting constants as bignums instead of inline raw constants
         (macrolet ((test (signedp nbits newval
-                          &aux (ref (symbolicate
-                                     (if signedp "SIGNED-" "")
-                                     "SAP-REF-"
-                                     (write-to-string nbits)))
-                                     (init (if signedp -1
-                                               (ldb (byte nbits 0) most-positive-word))))
+                          &aux (ref (symbolicate (if signedp "SIGNED-" "")
+                                                 "SAP-REF-" nbits))
+                               (init (if signedp -1
+                                         (ldb (byte nbits 0) most-positive-word))))
                      `(progn
                         ;; (format t "Testing ~a with initial bits ~x~%" ',ref ,init)
                         (setf (,ref sap 0) ,init)
@@ -618,11 +638,13 @@
                         (let ((old (cas (,ref sap 0) ,init ,newval)))
                           (assert (eql old ,init)) ; actual old
                           (assert (eql (,ref sap 0) ,newval)))))) ; should have changed
-          (test nil 64 #xdeadc0fefe00)
-          (test t   64 most-negative-fixnum)
+          #+64-bit (test nil 64 #xdeadc0fefe00)
+          #+64-bit (test t   64 most-negative-fixnum)
           (test nil 32 #xbabab00e)
-          #-ppc64 (test nil 16 #xfafa) ; gets "illegal instruction" if unimplemented
-          #-ppc64 (test nil 8 #xbb)
+          ;; on riscv I did not implement these sizes, and
+          ;; ppc64 might get "illegal instruction" depending on the particular CPU
+          #-(or riscv ppc64) (test nil 16 #xfafa)
+          #-(or riscv ppc64) (test nil 8 #xbb)
           )
         ;; SAP-REF-SAP
         (setf (aref data 0) 0)
@@ -641,8 +663,21 @@
           (assert (eq old nil))
           (assert (eq (sap-ref-lispobj sap 0) t)))))))
 
+(test-util:with-test (:name :cas-sb16
+                      :skipped-on (or :interpreter
+                                      (not (or :arm64 :x86-64))))
+ (let ((a (make-array 1 :element-type '(signed-byte 16))))
+   (flet ((cas-sb16 (sap old new)
+           (cas (sb-sys:signed-sap-ref-16 sap 0) old new)))
+     (setf (aref a 0) -1000)
+     (loop for old from -1000 to 1000 do
+        (sb-sys:with-pinned-objects (a)
+          (let ((actual (cas-sb16 (sb-sys:vector-sap a) old (1+ old))))
+            (assert (= actual old))
+            (assert (= (aref a 0) (1+ old)))))))))
+
 (test-util:with-test (:name :cas-sap-ref-stress-test
-                            :skipped-on (not (and :sb-thread (or :ppc64 :x86-64))))
+                            :skipped-on (not :sb-thread))
   (let ((data (make-array 1 :element-type 'sb-vm:word
                              :initial-element 0)))
     (sb-sys:with-pinned-objects (data)
@@ -665,14 +700,46 @@
           (assert (= (sap-ref-32 sap 0) (* n-threads n-increments))))))))
 
 (define-alien-variable "small_generation_limit" (signed 8))
-#+(or x86-64 ppc64)
+;; PPC64 shouldn't fail, but depending on the CPU revision it might not
+;; have the needed instruction, and I don't know how to test for it.
+;; And surely it doesn't really depend on endian-ness, but the machine
+;; that I'm testing on which is little-endian passes the test.
+#+(and sb-thread (or x86-64 (and ppc64 little-endian)))
+(progn
 (defun cas-an-alien-byte (x y) (cas small-generation-limit x y))
-#+(or x86-64 ppc64)
 (compile 'cas-an-alien-byte)
-(test-util:with-test (:name :cas-alien
-                            :skipped-on (not (and :sb-thread (or :ppc64 :x86-64))))
+(test-util:with-test (:name :cas-alien)
   (assert (= small-generation-limit 1))
   (assert (= (cas-an-alien-byte 0 5) 1))
   (assert (= (cas-an-alien-byte 1 6) 1))
   (assert (= small-generation-limit 6))
-  (setf small-generation-limit 1))
+  (setf small-generation-limit 1)))
+
+(test-util:with-test (:name :cas-aref
+                      :skipped-on (not (or :arm64 :x86-64)))
+  (dolist (bits '(8 16 32 #+64-bit 64))
+    (let ((unsigned (make-array '(3 3) :element-type `(unsigned-byte ,bits)
+                                :initial-element 0))
+          (signed (make-array '(3 3) :element-type `(signed-byte ,bits)
+                              :initial-element 0))
+          (uint 0)
+          (sint -5))
+      (dotimes (i 3)
+        (dotimes (j 3)
+          (cas (aref unsigned i j) 0 (incf uint))
+          (cas (aref signed i j) 0 (incf sint))))
+      (assert (equalp unsigned #2A((1 2 3) (4 5 6) (7 8 9))))
+      (assert (equalp signed #2A((-4 -3 -2) (-1 0 1) (2 3 4)))))))
+
+(test-util:with-test (:name :cas-aref-float :skipped-on (not :x86-64))
+  (dolist (et '(single-float double-float))
+    (let ((a (make-array 4 :element-type et)))
+      (dotimes (i 4)
+        (cas (aref a i) (coerce 0 et) (coerce (1+ i) et)))
+      (assert (equalp a #(1d0 2d0 3d0 4d0))))))
+
+(declaim (global *not-ab-global*))
+(defun cas-not-ab-global (old new) (cas *not-ab-global* old new))
+(compile 'cas-not-ab-global)
+(test-util:with-test (:name :cas-not-always-bound-global)
+  (assertoid:assert-error (cas-not-ab-global 1 2) cell-error))

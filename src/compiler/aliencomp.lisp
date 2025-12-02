@@ -61,9 +61,9 @@
   (flushable movable))
 (defknown deport-alloc (alien alien-type) t
   (flushable movable))
-(defknown %alien-value (system-area-pointer unsigned-byte alien-type) t
+(defknown %alien-value (system-area-pointer word alien-type) t
   (flushable))
-(defknown (setf %alien-value) (t system-area-pointer unsigned-byte alien-type) t
+(defknown (setf %alien-value) (t system-area-pointer word alien-type) t
   ())
 
 (defknown alien-funcall (alien-value &rest t) *
@@ -219,7 +219,7 @@
            (give-up-ir1-transform "Element alignment is unknown."))
          (if (null dims)
              (values nil 0 element-type)
-             (let* ((arg (sb-xc:gensym))
+             (let* ((arg (gensym))
                     (args (list arg))
                     (offsetexpr arg))
                (dolist (dim (cdr dims))
@@ -236,7 +236,6 @@
 
 #+nil ;; Shouldn't be necessary.
 (defoptimizer (deref derive-type) ((alien &rest noise))
-  (declare (ignore noise))
   (block nil
     (catch 'give-up-ir1-transform
       (return (make-alien-type-type (find-deref-element-type alien))))
@@ -252,7 +251,6 @@
 
 #+nil ;; ### Again, the value might be coerced.
 (defoptimizer (%set-deref derive-type) ((alien value &rest noise))
-  (declare (ignore noise))
   (block nil
     (catch 'give-up-ir1-transform
       (let ((type (make-alien-type-type
@@ -272,7 +270,6 @@
              value))))
 
 (defoptimizer (%deref-addr derive-type) ((alien &rest noise))
-  (declare (ignore noise))
   (block nil
     (catch 'give-up-ir1-transform
       (return (make-alien-type-type
@@ -370,8 +367,8 @@
                             alien-rep-type)
                  '(int-sap 0))
                 ((ctypep 0 alien-rep-type) 0)
-                ((ctypep $0.0f0 alien-rep-type) $0.0f0)
-                ((ctypep $0.0d0 alien-rep-type) $0.0d0)
+                ((ctypep 0.0f0 alien-rep-type) 0.0f0)
+                ((ctypep 0.0d0 alien-rep-type) 0.0d0)
                 (t
                  (compiler-error
                   "Aliens of type ~S cannot be represented immediately."
@@ -414,7 +411,6 @@
         '(error "This should be eliminated as dead code."))))
 
 (defoptimizer (%local-alien-addr derive-type) ((info var))
-  (declare (ignore var))
   (if (constant-lvar-p info)
       (let* ((info (lvar-value info))
              (alien-type (local-alien-info-type info)))
@@ -433,7 +429,6 @@
 ;;;; %CAST
 
 (defoptimizer (%cast derive-type) ((alien type))
-  (declare (ignore alien))
   (or (when (constant-lvar-p type)
         (let ((alien-type (lvar-value type)))
           (when (alien-type-p alien-type)
@@ -460,21 +455,52 @@
       (combination
        (splice-fun-args alien '%sap-alien 2)
        '(lambda (sap type)
-          (declare (ignore type))
-          sap))
+         (declare (ignore type))
+         sap))
+      (ref
+       ;; Go through a variable in the %sap-alien transform below
+       (map-all-uses (lambda (use)
+                       (when (combination-is use '(%sap-alien))
+                         (reoptimize-node use)))
+                     alien)
+       (give-up-ir1-transform))
       (t
        (give-up-ir1-transform)))))
 
+(deftransform %sap-alien ((sap type) * * :node node)
+  "optimize away %SAP-ALIEN"
+  (let (alien-saps)
+    ;; Optimize multiple alien-saps through a variable
+    (cond ((block nil
+             (map-refs
+              (lambda (dest lvar)
+                (declare (ignore lvar))
+                (cond ((combination-is dest '(alien-sap))
+                       (pushnew dest alien-saps :test #'eq))
+                      ((combination-is dest '(eq)))
+                      (t
+                       (return))))
+              (node-lvar node)
+              :leaf-set (lambda () (return))
+              :multiple-uses (lambda () (return)))
+             alien-saps)
+           (erase-node-type node (values-specifier-type '(values system-area-pointer &optional)))
+           (loop for alien-sap in alien-saps
+                 do
+                 (transform-call alien-sap
+                                 `(lambda (sap)
+                                    sap)
+                                 'alien-sap
+                                 nil))
+           'sap)
+          (t
+           (give-up-ir1-transform
+            "forced to do runtime allocation of alien-value structure")))))
+
 (defoptimizer (%sap-alien derive-type) ((sap type))
-  (declare (ignore sap))
   (if (constant-lvar-p type)
       (make-alien-type-type (lvar-value type))
       *wild-type*))
-
-(deftransform %sap-alien ((sap type))
-  "optimize away %SAP-ALIEN"
-  (give-up-ir1-transform
-   "forced to do runtime allocation of alien-value structure"))
 
 ;;;; NATURALIZE/DEPORT/EXTRACT/DEPOSIT magic
 
@@ -539,17 +565,17 @@
                  ;; then snarf out the string and use it as the funarg
                  ;; unless the backend lacks the CALL-OUT-NAMED vop.
                  `(%alien-funcall
-                   ,(or (when (and (gethash 'call-out-named *backend-parsed-vops*)
-                                   (lvar-matches function :fun-names '(%sap-alien)
-                                                          :arg-count 2))
-                          (let ((sap (first (combination-args (lvar-use function)))))
-                            (when (lvar-matches sap :fun-names '(foreign-symbol-sap)
-                                                    :arg-count 1)
-                              (let ((sym (first (combination-args (lvar-use sap)))))
-                                (when (and (constant-lvar-p sym)
-                                           (stringp (lvar-value sym)))
-                                  (setq ignore-fun t)
-                                  (lvar-value sym))))))
+                   ,(or (when-vop-existsp (:named call-out-named)
+                          (when (lvar-matches function :fun-names '(%sap-alien)
+                                                       :arg-count 2)
+                            (let ((sap (first (combination-args (lvar-use function)))))
+                              (when (lvar-matches sap :fun-names '(foreign-symbol-sap)
+                                                      :arg-count 1)
+                                (let ((sym (first (combination-args (lvar-use sap)))))
+                                  (when (and (constant-lvar-p sym)
+                                             (stringp (lvar-value sym)))
+                                    (setq ignore-fun t)
+                                    (lvar-value sym)))))))
                         `(deport function ',alien-type))
                    ',alien-type
                    ,@(deports))))
@@ -594,7 +620,6 @@
                ,body)))))))
 
 (defoptimizer (%alien-funcall derive-type) ((function type &rest args))
-  (declare (ignore function args))
   (unless (and (constant-lvar-p type)
                (alien-fun-type-p (lvar-value type)))
     (error "Something is broken."))
@@ -604,8 +629,7 @@
     (if (eq spec '*) *wild-type* (values-specifier-type spec))))
 
 (defoptimizer (%alien-funcall ltn-annotate)
-              ((function type &rest args) node ltn-policy)
-  (declare (ignore type ltn-policy))
+              ((function type &rest args) node)
   (setf (basic-combination-info node) :funny)
   (setf (node-tail-p node) nil)
   (unless (and (constant-lvar-p function)
@@ -667,10 +691,10 @@
 
               (cond
                 #+arm-softfp
-                ((and (proper-list-of-length-p tn 3)
-                      (symbolp (third tn)))
+                ((and (listp tn)
+                      (symbolp (car (last tn))))
                  (emit-template call block
-                                (template-or-lose (third tn))
+                                (template-or-lose (car (last tn)))
                                 (reference-tn (lvar-tn call block arg) nil)
                                 (reference-tn-list (butlast tn) t)))
                 (t
@@ -736,12 +760,12 @@
         (cond
           #+arm-softfp
           ((and lvar
-                (fourth result-tns))
+                (symbolp (car (last result-tns))))
            (emit-template call block
-                          (template-or-lose (fourth result-tns))
+                          (template-or-lose (car (last result-tns)))
                           (reference-tn-list (butlast result-tns 2) nil)
-                          (reference-tn (third result-tns) t))
-           (move-lvar-result call block (list (third result-tns)) lvar))
+                          (reference-tn (car (last result-tns 2)) t))
+           (move-lvar-result call block (list (car (last result-tns 2))) lvar))
           (t
            (move-lvar-result call block result-tns lvar)))))))
 

@@ -34,20 +34,19 @@
 
 ;;; the actual bashers and common uses of same
 
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  (defconstant min-bytes-c-call-threshold
-    ;; mostly just guessing here
-    #+(or x86 x86-64 ppc ppc64) 128
-    #-(or x86 x86-64 ppc ppc64) 256))
+(defconstant min-bytes-c-call-threshold
+  ;; mostly just guessing here
+  #+(or x86 x86-64 ppc ppc64) 128
+  #-(or x86 x86-64 ppc ppc64) 256)
 
 (defmacro verify-src/dst-bits-per-elt (source destination expect-bits-per-element)
   (declare (ignorable source destination expect-bits-per-element))
   #+(and sb-devel (not sb-devel-no-errors))
   `(let ((src-bits-per-element
-          (ash 1 (aref %%simple-array-n-bits-shifts%%
+          (ash 1 (aref #.%%simple-array-n-bits-shifts%%
                        (%other-pointer-widetag ,source))))
          (dst-bits-per-element
-          (ash 1 (aref %%simple-array-n-bits-shifts%%
+          (ash 1 (aref #.%%simple-array-n-bits-shifts%%
                        (%other-pointer-widetag ,destination)))))
     (when (or (/= src-bits-per-element ,expect-bits-per-element)
               (/= dst-bits-per-element ,expect-bits-per-element))
@@ -113,6 +112,12 @@
       (locally
          (declare (optimize (safety 0)
                             (sb-c::alien-funcall-saves-fp-and-pc 0)))
+      #+cheneygc (when (> nelements 0)
+                   ;; cheneygc can't handle a WP fault in memcpy()
+                   ;; because "if(!foreign_function_call_active ..."
+                   (let ((last (truly-the index (+ dst-start (1- nelements)))))
+                     (data-vector-set (truly-the ,vtype dst) last
+                                      (data-vector-ref (truly-the ,vtype dst) last))))
        ,(if (= bytes-per-element sb-vm:n-word-bytes)
           `(if ,always-call-out-p
                ,(use-memmove)
@@ -842,5 +847,9 @@
     (otherwise nil)))
 (clear-info :function :inlinep '%bit-position/0)
 (clear-info :function :inlinep '%bit-position/1)
+
+;;; These are needed ASAP (in target-unicode)
+(defun shift-towards-start (number count) (shift-towards-start number count))
+(defun shift-towards-end (number count) (shift-towards-end number count))
 
 (run-bit-position-assertions)

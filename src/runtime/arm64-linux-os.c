@@ -17,8 +17,7 @@
 #include <stdio.h>
 #include <sys/param.h>
 #include <sys/file.h>
-#include "sbcl.h"
-#include "./signal.h"
+#include "genesis/sbcl.h"
 #include "os.h"
 #include "arch.h"
 #include "globals.h"
@@ -50,6 +49,8 @@ int arch_os_thread_init(struct thread *thread) {
     return 1;                   /* success */
 }
 int arch_os_thread_cleanup(struct thread *thread) {
+    if (thread->breakpoint_misc)
+        os_deallocate((os_vm_address_t) thread->breakpoint_misc, getpagesize());
     return 1;                   /* success */
 }
 
@@ -57,12 +58,6 @@ os_context_register_t   *
 os_context_register_addr(os_context_t *context, int offset)
 {
     return (os_context_register_t *)&(context->uc_mcontext.regs[offset]);
-}
-
-os_context_register_t *
-os_context_pc_addr(os_context_t *context)
-{
-    return (os_context_register_t *)&(context->uc_mcontext.pc);
 }
 
 os_context_register_t *
@@ -75,6 +70,12 @@ sigset_t *
 os_context_sigmask_addr(os_context_t *context)
 {
     return &(context->uc_sigmask);
+}
+
+os_context_register_t *
+os_context_flags_addr(os_context_t *context)
+{
+    return (os_context_register_t *)&(context->uc_mcontext.pstate);
 }
 
 void

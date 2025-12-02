@@ -34,49 +34,37 @@
 
 (defun dfun-arg-symbol (arg-number)
   (or (nth arg-number *dfun-arg-symbols*)
-      (format-symbol *pcl-package* ".ARG~A." arg-number)))
+      (pcl-symbolicate ".ARG" arg-number ".")))
 
 (declaim (list *slot-vector-symbols*))
 (define-load-time-global *slot-vector-symbols* '(.SLOTS0. .SLOTS1. .SLOTS2. .SLOTS3.))
 
 (defun slot-vector-symbol (arg-number)
   (or (nth arg-number *slot-vector-symbols*)
-      (format-symbol *pcl-package* ".SLOTS~A." arg-number)))
+      (pcl-symbolicate ".SLOTS" arg-number ".")))
 
 (declaim (inline make-dfun-required-args))
 (defun make-dfun-required-args (count)
   (declare (type index count))
-  (let (result)
-    (dotimes (i count (nreverse result))
-      (push (dfun-arg-symbol i) result))))
+  ;; N.B.: don't PUSH and NREVERSE here. COLLECT will cons in the system TLAB,
+  ;; but NREVERSE won't because we don't inline NREVERSE.
+  (collect ((result))
+    (dotimes (i count (result))
+      (result (dfun-arg-symbol i)))))
 
 (defun make-dfun-lambda-list (nargs applyp)
   (let ((required (make-dfun-required-args nargs)))
     (if applyp
-        (nconc required
-               ;; Use &MORE arguments to avoid consing up an &REST list
-               ;; that we might not need at all. See MAKE-EMF-CALL and
-               ;; INVOKE-EFFECTIVE-METHOD-FUNCTION for the other
-               ;; pieces.
-               '(&more .dfun-more-context. .dfun-more-count.))
+        (nconc required '(&rest .rest.))
         required)))
 
 (defun make-dlap-lambda-list (nargs applyp)
   (let ((required (make-dfun-required-args nargs)))
-    ;; Return the full lambda list, the required arguments, a form
-    ;; that will generate a rest-list, and a list of the &MORE
-    ;; parameters used.
-    ;; Beware of deep voodoo! The DEFKNOWN for %LISTIFY-REST-ARGS says that its
-    ;; second argument is INDEX, but the THE form below is "weaker" on account
-    ;; of the vop operand restrictions or something that I don't understand.
-    ;; Which is to say, PCL compilation reliably broke when changed to INDEX.
     (if applyp
-        (values (append required '(&more .more-context. .more-count.))
+        (values (sys-tlab-append required '(&rest .rest.))
                 required
-                '((sb-c:%listify-rest-args
-                   .more-context. (the (and unsigned-byte fixnum)
-                                    .more-count.)))
-                '(.more-context. .more-count.))
+                '((sb-c::%rest-list .rest.))
+                '(.rest.))
         (values required required nil nil))))
 
 (defun make-emf-call (nargs applyp fn-variable &optional emf-type)
@@ -91,14 +79,10 @@
        ;; the :REST-ARG version or the :MORE-ARG version depending on
        ;; the type of the EMF.
        :rest-arg ,(if applyp
-                      ;; Creates a list from the &MORE arguments.
-                      '((sb-c:%listify-rest-args ; See above re. voodoo
-                         .dfun-more-context.
-                         (the (and unsigned-byte fixnum)
-                           .dfun-more-count.)))
+                      '((sb-c::%rest-list .rest.))
                       nil)
        :more-arg ,(when applyp
-                    '(.dfun-more-context. .dfun-more-count.)))))
+                    '(.rest.)))))
 
 (defun make-fast-method-call-lambda-list (nargs applyp)
   (list* '.pv. '.next-method-call. (make-dfun-lambda-list nargs applyp)))
@@ -114,6 +98,9 @@
 (defun emit-one-class-writer (class-slot-p)
   (emit-reader/writer :writer 1 class-slot-p))
 
+(defun emit-one-class-makunbound (class-slot-p)
+  (emit-reader/writer :makunbound 1 class-slot-p))
+
 (defun emit-two-class-reader (class-slot-p)
   (emit-reader/writer :reader 2 class-slot-p))
 
@@ -122,6 +109,9 @@
 
 (defun emit-two-class-writer (class-slot-p)
   (emit-reader/writer :writer 2 class-slot-p))
+
+(defun emit-two-class-makunbound (class-slot-p)
+  (emit-reader/writer :makunbound 2 class-slot-p))
 
 ;;; --------------------------------
 
@@ -134,6 +124,9 @@
 (defun emit-one-index-writers (class-slot-p)
   (emit-one-or-n-index-reader/writer :writer nil class-slot-p))
 
+(defun emit-one-index-makunbounds (class-slot-p)
+  (emit-one-or-n-index-reader/writer :makunbound nil class-slot-p))
+
 (defun emit-n-n-readers ()
   (emit-one-or-n-index-reader/writer :reader t nil))
 
@@ -142,6 +135,9 @@
 
 (defun emit-n-n-writers ()
   (emit-one-or-n-index-reader/writer :writer t nil))
+
+(defun emit-n-n-makunbounds ()
+  (emit-one-or-n-index-reader/writer :makunbound t nil))
 
 ;;; --------------------------------
 
@@ -161,8 +157,16 @@
 
 ;;; FIXME: What do these variables mean?
 (defvar *precompiling-lap* nil)
+(defvar *emit-function-p* t)
+
+;;; Should PCL call compile at runtime to optimize cache functions?
+(defvar *optimize-cache-functions-p* t)
 
 (defun emit-default-only (metatypes applyp)
+  (unless *optimize-cache-functions-p*
+    (when (and (null *precompiling-lap*) *emit-function-p*)
+      (return-from emit-default-only
+        (emit-default-only-function metatypes applyp))))
   (multiple-value-bind (lambda-list args rest-arg more-arg)
       (make-dlap-lambda-list (length metatypes) applyp)
     (generating-lisp '(emf)
@@ -179,15 +183,16 @@
   (let ((lambda `(lambda ,closure-variables
                    ,@(when (member 'miss-fn closure-variables)
                        `((declare (type function miss-fn))))
-                   (declare (optimize (sb-c:store-source-form 0)))
+                   (declare (optimize (sb-c:store-source-form 0)
+                                      (sb-c::store-xref-data 0)))
                    (declare (optimize (sb-c::store-closure-debug-pointer 3)))
                    #'(lambda ,args
-                       (let ()
+                       (let () ; What is this LET doing?
                          (declare #.*optimize-speed*)
                          ,form)))))
     (values (if *precompiling-lap*
                 `#',lambda
-                (compile nil lambda))
+                (pcl-compile lambda :safe))
             nil)))
 
 ;;; note on implementation for CMU 17 and later (including SBCL):
@@ -203,7 +208,7 @@
         (closure-variables ())
         (read-form (emit-slot-read-form class-slot-p 'index 'slots)))
     (ecase reader/writer
-      ((:reader :boundp)
+      ((:reader :boundp :makunbound)
        (setq instance (dfun-arg-symbol 0)
              arglist  (list instance)))
       (:writer (setq instance (dfun-arg-symbol 1)
@@ -219,15 +224,15 @@
                                ,@(unless class-slot-p
                                    `((setq slots
                                            (std-instance-slots ,instance))))
-                               (%instance-wrapper ,instance))
+                               (%instance-layout ,instance))
                               ((fsc-instance-p ,instance)
                                ,@(unless class-slot-p
                                    `((setq slots
                                            (fsc-instance-slots ,instance))))
-                               (%fun-wrapper ,instance)))))
+                               (%fun-layout ,instance)))))
         (block access
           (when (and wrapper
-                     (not (zerop (wrapper-clos-hash wrapper)))
+                     (not (zerop (layout-clos-hash wrapper)))
                      ,@(if (eql 1 1-or-2-class)
                            `((eq wrapper wrapper-0))
                            `((or (eq wrapper wrapper-0)
@@ -240,6 +245,9 @@
                 (:boundp
                  `((let ((value ,read-form))
                      (return-from access (not (unbound-marker-p value))))))
+                (:makunbound
+                 `((progn (setf ,read-form +slot-unbound+)
+                          ,instance)))
                 (:writer
                  `((return-from access (setf ,read-form ,(car arglist)))))))
           (funcall miss-fn ,@arglist))))))
@@ -261,10 +269,12 @@
     (ecase reader/writer
       (:reader (emit-boundp-check read-form miss-fn arglist))
       (:boundp `(not (unbound-marker-p ,read-form)))
+      (:makunbound `(progn (setf ,read-form +slot-unbound+) ,(car arglist)))
       (:writer `(setf ,read-form ,(car arglist))))))
 
 (defmacro emit-reader/writer-macro (reader/writer 1-or-2-class class-slot-p)
-  (let ((*precompiling-lap* t))
+  (let ((*emit-function-p* nil)
+        (*precompiling-lap* t))
     (values
      (emit-reader/writer reader/writer 1-or-2-class class-slot-p))))
 
@@ -274,9 +284,14 @@
 (defun emit-one-or-n-index-reader/writer (reader/writer
                                           cached-index-p
                                           class-slot-p)
+  (unless *optimize-cache-functions-p*
+    (when (and (null *precompiling-lap*) *emit-function-p*)
+      (return-from emit-one-or-n-index-reader/writer
+        (emit-one-or-n-index-reader/writer-function
+         reader/writer cached-index-p class-slot-p))))
   (multiple-value-bind (arglist metatypes)
       (ecase reader/writer
-        ((:reader :boundp)
+        ((:reader :boundp :makunbound)
          (values (list (dfun-arg-symbol 0))
                  '(standard-instance)))
         (:writer (values (list (dfun-arg-symbol 0) (dfun-arg-symbol 1))
@@ -295,18 +310,15 @@
 
 (defmacro emit-one-or-n-index-reader/writer-macro
     (reader/writer cached-index-p class-slot-p)
-  (let ((*precompiling-lap* t))
+  (let ((*emit-function-p* nil)
+        (*precompiling-lap* t))
     (values
-     (emit-one-or-n-index-reader/writer reader/writer
-                                        cached-index-p
+     (emit-one-or-n-index-reader/writer reader/writer cached-index-p
                                         class-slot-p))))
 
 (defun emit-miss (miss-fn args applyp)
   (if applyp
-      `(multiple-value-call ,miss-fn ,@args
-                            (sb-c:%more-arg-values .more-context.
-                                                    0
-                                                    .more-count.))
+      `(apply ,miss-fn ,@args .rest.)
       `(funcall ,miss-fn ,@args)))
 
 ;; (cache-emf, return-value):
@@ -318,6 +330,11 @@
 ;;  METATYPES must be acceptable to EMIT-FETCH-WRAPPER.
 ;;  APPLYP says whether there is a &MORE context.
 (defun emit-checking-or-caching (cached-emf-p return-value-p metatypes applyp)
+  (unless *optimize-cache-functions-p*
+    (when (and (null *precompiling-lap*) *emit-function-p*)
+      (return-from emit-checking-or-caching
+        (emit-checking-or-caching-function
+         cached-emf-p return-value-p metatypes applyp))))
   (multiple-value-bind (lambda-list args rest-arg more-arg)
       (make-dlap-lambda-list (length metatypes) applyp)
     (generating-lisp
@@ -350,9 +367,7 @@
          (wrapper-bindings (mapcan (lambda (arg mt)
                                      (unless (eq mt t)
                                        (incf index)
-                                       `((,(format-symbol *pcl-package*
-                                                          "WRAPPER-~D"
-                                                          index)
+                                       `((,(pcl-symbolicate "WRAPPER-" index)
                                           ,(emit-fetch-wrapper
                                             mt arg miss-tag (pop slot-vars))))))
                                    args metatypes))
@@ -383,20 +398,20 @@
      ;; instance-slots-layout instead of for-std-class-p, as if there
      ;; are no layouts there are no slots to worry about.
      (with-unique-names (wrapper)
-       `(cond ((std-instance-p ,argument)
+       `(cond ((%instancep ,argument)
                ,(if slots-var
-                    `(let ((,wrapper (%instance-wrapper ,argument)))
+                    `(let ((,wrapper (%instance-layout ,argument)))
                        (when (layout-for-pcl-obj-p ,wrapper)
                          (setq ,slots-var (std-instance-slots ,argument)))
                        ,wrapper)
-                    `(%instance-wrapper ,argument)))
-              ((fsc-instance-p ,argument)
+                    `(%instance-layout ,argument)))
+              ((function-with-layout-p ,argument)
                ,(if slots-var
-                    `(let ((,wrapper (%fun-wrapper ,argument)))
+                    `(let ((,wrapper (%fun-layout ,argument)))
                        (when (layout-for-pcl-obj-p ,wrapper)
                          (setq ,slots-var (fsc-instance-slots ,argument)))
                        ,wrapper)
-                    `(%fun-wrapper ,argument)))
+                    `(%fun-layout ,argument)))
                (t (go ,miss-tag)))))
     ;; Sep92 PCL used to distinguish between some of these cases (and
     ;; spuriously exclude others).  Since in SBCL
@@ -407,7 +422,7 @@
      (when slots-var
        (bug "SLOT requested for metatype ~S, but it isn't going to happen."
             metatype))
-     `(wrapper-of ,argument))
+     `(layout-of ,argument))
     ;; a metatype of NIL should never be seen here, as NIL is only in
     ;; the metatypes before a generic function is fully initialized.
     ;; T should never be seen because we never need to get a wrapper

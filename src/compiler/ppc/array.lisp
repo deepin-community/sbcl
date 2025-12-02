@@ -38,7 +38,7 @@
       ;; Exercise for the reader: these next 4 instructions can be
       ;; replaced by just 2: one RLWINM and one RLWIMI
       (inst andi. ndescr ndescr (fixnumize array-rank-mask))
-      (inst slwi ndescr ndescr array-rank-byte-pos)
+      (inst slwi ndescr ndescr array-rank-position)
       (inst or ndescr ndescr type)
       (inst srwi ndescr ndescr n-fixnum-tag-bits)
       (storew ndescr header 0 other-pointer-lowtag))
@@ -51,19 +51,21 @@
   (:policy :fast-safe)
   (:variant array-dimensions-offset other-pointer-lowtag))
 
-(define-vop (%set-array-dimension word-index-set-nr)
+(define-vop (%set-array-dimension word-index-set)
   (:translate %set-array-dimension)
   (:policy :fast-safe)
   (:variant array-dimensions-offset other-pointer-lowtag))
 
 (define-vop ()
-  (:translate %array-rank)
+  (:translate array-rank)
   (:policy :fast-safe)
   (:args (x :scs (descriptor-reg)))
   (:results (res :scs (unsigned-reg)))
   (:result-types positive-fixnum)
   (:generator 6
-    (inst lbz res x (- 1 other-pointer-lowtag)) ; big-endian only
+    ;; convert ARRAY-RANK-POSITION to byte index and compensate for endianness
+    ;; ASSUMPTION: n-widetag-bits = 8 and rank is adjacent to widetag
+    (inst lbz res x (- 2 other-pointer-lowtag)) ; big-endian only
     (inst addi res res 1)
     (inst andi. res res array-rank-mask)))
 
@@ -104,7 +106,7 @@
        (:results (value :scs ,scs))
        (:result-types ,element-type))
      (define-vop (,(symbolicate "DATA-VECTOR-SET/" (string type))
-                  ,(symbolicate (string variant) "-SET-NR"))
+                  ,(symbolicate (string variant) "-SET"))
        (:note "inline array store")
        (:variant vector-data-offset other-pointer-lowtag)
        (:translate data-vector-set)
@@ -452,13 +454,22 @@
   (:result-types unsigned-num)
   (:variant vector-data-offset other-pointer-lowtag))
 
-(define-vop (set-vector-raw-bits word-index-set-nr)
+(define-vop (set-vector-raw-bits word-index-set)
   (:note "setf vector-raw-bits VOP")
   (:translate %set-vector-raw-bits)
   (:args (object :scs (descriptor-reg))
          (index :scs (any-reg zero immediate))
          (value :scs (unsigned-reg)))
   (:arg-types * positive-fixnum unsigned-num)
+  (:variant vector-data-offset other-pointer-lowtag))
+
+;;; Weak vectors
+(define-vop (%weakvec-ref word-index-ref)
+  (:translate %weakvec-ref)
+  (:variant vector-data-offset other-pointer-lowtag))
+
+(define-vop (%weakvec-set word-index-set)
+  (:translate %weakvec-set)
   (:variant vector-data-offset other-pointer-lowtag))
 
 ;;;
@@ -471,7 +482,7 @@
   (:results (value :scs (signed-reg)))
   (:result-types tagged-num))
 
-(define-vop (data-vector-set/simple-array-signed-byte-8 byte-index-set-nr)
+(define-vop (data-vector-set/simple-array-signed-byte-8 byte-index-set)
   (:note "inline array store")
   (:variant vector-data-offset other-pointer-lowtag)
   (:translate data-vector-set)
@@ -489,7 +500,7 @@
   (:results (value :scs (signed-reg)))
   (:result-types tagged-num))
 
-(define-vop (data-vector-set/simple-array-signed-byte-16 halfword-index-set-nr)
+(define-vop (data-vector-set/simple-array-signed-byte-16 halfword-index-set)
   (:note "inline array store")
   (:variant vector-data-offset other-pointer-lowtag)
   (:translate data-vector-set)

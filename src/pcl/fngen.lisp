@@ -22,6 +22,49 @@
 ;;;; specification.
 
 (in-package "SB-PCL")
+
+(defun pcl-compile (expr safety)
+  (labels ((strictly-heap-p (x)
+             (or (atom x)
+                 (and (heap-allocated-p x) (strictly-heap-p (cdr x)))))
+           (maybe-copy-expr ()
+             ;; The lambda list goes into a code component as-is.
+             ;; To avoid creating a heap->arena pointer we might have to copy it.
+             #-system-tlabs expr
+             #+system-tlabs
+             (multiple-value-bind (name rest)
+                 (ecase (car expr)
+                   (named-lambda (values (cadr expr) (cddr expr)))
+                   (lambda (values nil (cdr expr))))
+               (destructuring-bind (args . body) rest
+                   (if (strictly-heap-p args)
+                       expr
+                       (let ((args-copy (copy-list args)))
+                         (if name
+                             `(named-lambda ,name ,args-copy . ,body)
+                             `(lambda ,args-copy . ,body))))))))
+    (sb-vm:without-arena "pcl-compile"
+     (let* ((base-policy sb-c::*policy*)
+            (lexenv
+             (sb-c::make-almost-null-lexenv
+              (ecase safety
+                ;; Stepping invokes the printer on forms, which might
+                ;; invoke print-object, which might require dispatch
+                ;; function recompilation.
+                (:safe (if (sb-c:policy base-policy (= sb-c:insert-step-conditions 0))
+                           base-policy
+                           (sb-c::process-optimize-decl '(optimize (sb-c:insert-step-conditions 0))
+                                                        base-policy)))
+                (:unsafe (sb-c::process-optimize-decl
+                          '(optimize (space 1) (compilation-speed 1)
+                            (speed 3) (safety 0) (sb-ext:inhibit-warnings 3) (debug 0))
+                          base-policy)))
+              ;; I suspect that INHIBIT-WARNINGS precludes them from happening
+              (list (cons (sb-kernel:find-classoid 'style-warning) 'muffle-warning)
+                    (cons (sb-kernel:find-classoid 'compiler-note) 'muffle-warning))
+              nil nil nil
+              '((:declare sb-c::tlab :system)))))
+       (sb-c:compile-in-lexenv (maybe-copy-expr) lexenv nil nil nil nil nil)))))
 
 ;;; GET-FUN is the main user interface to this code. It is like
 ;;; COMPILE, only more efficient. It achieves this efficiency by
@@ -54,7 +97,7 @@
 
 (defun default-constantp (form)
   (and (constantp form)
-       (not (typep (constant-form-value form) '(or symbol fixnum cons wrapper)))))
+       (not (typep (constant-form-value form) '(or symbol fixnum cons layout)))))
 
 (defun default-test-converter (form)
   (if (default-constantp form)
@@ -95,6 +138,11 @@
                (unless (fgen-system old)
                  (setf (fgen-system old) system)))
               (t
+               (unless (eql (sb-vm:thread-current-arena) 0)
+                 (setq gensyms (ensure-heap-list gensyms))
+                 (sb-vm:without-arena
+                     (setq test (copy-tree test)
+                           generator-lambda  (copy-tree generator-lambda))))
                (setf (gethash test table)
                      (make-fgen gensyms generator generator-lambda system))))))))
 
@@ -111,10 +159,10 @@
 (defun get-new-fun-generator (lambda test code-converter)
   (multiple-value-bind (code gensyms) (compute-code lambda code-converter)
     (let ((generator-lambda `(lambda ,gensyms
-                               (declare (muffle-conditions compiler-note)
-                                        (optimize (sb-c:store-source-form 0)))
+                               (declare (optimize (sb-c:store-source-form 0)
+                                                  (sb-c::store-xref-data 0)))
                                (function ,code))))
-      (let ((generator (compile nil generator-lambda)))
+      (let ((generator (pcl-compile generator-lambda :safe)))
         (ensure-fgen test gensyms generator generator-lambda nil)
         generator))))
 
@@ -146,8 +194,8 @@
             gensyms)))
 
 (defun compute-constants (lambda constant-converter)
-  (let ((*walk-form-expand-macros-p* t) ; doesn't matter here.
-        collect)
+  (let ((*walk-form-expand-macros-p* t)) ; doesn't matter here.
+   (collect ((res))
     (walk-form lambda
                nil
                (lambda (f c e)
@@ -156,11 +204,9 @@
                      f
                      (let ((consts (funcall constant-converter f)))
                        (if consts
-                           (progn
-                             (setq collect (append collect consts))
-                             (values f t))
+                           (dolist (x consts (values f t)) (res x))
                            f)))))
-    collect))
+    (res))))
 
 (defmacro precompile-function-generators (&optional system)
   (let (collect)

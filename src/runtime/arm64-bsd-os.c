@@ -17,8 +17,7 @@
 #include <stdio.h>
 #include <sys/param.h>
 #include <sys/file.h>
-#include "sbcl.h"
-#include "./signal.h"
+#include "genesis/sbcl.h"
 #include "os.h"
 #include "arch.h"
 #include "globals.h"
@@ -38,9 +37,10 @@
 #include <errno.h>
 
 #include "validate.h"
-size_t os_vm_page_size;
 
 int arch_os_thread_cleanup(struct thread *thread) {
+    if (thread->breakpoint_misc)
+        os_deallocate((os_vm_address_t) thread->breakpoint_misc, getpagesize());
     return 1;                   /* success */
 }
 
@@ -72,12 +72,6 @@ os_context_register_addr(os_context_t *context, int regno)
     }
 }
 
-os_context_register_t *
-os_context_pc_addr(os_context_t *context)
-{
-    return (&context->sc_elr);
-}
-
 os_context_register_t   *
 os_context_float_register_addr(os_context_t *context, int offset)
 {
@@ -102,18 +96,17 @@ os_flush_icache(os_vm_address_t address, os_vm_size_t length)
         = (os_vm_address_t)(((uintptr_t) address) + length);
     __clear_cache(address, end_address);
 }
+os_context_register_t *
+os_context_flags_addr(os_context_t *context)
+{
+    return (os_context_register_t*)(&context->sc_spsr);
+}
 
 #elif defined(LISP_FEATURE_NETBSD)
 os_context_register_t   *
 os_context_register_addr(os_context_t *context, int offset)
 {
     return (os_context_register_t *)&(context->uc_mcontext.__gregs[offset]);
-}
-
-os_context_register_t *
-os_context_pc_addr(os_context_t *context)
-{
-    return os_context_register_addr(context, 32);
 }
 
 os_context_register_t *
@@ -135,14 +128,59 @@ os_context_float_register_addr(os_context_t *context, int offset)
         &context->uc_mcontext.__fregs.__qregs[offset];
 }
 
+os_context_register_t *
+os_context_flags_addr(os_context_t *context)
+{
+    return (os_context_register_t *)&(context->uc_mcontext.__gregs[_REG_SPSR]);
+}
+
 void
 os_flush_icache(os_vm_address_t address, os_vm_size_t length)
 {
     __builtin___clear_cache(address, address + length);
 }
-
-#elif defined (LISP_FEATURE_DARWIN)
+#elif defined LISP_FEATURE_FREEBSD
 os_context_register_t   *
+os_context_register_addr(os_context_t *context, int offset)
+{
+      switch (offset) {
+        case reg_LR:    return (&context->uc_mcontext.mc_gpregs.gp_lr);
+        case reg_NSP:   return (&context->uc_mcontext.mc_gpregs.gp_sp);
+        default:        return (&context->uc_mcontext.mc_gpregs.gp_x[offset]);
+    }
+}
+
+os_context_register_t *
+os_context_lr_addr(os_context_t *context)
+{
+    return os_context_register_addr(context, reg_LR);
+}
+
+void
+os_restore_fp_control(os_context_t *context)
+{
+    /* FIXME: Implement. */
+}
+
+os_context_register_t *
+os_context_float_register_addr(os_context_t *context, int offset)
+{
+    return (os_context_register_t*) &context->uc_mcontext.mc_fpregs.fp_q[offset];
+}
+
+os_context_register_t *
+os_context_flags_addr(os_context_t *context)
+{
+    return (os_context_register_t*)(&context->uc_mcontext.mc_gpregs.gp_spsr);
+}
+
+void
+os_flush_icache(os_vm_address_t address, os_vm_size_t length)
+{
+    __builtin___clear_cache(address, address + length);
+}
+#elif defined (LISP_FEATURE_DARWIN)
+os_context_register_t *
 os_context_register_addr(os_context_t *context, int regno)
 {
     switch (regno) {
@@ -153,15 +191,22 @@ os_context_register_addr(os_context_t *context, int regno)
 }
 
 os_context_register_t *
-os_context_pc_addr(os_context_t *context)
-{
-    return (os_context_register_t*)(&context->uc_mcontext->__ss.__pc);
-}
-
-os_context_register_t   *
 os_context_float_register_addr(os_context_t *context, int offset)
 {
-    return NULL;
+    return (os_context_register_t*)(&context->uc_mcontext->__ns.__v[offset]);
+}
+
+unsigned int
+os_context_fp_control(os_context_t *context)
+{
+    return context->uc_mcontext->__ns.__fpsr | context->uc_mcontext->__ns.__fpcr;
+}
+
+void
+os_context_set_fp_control(os_context_t *context, unsigned int value)
+{
+    context->uc_mcontext->__ns.__fpsr = value;
+    context->uc_mcontext->__ns.__fpcr = value;
 }
 
 void
@@ -173,5 +218,11 @@ os_context_register_t *
 os_context_lr_addr(os_context_t *context)
 {
     return os_context_register_addr(context, reg_LR);
+}
+
+os_context_register_t *
+os_context_flags_addr(os_context_t *context)
+{
+    return (os_context_register_t*)(&context->uc_mcontext->__ss.__cpsr);
 }
 #endif
