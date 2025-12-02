@@ -24,16 +24,6 @@
 #include <stdint.h>
 #include <string.h>
 
-#if defined LISP_FEATURE_SB_THREAD && !defined LISP_FEATURE_SB_SAFEPOINT
-# define THREADS_USING_GCSIGNAL 1
-#endif
-
-#if defined LISP_FEATURE_GENERATIONAL && !defined LISP_FEATURE_C_STACK_IS_CONTROL_STACK
-# define GENCGC_IS_PRECISE 1
-#else
-# define GENCGC_IS_PRECISE 0
-#endif
-
 extern void gc_init(void);
 extern void collect_garbage(generation_index_t last_gen);
 
@@ -153,12 +143,16 @@ static inline char *page_address(page_index_t page_num)
 
 #if (defined LISP_FEATURE_DARWIN || defined LISP_FEATURE_LINUX) \
   && defined LISP_FEATURE_SB_THREAD
+#include <time.h>
 #define MEASURE_STOP_THE_WORLD_PAUSE
+extern void thread_accrue_stw_time(void*,struct timespec*,struct timespec*);
+#else
+#define thread_accrue_stw_time(dummy1,dummy2,dummy3)
 #endif
 
 #ifdef LISP_FEATURE_X86_64
-#define GC_SAFEPOINT_PAGE_ADDR (void*)(gc_card_mark-BACKEND_PAGE_BYTES)
-#define GC_SAFEPOINT_TRAP_ADDR (void*)(gc_card_mark-8)
+#define GC_SAFEPOINT_PAGE_ADDR (void*)(STATIC_SPACE_END)
+#define GC_SAFEPOINT_TRAP_ADDR (void*)(STATIC_SPACE_END)
 #endif
 void remap_free_pages(page_index_t,page_index_t);
 void page_remap_as_type(int,void*,sword_t);

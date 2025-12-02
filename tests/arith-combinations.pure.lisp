@@ -69,14 +69,18 @@
                                                         (error "~a => ~a /= ~a" (list* lambda args) c result)
                                                         (let ((x (type-error-datum c))
                                                               (type (type-error-expected-type c)))
-                                                          (cond ((not (equal type result-type))
-                                                                 (error "~a => type error ~a /= ~a" (list* lambda args)
-                                                                        c
-                                                                        result-type))
-                                                                ((not (eql x result))
-                                                                 (error "~a => type error ~a /= ~a" (list* lambda args)
-                                                                        c
-                                                                        x))))))
+                                                          (cond
+                                                            ((not (or (equal type result-type)
+                                                                      (and (eq op '*)
+                                                                           ;; Some transforms are not too careful about their errors
+                                                                           (subtypep result-type type))))
+                                                             (error "~a => type error ~a /= ~a" (list* lambda args)
+                                                                    c
+                                                                    result-type))
+                                                            ((not (eql x result))
+                                                             (error "~a => type error ~a /= ~a" (list* lambda args)
+                                                                    c
+                                                                    x))))))
                                                   (error (c)
                                                     (error "~a => type error ~a /= ~a" (list* lambda args)
                                                            c
@@ -145,7 +149,8 @@
                 (signed-byte ,sb-vm:n-word-bits)
                 (unsigned-byte ,sb-vm:n-word-bits)
                 (signed-byte 8)
-                (unsigned-byte 8))
+                (unsigned-byte 8)
+                (integer 5 2147483647))
             (list 0 1 2 3 4 -1 -2 -3 -4
                   (- (expt 2 sb-vm:n-word-bits) 1)
                   (- (expt 2 sb-vm:n-word-bits) 5)
@@ -159,7 +164,8 @@
                   (1- most-positive-fixnum)
                   (1+ most-negative-fixnum)
                   (floor most-positive-fixnum 2)
-                  (floor most-negative-fixnum 2))
+                  (floor most-negative-fixnum 2)
+                  2147483647)
             :result-types '(t)))
 
 (with-test (:name :integer-ratio-float-compare)
@@ -172,7 +178,8 @@
                 (signed-byte ,sb-vm:n-word-bits)
                 (unsigned-byte ,sb-vm:n-word-bits)
                 (signed-byte 8)
-                (unsigned-byte 8))
+                (unsigned-byte 8)
+                (integer 5 2147483647))
             (list 0 1 2 3 4 -1 -2 -3 -4
                   (- (expt 2 sb-vm:n-word-bits) 1)
                   (- (expt 2 sb-vm:n-word-bits) 5)
@@ -181,6 +188,7 @@
                   (- (expt 2 (1- sb-vm:n-word-bits)))
                   (- 10 (expt 2 (1- sb-vm:n-word-bits)))
                   (expt 2 (1- sb-vm:n-word-bits))
+                  2147483647
                   most-positive-fixnum
                   most-negative-fixnum
                   (1- most-positive-fixnum)

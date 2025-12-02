@@ -23,10 +23,10 @@
   (defmacro without-arena (&body body)
     #-system-tlabs `(progn ,@body)
     #+system-tlabs
-    `(let ((arena (thread-current-arena)))
-       (when (%instancep arena) (switch-to-arena 0))
+    `(let ((.arena. (thread-current-arena)))
+       (when (%instancep .arena.) (switch-to-arena 0))
        (unwind-protect (progn ,@body)
-         (when (%instancep arena) (switch-to-arena arena)))))
+         (when (%instancep .arena.) (switch-to-arena .arena.)))))
   #+system-tlabs
   (progn
     (defun switch-to-arena (a)
@@ -43,7 +43,8 @@
   ;; uninterruptible, but this technique has less overhead than WITHOUT-GCING
   ;; which is to be eschewed as no such thing exists in most collectors.
   ;; If using safepoints, then this reduces to PROGN.
-  `(symbol-macrolet (#-sb-safepoint (sb-vm::.pseudo-atomic-call-out. t))
+  `(symbol-macrolet (#-(or sb-safepoint nonstop-foreign-call)
+                     (sb-vm::.pseudo-atomic-call-out. t))
      ,@body))
 
 ;;;; other miscellaneous stuff
@@ -105,10 +106,13 @@
           ((name &key lowtag widetag alloc-trans (type t)
                       (size (symbolicate name "-SIZE")))
            &rest slot-specs)
+  (declare (notinline coerce)) ; problem in make-host-2 if inlined
   (collect ((slots) (specials) (constants) (forms) (inits))
     (let ((offset (if widetag 1 0))
           (variable-length-p nil))
-      (dolist (spec slot-specs)
+      (dolist (spec ; flatten vectors in slot-specs before processing them
+               (mapcan (lambda (x) (if (vectorp x) (coerce x 'list) (list x)))
+                       slot-specs))
         (when variable-length-p
           (error "No more slots can follow a :rest-p slot."))
         (destructuring-bind
@@ -186,6 +190,9 @@
                (append *!late-primitive-object-forms*
                        ',(forms)))))))
 
+;;; A special sc-number for encoding errors
+(defconstant negative-immediate-sc-number 61)
+
 ;;; We want small SC-NUMBERs for SCs whose numbers are frequently
 ;;; embedded into machine code. We therefore fix the numbers for the
 ;;; four (i.e two bits) most frequently embedded SCs (empirically
@@ -201,6 +208,9 @@
                (let* ((sc-number (or (cdr (assoc sc-name fixed-numbers))
                                      (1- (incf index))))
                       (constant-name (symbolicate sc-name "-SC-NUMBER")))
+                 (when (= sc-number negative-immediate-sc-number)
+                   (error "sc-number can't be the sames ~a=~a"
+                          'negative-immediate-sc-number negative-immediate-sc-number))
                  `((!define-storage-class ,sc-name ,sc-number
                      ,sb-name ,@args)
                    (defconstant ,constant-name ,sc-number))))))
@@ -217,6 +227,8 @@
 (defconstant sc-offset-limit (ash 1 21))
 (defconstant sc-offset-bits (integer-length (1- sc-offset-limit)))
 (deftype sc-offset () `(integer 0 (,sc-offset-limit)))
+(deftype sc-offset-immediate () `(integer ,(- 1 (ash 1 21)) ;; it's stored as sign-magnitude
+                                          ,(1- (ash 1 21))))
 
 (defconstant finite-sc-offset-limit
   #-(or sparc) 32

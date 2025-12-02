@@ -11,27 +11,32 @@
 
 (in-package "SB-VM")
 
-(defun invoke-asm-routine (name reg &key tail)
+(defun invoke-asm-routine (name reg &key tail
+                                         load-cfp)
   (cond ((or (not (boundp '*component-being-compiled*))
-             (sb-c::code-immobile-p *component-being-compiled*))
+             (code-immobile-p *component-being-compiled*))
+         (when load-cfp
+           (move cfp-tn load-cfp))
          (if tail
              (inst b (make-fixup name :assembly-routine))
              (inst bl (make-fixup name :assembly-routine))))
         (t
          (load-inline-constant reg `(:fixup ,name :assembly-routine))
+         (when load-cfp
+           (move cfp-tn load-cfp))
          (if tail
              (inst br reg)
              (inst blr reg)))))
 
 (defun load-asm-routine (reg name)
   (if (or (not (boundp '*component-being-compiled*))
-          (sb-c::code-immobile-p *component-being-compiled*))
+          (code-immobile-p *component-being-compiled*))
       (inst adr reg (make-fixup name :assembly-routine))
       (load-inline-constant reg `(:fixup ,name :assembly-routine))))
 
 (defun invoke-foreign-routine (name reg &key tail)
   (cond ((or (not (boundp '*component-being-compiled*))
-             (sb-c::code-immobile-p *component-being-compiled*))
+             (code-immobile-p *component-being-compiled*))
          (if tail
              (inst b (make-fixup name :foreign))
              (inst bl (make-fixup name :foreign))))
@@ -44,7 +49,7 @@
 (defun load-foreign-symbol (reg name &key dataref)
   (let ((kind (if dataref :foreign-dataref :foreign)))
     (if (or (not (boundp '*component-being-compiled*))
-            (sb-c::code-immobile-p *component-being-compiled*))
+            (code-immobile-p *component-being-compiled*))
         (if dataref
             (inst ldr reg (make-fixup name kind))
             (inst adr reg (make-fixup name kind)))
@@ -54,7 +59,6 @@
             (loadw reg reg))))))
 
 (defun generate-call-sequence (name style vop options)
-  (declare (ignore options vop))
   (ecase style
     ((:none :raw :full-call-no-return)
      (let ((lr (gensym)))
@@ -63,7 +67,9 @@
             ,lr
             ,@(if (eq style :none)
                   `((invoke-asm-routine ',name tmp-tn :tail t))
-                  `((invoke-asm-routine ',name ,lr)))))
+                  `((invoke-asm-routine ',name ,lr)))
+            ,@(when (assoc :save-p options)
+                `((note-this-location ,vop :single-value-return)))))
         `((:temporary (:sc non-descriptor-reg :from (:eval 0) :to (:eval 1) :offset lr-offset)
                       ,lr)))))))
 

@@ -111,7 +111,8 @@
                                    `(,arg :scs (descriptor-reg any-reg character-reg
                                                 unsigned-reg signed-reg constant
                                                 single-reg double-reg
-                                                complex-single-reg complex-double-reg)
+                                                complex-single-reg complex-double-reg
+                                                (immediate (typep (tn-value tn) 'sc-offset-immediate)))
                                           #+(or immobile-space permgen)
                                           ,@(if (eq name 'sb-c::%type-check-error)
                                                 `(:load-if (type-err-type-tn-loadp ,arg)))))
@@ -135,6 +136,43 @@
   (def "UNREACHABLE"             sb-impl::unreachable         nil)
   (def "FAILED-AVER"             sb-impl::%failed-aver        nil form)
   (def "FILL-POINTER"            fill-pointer-error           nil array))
+
+(define-vop ()
+  (:policy :fast-safe)
+  (:translate op-not-type2-error)
+  (:args
+   (a :scs
+    #1=(descriptor-reg any-reg character-reg unsigned-reg signed-reg constant single-reg double-reg complex-single-reg complex-double-reg
+     (immediate (typep (tn-value tn) 'sc-offset-immediate))))
+   (b :scs #1#))
+  (:info *location-context*)
+  (:arg-types * * (:constant t))
+  (:vop-var vop)
+  (:save-p :compute-only)
+  (:generator 1000
+    (if (policy (sb-c::vop-node vop) (= debug 0))
+        ;; no debug fun is computed and the context is lost,
+        ;; just report the type without the value
+        (error-call vop 'sb-kernel::op-not-type2-error a (emit-constant *location-context*))
+        (error-call vop 'sb-kernel::op-not-type2-error a b))))
+
+(define-vop ()
+  (:policy :fast-safe)
+  (:translate op-not-type1-error)
+  (:args
+   (a :scs
+      (descriptor-reg any-reg character-reg unsigned-reg signed-reg constant single-reg double-reg complex-single-reg complex-double-reg
+                      (immediate (typep (tn-value tn) 'sc-offset-immediate)))))
+  (:info *location-context*)
+  (:arg-types * (:constant t))
+  (:vop-var vop)
+  (:save-p :compute-only)
+  (:generator 1000
+    (if (policy (sb-c::vop-node vop) (= debug 0))
+        ;; no debug fun is computed and the context is lost,
+        ;; just report the type without the value
+        (error-call vop 'sb-kernel::op-not-type1-error (emit-constant *location-context*))
+        (error-call vop 'sb-kernel::op-not-type1-error a))))
 
 
 (defun emit-internal-error (kind code values &key trap-emitter)
@@ -170,18 +208,23 @@
      (prog1 (progn ,@body)
        (push ,var *adjustable-vectors*))))
 
+(defun encode-immediate-error-arg (x)
+  (declare (type sc-offset-immediate x))
+  (make-sc+offset (if (minusp x)
+                      negative-immediate-sc-number
+                      immediate-sc-number)
+                  (abs x)))
+
 (defun encode-internal-error-args (values)
   (with-adjustable-vector (vector)
     (dolist (where values)
       (write-var-integer
        ;; WHERE can be either a TN or a packed SC number + offset
-       (cond ((consp where)
-              (make-sc+offset immediate-sc-number (car where)))
-             ((not (tn-p where))
+       (cond ((not (tn-p where))
               where)
              ((and (sc-is where immediate)
                    (fixnump (tn-value where)))
-              (make-sc+offset immediate-sc-number (tn-value where)))
+              (encode-immediate-error-arg (tn-value where)))
              (t
               (make-sc+offset (if (and (sc-is where immediate)
                                        (typep (tn-value where) '(or symbol layout)))

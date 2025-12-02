@@ -29,12 +29,7 @@
                     ;; EVAL-WHEN is necessary because stuff like #.EAX-OFFSET
                     ;; (in the same file) depends on compile-time evaluation
                     ;; of the DEFCONSTANT. -- AL 20010224
-                (defconstant ,(symbolicate name "-OFFSET") ,offset)))
-           (defregset (name &rest regs)
-             `(defglobal ,name
-                  (list ,@(mapcar (lambda (name)
-                                    (symbolicate name "-OFFSET"))
-                                  regs)))))
+                (defconstant ,(symbolicate name "-OFFSET") ,offset))))
 
   ;; byte registers
   ;;
@@ -89,8 +84,7 @@
   ;; the number of arguments/return values passed in registers
   (defconstant  register-arg-count 3)
   ;; names and offsets for registers used to pass arguments
-  (eval-when (:compile-toplevel :load-toplevel :execute)
-    (defparameter *register-arg-names* '(edx edi esi)))
+  (defconstant-eqx register-arg-names '(edx edi esi) #'equal)
   (defregset    *register-arg-offsets* edx edi esi))
 
 ;;;; SB definitions
@@ -319,10 +313,10 @@
   (def-misc-reg-tns single-reg fr0 fr1 fr2 fr3 fr4 fr5 fr6 fr7))
 
 ;;; TNs for registers used to pass arguments
-(defparameter *register-arg-tns*
+(define-load-time-global *register-arg-tns*
   (mapcar (lambda (register-arg-name)
             (symbol-value (symbolicate register-arg-name "-TN")))
-          *register-arg-names*))
+          register-arg-names))
 
 ;;; FIXME: doesn't seem to be used in SBCL
 #|
@@ -417,7 +411,7 @@
                                         ; related to signal context stuff
 
 ;;; This is used by the debugger.
-(defconstant single-value-return-byte-offset 2)
+(defconstant single-value-return-byte-offset 0)
 
 ;;; This function is called by debug output routines that want a pretty name
 ;;; for a TN's location. It returns a thing that can be printed with PRINC.

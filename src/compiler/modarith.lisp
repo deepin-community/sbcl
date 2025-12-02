@@ -137,18 +137,19 @@
 
 (defmacro define-modular-fun-optimizer
     (name ((&rest lambda-list) kind signedp &key (width (gensym "WIDTH"))
-                                                 result-width)
+                                                 result-width
+                                                 (node (gensym "NODE")))
      &body body)
   (%check-modular-fun-macro-arguments name kind lambda-list)
-  (with-unique-names (call args result-width-name)
+  (with-unique-names (args result-width-name)
     `(setf (gethash ',name (modular-class-funs (find-modular-class ',kind ',signedp)))
-           (lambda (,call ,width ,(or result-width
+           (lambda (,node ,width ,(or result-width
                                    result-width-name))
-             (declare (type basic-combination ,call)
+             (declare (type basic-combination ,node)
                       (type (integer 0) ,width)
                       ,@(unless result-width
                           `((ignore ,result-width-name))))
-             (let ((,args (basic-combination-args ,call)))
+             (let ((,args (basic-combination-args ,node)))
                (when (= (length ,args) ,(length lambda-list))
                  (destructuring-bind ,lambda-list ,args
                    (declare (type lvar ,@lambda-list))
@@ -216,6 +217,9 @@
                  (setf (block-reoptimize (node-block node)) t)
                  (reoptimize-component (node-component node) :maybe))
                t)
+             (change-return-type (node type)
+               (setf (node-derived-type node) type)
+               (setf (lvar-%derived-type (node-lvar node)) nil))
              (cut-node (node)
                "Try to cut a node to width. The primary return value is
                 whether we managed to cut (cleverly), and the second whether
@@ -240,10 +244,7 @@
                              (t
                               (change-ref-leaf node (find-constant new-value)
                                                :recklessly t)
-                              (let ((lvar (node-lvar node)))
-                                (setf (lvar-%derived-type lvar)
-                                      (and (lvar-has-single-use-p lvar)
-                                           (make-values-type (list (ctype-of new-value))))))
+                              (change-return-type node (make-values-type (list (ctype-of new-value))))
                               (setf (block-reoptimize (node-block node)) t)
                               (reoptimize-component (node-component node) :maybe)
                               (values t t)))))))
@@ -300,13 +301,31 @@
                                  ;; Can't rely on REOPTIMIZE-NODE, as it may neve get reoptimized.
                                  ;; But the outer functions don't want the type to get
                                  ;; widened and their VOPs may never be applied.
-                                 (setf (node-derived-type node)
-                                       (fun-type-returns (global-ftype (if (eq name t)
-                                                                           fun-name
-                                                                           name))))
-                                 (setf (lvar-%derived-type (node-lvar node)) nil)
+                                 (change-return-type node
+                                                     (fun-type-returns (global-ftype (if (eq name t)
+                                                                                         fun-name
+                                                                                         name))))
                                  (ir1-optimize-combination node))
-                               (values t did-something over-wide)))))))))
+                               (values t did-something over-wide)))))))
+                 (cast
+                  ;; Cut (logand (+ x 1) m), which is (logand (the integer (+ x 1)) m),
+                  ;; and X can only be an integer for that to be true.
+                  (when (eq (cast-type-to-check node)
+                            (specifier-type 'integer))
+                    (let (did-something)
+                      (do-uses (combination (cast-value node))
+                        (when (and (combination-matches* '(+ -) '(* *) combination)
+                                   (almost-immediately-used-p (node-lvar combination) combination
+                                                              :flushable t))
+                          (destructuring-bind (a b) (combination-args combination)
+                            (when (or (not (types-equal-or-intersect (lvar-type a)
+                                                                     #1=(specifier-type '(or ratio (complex rational)))))
+                                      (not (types-equal-or-intersect (lvar-type b) #1#)))
+                              (when (cut-node combination)
+                                (setf did-something t))))))
+                      (when did-something
+                        (change-return-type node (values-specifier-type '(values integer &optional))))
+                      nil)))))
              (cut-lvar (lvar &key head
                         &aux did-something must-insert over-wide)
                "Cut all the LVAR's use nodes. If any of them wasn't handled
@@ -359,7 +378,6 @@
              (cond
                ((eq signedp (cdr w)) (<= width (car w)))
                ((eq signedp nil) (< width (car w))))))
-      (declare (dynamic-extent #'inexact-match))
       (let ((tgt (find-if #'inexact-match twidths)))
         (when tgt
           (return-from best-modular-version
@@ -734,3 +752,39 @@
             `(sb-vm::calc-phash val ,n-temps ,steps)
             form)))))
 )
+
+#+(or arm64 x86-64)
+(progn
+  (defknown sb-vm::truncate-mod64 (sb-vm:signed-word sb-vm:signed-word)
+      (values word sb-vm:signed-word)
+      (foldable flushable movable))
+
+  (defoptimizer (sb-vm::truncate-mod64 derive-type) ((n d) node)
+    (let ((res (truncate-derive-type-optimizer node)))
+      (when res
+        (destructuring-bind (q r) (values-type-required res)
+          (make-values-type  (list (%two-arg-derive-type q
+                                                         (specifier-type `(eql ,(ldb (byte sb-vm:n-word-bits 0) -1)))
+                                                         #'logand-derive-type-aux)
+                                   r))))))
+
+  (deftransform sb-vm::truncate-mod64 ((n d) * * :node node)
+    (let ((truncate-type (truncate-derive-type-optimizer node)))
+      (if (and truncate-type
+               (values-subtypep truncate-type
+                                (values-specifier-type `(values sb-vm:signed-word t &optional))))
+          `(multiple-value-bind (q r) (truncate n d)
+             (values (logand q ,most-positive-word)
+                     r))
+          (give-up-ir1-transform))))
+
+  (define-modular-fun-optimizer truncate
+      ((n d) :untagged nil :width width :node node)
+    (when (and (= width sb-vm:n-word-bits)
+               (not (values-subtypep (node-derived-type node)
+                                     (values-specifier-type `(values sb-vm:signed-word t &optional))))
+               (csubtypep (lvar-type n) (specifier-type 'sb-vm:signed-word))
+               (csubtypep (lvar-type d) (specifier-type 'sb-vm:signed-word)))
+      'sb-vm::truncate-mod64))
+  (setf (gethash 'sb-vm::truncate-mod64 (modular-class-versions (find-modular-class ':untagged 'nil)))
+        `(truncate ,sb-vm:n-word-bits)))

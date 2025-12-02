@@ -101,6 +101,7 @@
                 :type (member :beginning
                               :block-boundary
                               nil))
+  (previous-chunk) ; as an integer, however much was fetched
   (known-register-contents)
 
   ;; alist of (address . label-number)
@@ -116,7 +117,7 @@
   (cur-offs-hooks nil :type list)
 
   ;; for the current location
-  (notes nil :type list)
+  (notes nil) ; a single note or a list of notes
 
   ;; currently active source variables
   (current-valid-locations nil :type (or null (vector bit))))

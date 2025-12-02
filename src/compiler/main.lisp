@@ -436,12 +436,12 @@ necessary, since type inference may take arbitrarily long to converge.")
   (when (component-reanalyze component)
     (maybe-mumble "DFO")
     (loop
-     (find-dfo component)
+      (find-dfo component)
       (unless (component-reanalyze component)
         (maybe-mumble " ")
         (return))
-      (maybe-mumble "."))
-    t))
+      (maybe-mumble ".")))
+  (values))
 
 (defvar *ir1-transforms-after-constraints*)
 (defvar *ir1-transforms-after-ir1-phases*)
@@ -511,6 +511,9 @@ necessary, since type inference may take arbitrarily long to converge.")
         (*delayed-ir1-transforms* nil))
     (declare (special *constraint-universe* *delayed-ir1-transforms*))
     (ir1-optimize-phase-1 component)
+    (when *compiler-trace-output*
+      (when (memq :checkgen *compile-trace-targets*)
+        (describe-component component *compiler-trace-output*)))
     (loop while (progn
                   (maybe-mumble "Type ")
                   (generate-type-checks component))
@@ -574,10 +577,9 @@ necessary, since type inference may take arbitrarily long to converge.")
   (maybe-mumble "IR2Tran ")
   (entry-analyze component)
 
-    ;; For on-demand recalculation of dominators, the previously
-    ;; computed results may be stale.
-
-  (clear-dominators component)
+  ;; Recompute dominators for GC store barriers. Must be done before
+  ;; IR2-convert renumbers blocks according to forward emit order.
+  (find-dominators component)
 
   (ir2-convert component)
 
@@ -814,19 +816,20 @@ necessary, since type inference may take arbitrarily long to converge.")
   (values))
 
 (defun describe-ir2-component (component *standard-output*)
-  (format t "~%~|~%;;;; IR2 component: ~S~2%" (component-name component))
-  (format t "entries:~%")
-  (dolist (entry (ir2-component-entries (component-info component)))
-    (format t "~4TL~D: ~S~:[~; [closure]~]~%"
-            (label-id (entry-info-offset entry))
-            (entry-info-name entry)
-            (entry-info-closure-tn entry)))
-  (terpri)
-  (pre-pack-tn-stats component *standard-output*)
-  (terpri)
-  (print-ir2-blocks component)
-  (terpri)
-  (values))
+  (let ((*print-readably* nil))
+    (format t "~%~|~%;;;; IR2 component: ~S~2%" (component-name component))
+    (format t "entries:~%")
+    (dolist (entry (ir2-component-entries (component-info component)))
+      (format t "~4TL~D: ~S~:[~; [closure]~]~%"
+              (label-id (entry-info-offset entry))
+              (entry-info-name entry)
+              (entry-info-closure-tn entry)))
+    (terpri)
+    (pre-pack-tn-stats component *standard-output*)
+    (terpri)
+    (print-ir2-blocks component)
+    (terpri)
+    (values)))
 
 ;;; Leave this as NIL if you want modern, rational, correct, behavior,
 ;;; or switch it to T for legacy (CLHS-specified) bullshit a la
@@ -1123,11 +1126,18 @@ necessary, since type inference may take arbitrarily long to converge.")
 ;;; Print some noise about FORM if *COMPILE-PRINT* is true.
 (defun note-top-level-form (form)
   (when *compile-print*
-    (let ((*print-length* 2)
-          (*print-level* 2)
-          (*print-pretty* nil))
-      (with-compiler-io-syntax
-        (compiler-mumble "~&; processing ~S" form)))))
+    (multiple-value-bind (*print-length* *print-level*)
+        (if (typep form '(cons (eql defmethod)))
+            (values (loop for i from 1
+                          for cdr on form
+                          when (or (atom cdr)
+                                   (listp (car cdr)))
+                          return i)
+                    5)
+            (values 2 2))
+      (let ((*print-pretty* nil))
+        (with-compiler-io-syntax
+          (compiler-mumble "~&; processing ~S" form))))))
 
 ;;; Handle the evaluation the a :COMPILE-TOPLEVEL body during
 ;;; compilation. Normally just evaluate in the appropriate
@@ -1731,8 +1741,10 @@ necessary, since type inference may take arbitrarily long to converge.")
 (defglobal *compile-elapsed-time* 0) ; nanoseconds
 (defglobal *compile-file-elapsed-time* 0) ; nanoseconds
 (defun get-thread-virtual-time ()
-  #+(and linux (not sb-xc-host)) (sb-unix:clock-gettime sb-unix:clock-thread-cputime-id)
-  #-(and linux (not sb-xc-host)) (values 0 0))
+  #+(and linux sb-devel (not sb-xc-host))
+  (return-from get-thread-virtual-time
+    (sb-unix:clock-gettime sb-unix:clock-thread-cputime-id))
+  (values 0 0))
 
 (defun accumulate-compiler-time (symbol start-sec start-nsec)
   (declare (ignorable symbol start-sec start-nsec))

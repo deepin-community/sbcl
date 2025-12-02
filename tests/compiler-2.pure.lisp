@@ -48,7 +48,8 @@
                    :allow-style-warnings t)
   ;; The sequence must contain a mixture of symbols and non-symbols
   ;; to call %FIND-POSITION. If only symbols, it makes no calls.
-  (let ((calls (ctu:ir1-funargs '(lambda (x) (position x '(1 2 3 a b c 4 5 6 d e f g) :from-end t)))))
+  (let ((calls (ctu:ir1-funargs '(lambda (x)
+                                  (position x '(1 2 3 a b c 4 5 6 d e f g "x") :from-end t)))))
     ;; Assert that the default :TEST of #'EQL was strength-reduced to #'EQ
     (assert (equal calls '((sb-kernel:%find-position identity eq)))))
   (checked-compile-and-assert ()
@@ -310,11 +311,9 @@
                             (map-into (make-string 10) #'evenp z))))
 
 (with-test (:name (:type-conflict complement))
-  (assert (nth-value 3
-                     (checked-compile
-                      `(lambda (z)
-                         (find z "l" :test (complement #'=)))
-                      :allow-style-warnings t))))
+  (compiles-with-warning
+   `(lambda (z)
+      (find z "l" :test (complement #'=)))))
 
 (with-test (:name :type-across-hairy-lambda-transforms)
   (assert (subtypep (sb-kernel:%simple-fun-type
@@ -4241,17 +4240,6 @@
                       (:nest (f5 d)))))))
     ((1) nil)))
 
-(with-test (:name :type-derivers-type-widening)
-  (checked-compile-and-assert
-      ()
-      `(lambda (b c)
-         (logbitp 0
-                  (if (eql c 0)
-                      (max (ignore-errors c) 0)
-                      b)))
-      ((1 2) t)
-      ((0 0) nil)))
-
 (with-test (:name :propagate-to-refs-hairy)
   (checked-compile-and-assert
       ()
@@ -4597,3 +4585,345 @@
            (apply #'list b list)))
     ((t 1) '(1 2 3) :test #'equal)
     ((nil 1) '(1 1) :test #'equal)))
+
+(declaim (ftype (function (integer t)) setf-on-ftype))
+
+
+(with-test (:name :setf-on-ftype)
+  (checked-compile-and-assert
+   (:optimize :safe)
+   `(sb-int:named-lambda setf-on-ftype (x j)
+      (setf x j)
+      x)
+   ((nil 1) (condition 'type-error))
+   ((1 nil) nil))
+  (assert-type
+   (sb-int:named-lambda setf-on-ftype (x j)
+     (when j
+       (incf x))
+     x)
+   integer))
+
+(with-test (:name :late-inline-return-from)
+  (checked-compile `(lambda (r)
+                      ((lambda ()
+                         (block nil
+                           (flet ((f ()
+                                    (or (funcall r)
+                                        (return))))
+                             (declare (inline f))
+                             (when (f)
+                               (f)))))))
+                   :allow-notes 'code-deletion-note))
+
+(declaim (ftype (function (&key (:a fixnum)) t) ftype-test-key)
+         (ftype (function (&optional fixnum) t) ftype-test-opt)
+         (ftype (function (&optional fixnum &key (:b integer)) t) ftype-test-opt-key))
+(defun ftype-test-key (&key (a nil))
+  a)
+(defun ftype-test-opt (&optional (a nil))
+  a)
+(defun ftype-test-opt-key (&optional (a nil) &key (b nil))
+  (declare (muffle-conditions style-warning))
+  (values a b))
+
+(compile 'ftype-test-key)
+(compile 'ftype-test-opt)
+(compile 'ftype-test-opt-key)
+
+(with-test (:name :ftype-optional)
+  (checked-compile-and-assert
+   ()
+   `(lambda ()
+      (ftype-test-opt))
+   (() nil))
+  (checked-compile-and-assert
+   ()
+   `(lambda ()
+      (ftype-test-key))
+   (() nil))
+  (checked-compile-and-assert
+   ()
+   `(lambda (a)
+      (ftype-test-key :a a))
+   ((nil) (condition 'type-error)))
+  (checked-compile-and-assert
+   ()
+   `(lambda (a)
+      (ftype-test-opt a))
+   ((nil) (condition 'type-error)))
+  (checked-compile-and-assert
+    ()
+   `(lambda (a)
+      (ftype-test-opt-key a))
+   ((nil) (condition 'type-error)))
+  (checked-compile-and-assert
+    ()
+   `(lambda (a b)
+      (ftype-test-opt-key a :b b))
+   ((0 nil) (condition 'type-error)))
+  (assert (type-specifiers-equal
+           (caddr
+            (sb-kernel:%simple-fun-type #'ftype-test-key))
+           '(values (or null fixnum) &optional)))
+  (assert (type-specifiers-equal
+           (caddr
+            (sb-kernel:%simple-fun-type #'ftype-test-opt))
+           '(values (or null fixnum) &optional))))
+
+;;; This trivial function failed to compile due to rev 88d078fe
+(with-test (:name :make-list-reduce)
+  (checked-compile
+   `(lambda (&key k)
+      (make-list (reduce #'max (mapcar #'length k))))))
+
+
+(with-test (:name :cdr-union-types)
+  (assert-type
+   (lambda (x)
+     (cdr (assoc x '((a . 1) (b . 2)))))
+   (or (eql 1) (eql 2) null))
+  (assert-type
+   (lambda (x)
+     (declare ((member a b) x)
+              (optimize speed))
+     (car (assoc x '((a . 1) (b . 3)))))
+   (member a b)))
+
+(with-test (:name :pop-type)
+  (assert-type
+   (lambda (n)
+     (let ((x '(1 2 3)))
+       (when n
+         (setf x (cdr x)))
+       (car x)))
+   (or null (integer 1 3)))
+  (assert-type
+   (lambda ()
+     (let ((x '(1 2 3)))
+       (values (pop x) (pop x))))
+   (values (integer 1 3) (or null (integer 1 3)) &optional))
+  (assert-type
+   (lambda ()
+     (declare (optimize speed (debug 1)))
+     (destructuring-bind (a b) '(1 2)
+       (values a b)))
+   (values (integer 1 2) (or null (integer 1 2)) &optional))
+  (assert-type
+   (lambda (n)
+     (loop for x in '(a b c)
+           when (eql n x)
+           return x))
+   symbol)
+  (assert-type
+   (lambda (n)
+     (let ((x '(1 2 (10))))
+       (dolist (x x)
+         (when (eql x n)
+           (return x)))))
+   (or list (integer 1 2)))
+  (assert-type
+   (lambda (n)
+     (declare (optimize (debug 2)))
+     (let ((x '(1 2 3)))
+       (dolist (x x)
+         (when (eql x n)
+           (return x)))))
+   (or (integer 1 3) null))
+  (assert-type
+   (lambda (x)
+     (do ((cdr '(1 2 3) (cdr cdr)))
+         ((null cdr))
+       (declare (list cdr))
+       (let ((car (car cdr)))
+         (when (eq car x)
+           (return car)))))
+   (or (integer 1 3) null))
+  (assert-type
+   (lambda (j)
+     (declare (optimize (debug 2)))
+     (let ((x nil))
+       (labels ((f ()
+                  (pop x)))
+         (when j
+           (f)
+           (f)))
+       x))
+   null)
+  (assert-type
+   (lambda (j)
+     (block nil
+       (map nil (lambda (x) (when j (return x))) '(1 2 3))
+       0))
+   (integer 0 3))
+  (assert-type
+   (lambda (j)
+     (block nil
+       (map nil (lambda (x) (when j (return (+ x 1)))) nil)
+       0))
+   (eql 0)))
+
+(with-test (:name :test-headers-lowtag-only)
+  (checked-compile-and-assert
+   ()
+   `(lambda (a)
+      (declare ((or hash-table string)  a))
+      (typep a '(or simple-vector string)))
+    (("") t)
+    (((make-hash-table)) nil)))
+
+(with-test (:name :&rest-escaping)
+  (let ((wrapper (lambda (x)
+                   (let ((list (list -1 -2)))
+                     (declare (dynamic-extent list))
+                     (opaque-identity list)
+                     (funcall x)))))
+    (checked-compile-and-assert
+        ()
+        `(lambda (control &rest arguments)
+           (lambda ()
+             (with-standard-io-syntax
+               (apply #'format nil control arguments))))
+      (("~a~a~a" 1 2 3) "123" :test (lambda (f a)
+                                      (assert (equal (funcall wrapper (car f)) (car a)))
+                                      t)))))
+
+(with-test (:name :&rest-escaping.recursive-reference)
+  (checked-compile-and-assert
+   ()
+   `(lambda (control &rest arguments)
+      (labels ((f ()
+                 (opaque-identity #'g)
+                 (apply #'format nil control arguments))
+               (g ()
+                 (opaque-identity #'f #'f)))
+        (declare (dynamic-extent #'g #'f))
+        (opaque-identity #'g)
+        (opaque-identity #'f)
+        (f)))
+   (("~a~a~a" 1 2 3) "123")))
+
+(with-test (:name :car-eq-if-listp)
+  (let ((f (compile nil '(lambda (x) (typep x '(cons (eql t)))))))
+    (assert (eq (funcall f '(t)) t))
+    (assert (eq (funcall f '(1)) nil))))
+
+(with-test (:name :apply-list-if)
+  (let ((f (compile nil '(lambda (p) (apply #'list (if p '(a b) '(c d)))))))
+    (assert (equal (funcall f t) '(a b)))
+    (assert (equal (funcall f nil) '(c d)))))
+
+(with-test (:name :values-list-if)
+  (let ((f (compile nil '(lambda (p) (values-list (if p '(a) ()))))))
+    (multiple-value-call (lambda (x) (assert (eql x 'a))) (funcall f t))
+    (multiple-value-call (lambda () t) (funcall f nil))))
+
+(with-test (:name :no-notes-list-vs-or-null)
+  (checked-compile `(lambda (l)
+                      (declare (list l)
+                               (optimize speed))
+                      (coerce l 'vector))
+                   :allow-notes nil))
+
+(with-test (:name :flushable-combination-args-p-lost-annotation)
+  (checked-compile-and-assert
+      ()
+      `(lambda (b)
+         (declare (vector b))
+         (let ((j))
+           (find 1 b :key (lambda (x)
+                            (setf j x)))
+           j))
+    ((#(2)) 2)))
+
+(with-test (:name :constant-fold-variables)
+  (assert-type
+   (lambda ()
+     (declare (optimize (debug 2)))
+     (let ((x #(a b)))
+       (aref x 0)))
+   (eql a)))
+
+(with-test (:name :funcall-externally-checkable-type)
+  (checked-compile-and-assert
+   (:optimize :safe)
+   `(lambda (n m)
+      (funcall (the (function ((signed-byte 33)) t)
+                    (if m
+                        (lambda (x) x)
+                        (lambda (x) (1+ x))))
+               n))
+   (('a t) (condition 'type-error))
+   (((expt 2 33) nil) (condition 'type-error))
+   ((1 t) 1)
+   ((2 nil) 3))
+  (checked-compile-and-assert
+   (:optimize :safe)
+   `(lambda (n f)
+      (funcall (the (function ((signed-byte 33)) t)
+                    f)
+               n))
+   (('a #'-) (condition 'type-error))
+   ((1 #'-) -1))
+  (checked-compile-and-assert
+   (:optimize :safe)
+   `(lambda (n)
+      (funcall (the (function ((signed-byte 33)) t)
+                    #'opaque-identity)
+               n))
+   (("a") (condition 'type-error))
+   ((2) 2))
+  (checked-compile-and-assert
+   (:optimize :safe)
+   `(lambda (n j)
+      (funcall (the (function ((signed-byte 33)) (values symbol &optional))
+                    (lambda (x) (when (evenp x)
+                                  j)))
+               n))
+   ((2 'a) 'a)
+   ((2 1) (condition 'type-error))))
+
+(with-test (:name :cast-move-exit)
+  (checked-compile-and-assert
+      (:optimize :safe)
+      `(lambda (m f)
+         (+ m (catch t (funcall f) 0)))
+    ((1 #'list) 1)
+    ((1 (lambda () (throw t 1))) 2)
+    ((1 (lambda () (throw t t))) (condition 'type-error)))
+  (checked-compile-and-assert
+      (:optimize :safe)
+      `(lambda (f)
+         (the number (catch t (funcall f) 2)))
+    ((#'list) 2)
+    (((lambda () (throw t 3))) 3)
+    (((lambda () (throw t t))) (condition 'type-error)))
+  (checked-compile-and-assert
+      (:optimize :safe)
+      `(lambda (f)
+         (the number (values (catch t (funcall f) 2))))
+    ((#'list) 2)
+    (((lambda () (throw t 3))) 3)
+    (((lambda () (throw t t))) (condition 'type-error)))
+  (checked-compile-and-assert
+      (:optimize :safe)
+      `(lambda (f)
+         (values (the number (catch t (funcall f) 2))))
+    ((#'list) 2)
+    (((lambda () (throw t 3))) 3)
+    (((lambda () (throw t t))) (condition 'type-error))))
+
+(with-test (:name :apply-type-derivation)
+  (assert-type
+   (lambda (r)
+     (apply #'concatenate 'vector r))
+   simple-vector)
+  (assert-type
+   (lambda (a r)
+     (declare ((array double-float) a))
+     (apply #'aref a r))
+   double-float)
+  (assert-type
+   (lambda (r)
+     (apply #'make-array 1 :element-type t r))
+   (vector t)))

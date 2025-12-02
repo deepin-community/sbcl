@@ -1,7 +1,15 @@
-#+gc-stress
-(sb-thread:make-thread (lambda ()
-                         (loop (gc :full t) (sleep 0.001)))
-                       :name "gc stress")
+#+(and gc-stress (not gc-stress-delay))
+(progn
+  #+sb-thread
+  (sb-thread:make-thread (lambda ()
+                           (loop (gc :full t) (sleep 0.001)))
+                         :name "gc stress")
+  #-sb-thread
+  (sb-ext:schedule-timer (make-timer (lambda () (gc :full t))) 0.1 :repeat-interval 0.005))
+
+#+gc-verify
+(setf (sb-alien:extern-alien "verify_gens" char) 0
+      (extern-alien "pre_verify_gen_0" int) 1)
 
 (defpackage :test-util
   (:use :cl :sb-ext)
@@ -458,7 +466,8 @@
                      (= safety 3))))
     ((eql :safe)
      (list :filter (lambda (&key speed safety &allow-other-keys)
-                     (and (> safety 0) (>= safety speed)))))
+                     (and (> safety 0) (>= safety speed)))
+           :compilation-speed 1 :space 1))
     ((eql :quick)
      '(:compilation-speed 1 :space 1))
     ((eql :quick/incomplete)

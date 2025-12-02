@@ -224,8 +224,8 @@
   (:generator 2
     (load-foreign-symbol res foreign-symbol :dataref t)))
 
-#+sb-safepoint
-(defconstant thread-saved-csp-slot (- (1+ sb-vm::thread-header-slots)))
+#+(or sb-safepoint nonstop-foreign-call)
+(defconstant thread-saved-csp-slot -1)
 
 (defconstant-eqx +destroyed-c-registers+
   (loop for i from 0 to 18 collect i)
@@ -246,7 +246,7 @@
         (storew-pair csp-tn thread-control-frame-pointer-slot temp thread-control-stack-pointer-slot thread-tn)
         ;; OK to run GC without stopping this thread from this point
         ;; on.
-        #+sb-safepoint
+        #+(or sb-safepoint nonstop-foreign-call)
         (storew csp-tn thread-tn thread-saved-csp-slot)
         (cond ((stringp function)
                (invoke-foreign-routine function cfunc))
@@ -267,9 +267,9 @@
                        (make-random-tn (sc-or-lose 'descriptor-reg) reg)
                        0))
         ;; No longer OK to run GC except at safepoints.
-        #+sb-safepoint
-        (storew zr-tn thread-tn thread-saved-csp-slot)
-        (storew zr-tn thread-tn thread-control-stack-pointer-slot))
+        #+(or sb-safepoint nonstop-foreign-call)
+        (storew zr-tn thread-tn thread-saved-csp-slot))
+      (storew zr-tn thread-tn thread-control-stack-pointer-slot)
       return
       #-sb-thread
       (progn
@@ -359,7 +359,6 @@
            (r1-tn (make-tn 1))
            (r2-tn (make-tn 2))
            (r3-tn (make-tn 3))
-           (r4-tn (make-tn 4))
            (temp-tn (make-tn 9))
            (nsp-save-tn (make-tn 10))
            (gprs (loop for i below 8
@@ -436,23 +435,18 @@
                    (incf arg-count))
                   (t
                    (bug "Unknown alien type: ~S" type)))))
-        ;; arg0 to FUNCALL3 (function)
-        (load-immediate-word r0-tn (static-fdefn-fun-addr 'enter-alien-callback))
-        (loadw r0-tn r0-tn)
         ;; arg0 to ENTER-ALIEN-CALLBACK (trampoline index)
-        (inst mov r1-tn (fixnumize index))
+        (inst mov r0-tn (fixnumize index))
         ;; arg1 to ENTER-ALIEN-CALLBACK (pointer to argument vector)
-        (inst mov-sp r2-tn nsp-tn)
+        (inst mov-sp r1-tn nsp-tn)
         ;; add room on stack for return value
         (inst sub nsp-tn nsp-tn (* n-word-bytes 2))
         ;; arg2 to ENTER-ALIEN-CALLBACK (pointer to return value)
-        (inst mov-sp r3-tn nsp-tn)
+        (inst mov-sp r2-tn nsp-tn)
 
         ;; Call
-        (load-immediate-word r4-tn (foreign-symbol-address
-                                    #-sb-thread "funcall3"
-                                    #+sb-thread "callback_wrapper_trampoline"))
-        (inst blr r4-tn)
+        (load-immediate-word r3-tn (foreign-symbol-address "callback_wrapper_trampoline"))
+        (inst blr r3-tn)
 
         ;; Result now on top of stack, put it in the right register
         (cond

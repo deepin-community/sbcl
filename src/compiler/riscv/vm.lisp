@@ -34,11 +34,6 @@
                `(eval-when (:compile-toplevel :load-toplevel :execute)
                   (defconstant ,offset-sym ,offset)
                   (setf (svref *register-names* ,offset-sym) ,(symbol-name name)))))
-           (defregset (name &rest regs)
-             (flet ((offset-namify (n) (symbolicate n "-OFFSET")))
-               `(eval-when (:compile-toplevel :load-toplevel :execute)
-                  (defparameter ,name
-                    (list ,@(mapcar #'offset-namify regs))))))
            (define-argument-register-set (&rest args)
              `(progn
                 (defregset *register-arg-offsets* ,@args)
@@ -266,7 +261,7 @@
 (defconstant ra-save-offset 1)
 (defconstant nfp-save-offset 2)
 
-(defparameter *register-arg-tns*
+(define-load-time-global *register-arg-tns*
   (let ((drsc (sc-or-lose 'descriptor-reg)))
     (flet ((make (n) (make-random-tn drsc n)))
       (mapcar #'make *register-arg-offsets*))))

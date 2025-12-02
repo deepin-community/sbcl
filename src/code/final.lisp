@@ -249,8 +249,10 @@ Examples:
   ;; I believe that most finalizers will *not* have the :DONT-SAVE flag set.
   ;; As evidence the https://github.com/trivial-garbage/trivial-garbage portability
   ;; library does not offer a way to specify :DONT-SAVE.
+  ;;
+  ;; FIXME: This is quite a lousy reason to reach for MAKE-VALUE-CELL.
   (let ((action
-         (if dont-save (sb-sys:%primitive sb-vm::make-value-cell function nil) function)))
+          (if dont-save (sb-vm::make-value-cell function) function)))
     (with-pinned-objects (object)
       #+weak-vector-readbarrier
       (with-system-mutex (*finalizer-lock*)
@@ -308,7 +310,7 @@ Examples:
       (sb-vm::reconstitute-object (sb-lockless:so-key node))))
 
 ;;; Perform various cleanups around finalizers
-(defglobal *saved-finalizers* nil)
+(define-load-time-global *saved-finalizers* nil)
 (defun finalizers-deinit (&aux save)
   (labels
       ((filter-actions (object actions)
@@ -465,10 +467,11 @@ Examples:
 ;;;   FINALIZER-THREAD-{START,STOP}, S-L-A-D, SB-POSIX:FORK
 (defun finalizer-thread-start ()
   (with-system-mutex (sb-thread::*make-thread-lock*)
-    #+(and unix sb-safepoint)
-    (sb-thread::make-system-thread "sigwait"
-                                   #'sb-unix::signal-handler-loop
-                                   nil 'sb-unix::*sighandler-thread*)
+    #+unix
+    (when (or #+sb-safepoint t (member :address-sanitizer *features*))
+      (sb-thread::make-system-thread "sigwait"
+                                     #'sb-unix::signal-handler-loop
+                                     nil 'sb-unix::*sighandler-thread*))
     (aver (not *finalizer-thread*))
     (setf finalizer-thread-runflag 1)
     (setq *finalizer-thread* :start)
@@ -492,14 +495,14 @@ Examples:
 ;;; You should almost always invoke this with *MAKE-THREAD-LOCK* held.
 ;;; Some tests violate that, but they know what they're doing.
 (defun finalizer-thread-stop ()
-  #+(and unix sb-safepoint)
+  #+unix ; there may or may not be a dedicated signal-receiving thread
   (let ((thread sb-unix::*sighandler-thread*))
-    (aver (sb-thread::thread-p thread))
-    (setq sb-unix::*sighandler-thread* nil)
-    ;; This kill causes the thread's sigwait() syscall to return normally
-    ;; and then not invoke any handler.
-    (sb-unix:pthread-kill (sb-thread::thread-os-thread thread) sb-unix:sigterm)
-    (sb-thread:join-thread thread))
+    (when (sb-thread::thread-p thread)
+      (setq sb-unix::*sighandler-thread* nil)
+      ;; This kill causes the thread's sigwait() syscall to return normally
+      ;; and then not invoke any handler.
+      (sb-unix:pthread-kill (sb-thread::thread-os-thread thread) sb-unix:sigterm)
+      (sb-thread:join-thread thread)))
   (let ((thread *finalizer-thread*))
     (aver (sb-thread::thread-p thread))
     (without-interrupts ;; don't unwind while holding finalizer_mutex

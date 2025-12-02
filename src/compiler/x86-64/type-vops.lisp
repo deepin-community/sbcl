@@ -70,15 +70,20 @@
     (case n-fixnum-tag-bits
      (1
       (%lea-for-lowtag-test temp value other-pointer-lowtag :qword)
-      (when (types-equal-or-intersect (tn-ref-type value-tn-ref)
-                                      (specifier-type 'fixnum))
-        (inst test :byte temp 1)
-        (inst jmp :nz (if not-p drop-through target))) ; inverted
-      (when (or (/= immediate single-float-widetag)
-                (types-equal-or-intersect (tn-ref-type value-tn-ref)
-                                          (specifier-type 'single-float)))
-        (inst cmp :byte temp (- immediate other-pointer-lowtag))
-        (inst jmp :e (if not-p drop-through target)))
+      (cond ((and (eq immediate single-float-widetag)
+                  (number-or-other-pointer-tn-ref-p value-tn-ref))
+             (inst test :byte temp lowtag-mask)
+             (inst jmp :nz (if not-p drop-through target)))
+            (t
+             (when (types-equal-or-intersect (tn-ref-type value-tn-ref)
+                                             (specifier-type 'fixnum))
+               (inst test :byte temp 1)
+               (inst jmp :nz (if not-p drop-through target))) ; inverted
+             (when (or (/= immediate single-float-widetag)
+                       (types-equal-or-intersect (tn-ref-type value-tn-ref)
+                                                 (specifier-type 'single-float)))
+               (inst cmp :byte temp (- immediate other-pointer-lowtag))
+               (inst jmp :e (if not-p drop-through target)))))
 
       (%test-headers value temp target not-p nil headers
                      :drop-through drop-through :compute-temp nil
@@ -156,94 +161,115 @@
         (if not-p
             (values :ne :a :b drop-through target)
             (values :e :na :nb target drop-through))
-
-      (cond ((not load-widetag))
-            ((and value-tn-ref
-                  (eq lowtag other-pointer-lowtag)
-                  (other-pointer-tn-ref-p value-tn-ref t immediate-tested))) ; best case: lowtag is right
-            ((and value-tn-ref
-                  ;; If HEADERS contains a range, then list pointers have to be
-                  ;; disallowed - consider a list whose CAR has a fixnum that
-                  ;; spuriously matches the range test.
-                  (if (some #'listp headers)
-                      (headered-object-pointer-tn-ref-p value-tn-ref)
-                      (pointer-tn-ref-p value-tn-ref)))
-             ;; Emit one fewer conditional jump than the general case,
-             (inst mov temp value)
-             (inst and temp (lognot lowtag-mask))
-             (if (ea-p widetag-tn)
-                 (setq widetag-tn (ea temp))
-                 (setq untagged (ea temp))))
-            (t
-             ;; Regardless of whether :COMPUTE-TEMP is T or NIL, it will hold
-             ;; an untagged ptr to VALUE if the lowtag test passes.
-             (setq untagged (ea temp))
-             (when (ea-p widetag-tn)
-               (setq widetag-tn untagged))
-             (when compute-temp
-               (%lea-for-lowtag-test temp value lowtag :qword))
-             (inst test :byte temp lowtag-mask)
-             (inst jmp :nz when-false)))
-
-      (when (and load-widetag
-                 (eq widetag-tn temp))
-        (inst mov :dword temp (or untagged (ea (- lowtag) value))))
-      (dolist (widetag except)
-        (inst cmp :byte temp widetag)
-        (inst jmp :e when-false))
-
-      (cond
-       ((and (fixnump first)
-             (fixnump second)
-             (not (cddr headers))
-             (= (logcount (logxor first second)) 1))
-        ;; Two widetags differing at one bit. Use one cmp and branch.
-        ;; Start by ORing in the bit that they differ on.
-        (let ((diff-bit (logxor first second)))
-          (aver (not (ea-p widetag-tn))) ; can't clobber a header
-          (inst or :byte widetag-tn diff-bit)
-          (inst cmp :byte widetag-tn (logior first diff-bit))
-          (if not-p (inst jmp :ne target) (inst jmp :eq target))))
-       (t
-      ;; Compared to x86 we additionally optimize the cases of a
-      ;; range starting with BIGNUM-WIDETAG (= min widetag)
-      ;; or ending with COMPLEX-ARRAY-WIDETAG (= max widetag)
-        (do ((remaining headers (cdr remaining)))
-            ((null remaining))
-          (let ((header (car remaining))
-                (last (null (cdr remaining))))
-            (cond
-              ((and (eql header simple-array-widetag)
-                    value-tn-ref
-                    (csubtypep (tn-ref-type value-tn-ref) (specifier-type 'string))))
-              ((atom header)
-               (inst cmp :byte widetag-tn header)
-               (if last
-                   (inst jmp equal target)
-                   (inst jmp :e when-true)))
-              (t
-               (let ((start (car header))
-                     (end (cdr header)))
-                 (cond
-                   ((= start bignum-widetag)
-                    (inst cmp :byte widetag-tn end)
-                    (if last
-                        (inst jmp less-or-equal target)
-                        (inst jmp :be when-true)))
-                   ((= end complex-array-widetag)
-                    (inst cmp :byte widetag-tn start)
-                    (if last
-                        (inst jmp greater-or-equal target)
-                        (inst jmp :b when-false)))
-                   ((not last)
-                    (inst cmp :byte temp start)
-                    (inst jmp :b when-false)
-                    (inst cmp :byte temp end)
-                    (inst jmp :be when-true))
-                   (t
-                    (inst sub :byte temp start)
-                    (inst cmp :byte temp (- end start))
-                    (inst jmp less-or-equal target))))))))))
+      (flet ((test-lowtag (target not-p &optional test)
+               (cond ((not load-widetag)
+                      nil)
+                     ((and value-tn-ref
+                           (eq lowtag other-pointer-lowtag)
+                           (other-pointer-tn-ref-p value-tn-ref t immediate-tested))
+                      nil) ; best case: lowtag is right
+                     ((and value-tn-ref
+                           (not test)
+                           ;; If HEADERS contains a range, then list pointers have to be
+                           ;; disallowed - consider a list whose CAR has a fixnum that
+                           ;; spuriously matches the range test.
+                           (if (some #'listp headers)
+                               (headered-object-pointer-tn-ref-p value-tn-ref)
+                               (pointer-tn-ref-p value-tn-ref)))
+                      ;; Emit one fewer conditional jump than the general case,
+                      (inst mov temp value)
+                      (inst and temp (lognot lowtag-mask))
+                      (if (ea-p widetag-tn)
+                          (setq widetag-tn (ea temp))
+                          (setq untagged (ea temp)))
+                      nil)
+                     (t
+                      ;; Regardless of whether :COMPUTE-TEMP is T or NIL, it will hold
+                      ;; an untagged ptr to VALUE if the lowtag test passes.
+                      (setq untagged (ea temp))
+                      (when (ea-p widetag-tn)
+                        (setq widetag-tn untagged))
+                      (when compute-temp
+                        (%lea-for-lowtag-test temp value lowtag :qword))
+                      (inst test :byte temp lowtag-mask)
+                      (inst jmp (if not-p :nz :z) target)
+                      t))))
+        (cond
+          ((and value-tn-ref
+                (not except)
+                ;; Is testing only the lowtag enough?
+                (eq lowtag other-pointer-lowtag)
+                (let ((widetags (sb-c::type-other-pointer-widetags (tn-ref-type value-tn-ref))))
+                  (when widetags
+                    (loop for widetag in widetags
+                          always
+                          (loop for header in headers
+                                thereis (if (consp header)
+                                            (<= (car header) widetag (cdr header))
+                                            (eql widetag header)))))))
+           (or (test-lowtag target not-p t)
+               (unless not-p
+                 (inst jmp target))))
+          (t
+           (test-lowtag when-false t)
+           (when (and load-widetag
+                      (eq widetag-tn temp))
+             (inst mov :dword temp (or untagged (ea (- lowtag) value))))
+           (dolist (widetag except)
+             (inst cmp :byte temp widetag)
+             (inst jmp :e when-false))
+           (cond
+             ((and (fixnump first)
+                   (fixnump second)
+                   (not (cddr headers))
+                   (= (logcount (logxor first second)) 1))
+              ;; Two widetags differing at one bit. Use one cmp and branch.
+              ;; Start by ORing in the bit that they differ on.
+              (let ((diff-bit (logxor first second)))
+                (aver (not (ea-p widetag-tn))) ; can't clobber a header
+                (inst or :byte widetag-tn diff-bit)
+                (inst cmp :byte widetag-tn (logior first diff-bit))
+                (if not-p (inst jmp :ne target) (inst jmp :e target))))
+             (t
+              ;; Compared to x86 we additionally optimize the cases of a
+              ;; range starting with BIGNUM-WIDETAG (= min widetag)
+              ;; or ending with COMPLEX-ARRAY-WIDETAG (= max widetag)
+              (do ((remaining headers (cdr remaining)))
+                  ((null remaining))
+                (let ((header (car remaining))
+                      (last (null (cdr remaining))))
+                  (cond
+                    ((and (eql header simple-array-widetag)
+                          value-tn-ref
+                          (csubtypep (tn-ref-type value-tn-ref) (specifier-type 'string))))
+                    ((atom header)
+                     (inst cmp :byte widetag-tn header)
+                     (if last
+                         (inst jmp equal target)
+                         (inst jmp :e when-true)))
+                    (t
+                     (let ((start (car header))
+                           (end (cdr header)))
+                       (cond
+                         ((= start bignum-widetag)
+                          (inst cmp :byte widetag-tn end)
+                          (if last
+                              (inst jmp less-or-equal target)
+                              (inst jmp :be when-true)))
+                         ((= end complex-array-widetag)
+                          (inst cmp :byte widetag-tn start)
+                          (if last
+                              (inst jmp greater-or-equal target)
+                              (inst jmp :b when-false)))
+                         ((not last)
+                          (inst cmp :byte temp start)
+                          (inst jmp :b when-false)
+                          (inst cmp :byte temp end)
+                          (inst jmp :be when-true))
+                         (t
+                          (inst sub :byte temp start)
+                          (inst cmp :byte temp (- end start))
+                          (inst jmp less-or-equal target)))))))))))))
 
       (emit-label drop-through))))
 
@@ -325,6 +351,32 @@
       (inst cmp :qword ea (bignum-header-for-length 1)))
     OUT))
 
+(define-vop (signed-byte-64-p-move-to-word type-predicate)
+  (:args (value :scs (any-reg descriptor-reg) :to :save))
+  (:arg-refs value-ref)
+  (:info target not-p flags)
+  (:results (r :scs (unsigned-reg signed-reg)))
+  (:result-types signed-num)
+  (:translate)
+  (:generator 10
+    (aver (equal (conditional-flags-flags flags) '(:z)))
+    (let ((fixnum-p (types-equal-or-intersect (tn-ref-type value-ref) (specifier-type 'fixnum))))
+      (multiple-value-bind (yep nope)
+          (if not-p
+              (values not-target target)
+              (values target not-target))
+        (assemble ()
+          (when fixnum-p
+            (move r value)
+            (inst sar r n-fixnum-tag-bits)
+            (inst jmp :nc YEP))
+          (unless (fixnum-or-other-pointer-tn-ref-p value-ref t)
+            (test-type value temp nope t (other-pointer-lowtag)))
+          (inst cmp :qword (object-slot-ea value 0 other-pointer-lowtag) (bignum-header-for-length 1))
+          (loadw r value bignum-digits-offset other-pointer-lowtag)
+          (inst jmp (if not-p :ne :e) target))))
+    not-target))
+
 (define-vop (signed-byte-64-p/unsigned)
   (:args (value :scs (unsigned-reg)))
   (:arg-types unsigned-num)
@@ -388,30 +440,13 @@
       (inst test :byte value fixnum-tag-mask))
     out))
 
-;;; Sign bit and fixnum tag bit.
-(defconstant non-negative-fixnum-mask-constant
-  #x8000000000000001)
-(defconstant non-negative-fixnum-mask-constant-wired-address
-  (+ static-space-start (* 12 n-word-bytes)))
-;; the preceding constant is embedded in an array,
-;; the header of which must not overlap the static alloc regions
-#-sb-thread
-(aver (>= (- non-negative-fixnum-mask-constant-wired-address (* 2 n-word-bytes))
-          (+ static-space-start
-             (max boxed-region-offset
-                  cons-region-offset
-                  mixed-region-offset)
-             (* 3 n-word-bytes))))
-
 ;;; An (unsigned-byte 64) can be represented with either a positive
 ;;; fixnum, a bignum with exactly one positive digit, or a bignum with
 ;;; exactly two digits and the second digit all zeros.
 (define-vop (unsigned-byte-64-p type-predicate)
   (:translate unsigned-byte-64-p)
   (:generator 10
-    (let* ((not-target (gen-label))
-           (single-word (gen-label))
-           (fixnum-p (types-equal-or-intersect (tn-ref-type args) (specifier-type 'fixnum)))
+    (let* ((fixnum-p (types-equal-or-intersect (tn-ref-type args) (specifier-type 'fixnum)))
            (not-signed-byte-64-p (not (types-equal-or-intersect (tn-ref-type args) (specifier-type 'signed-word))))
            (unsigned-p (or not-signed-byte-64-p
                            (not (types-equal-or-intersect (tn-ref-type args) (specifier-type '(integer * -1)))))))
@@ -419,108 +454,185 @@
           (if not-p
               (values not-target target)
               (values target not-target))
-        (when fixnum-p
-          (cond (unsigned-p
-                 (inst test :byte value fixnum-tag-mask)
-                 (inst jmp :z yep))
-                (t ;; Is it a fixnum with the sign bit clear?
-                 (inst test (ea non-negative-fixnum-mask-constant-wired-address) value)
-                 (inst jmp :z yep))))
-        (cond ((fixnum-or-other-pointer-tn-ref-p args t)
-               (when (and fixnum-p
-                          (not unsigned-p))
-                 (inst test :byte value fixnum-tag-mask)
-                 (inst jmp :z nope)))
-              (t
-               (%lea-for-lowtag-test temp value other-pointer-lowtag)
-               (inst test :byte temp lowtag-mask)
-               (inst jmp :ne nope)))
-        ;; Get the header.
-        (loadw temp value 0 other-pointer-lowtag)
-        (unless not-signed-byte-64-p
-          ;; Is it one?
-          (inst cmp temp (bignum-header-for-length 1))
-          (inst jmp :e (if unsigned-p
-                           yep
-                           single-word)))
-        ;; If it's other than two, we can't be an (unsigned-byte 64)
-        ;: Leave TEMP holding 0 in the affirmative case.
-        (inst sub temp (bignum-header-for-length 2))
-        (inst jmp :ne nope)
-        ;; Compare the second digit to zero (in TEMP).
-        (inst cmp (object-slot-ea value (1+ bignum-digits-offset) other-pointer-lowtag)
-              temp)
-        (cond (unsigned-p
-               (inst jmp (if not-p :nz :z) target))
-              (t
-               (inst jmp :z yep) ; All zeros, its an (unsigned-byte 64).
-               (inst jmp nope)))
+        (assemble ()
+          (cond ((fixnum-or-other-pointer-tn-ref-p args t)
+                 (when fixnum-p
+                   (inst test :byte value fixnum-tag-mask)
+                   (cond (unsigned-p
+                          (inst jmp :z yep))
+                         (t
+                          (inst jmp :nz bignum)
+                          (inst test value value)
+                          (inst jmp :ns yep)
+                          (inst jmp nope)))))
+                (t
+                 (when fixnum-p
+                   (cond (unsigned-p
+                          (inst test :byte value fixnum-tag-mask)
+                          (inst jmp :z yep))
+                         (t ;; Is it a fixnum with the sign bit clear?
+                          (inst test (constantize non-negative-fixnum-mask) value)
+                          (inst jmp :z yep))))
+                 (%lea-for-lowtag-test temp value other-pointer-lowtag)
+                 (inst test :byte temp lowtag-mask)
+                 (inst jmp :ne nope)))
+          ;; Get the header.
+          bignum
+          (loadw temp value 0 other-pointer-lowtag)
 
-        (unless unsigned-p
-          (emit-label single-word)
-          ;; Get the single digit.
-          (loadw temp value bignum-digits-offset other-pointer-lowtag)
-          ;; positive implies (unsigned-byte 64).
-          (inst test temp temp)
-          (inst jmp (if not-p :s :ns) target))
+          (unless not-signed-byte-64-p
+            ;; Is it one?
+            (inst cmp temp (bignum-header-for-length 1))
+            (cond (unsigned-p
+                   (inst jmp :e yep))
+                  (t
+                   (inst jmp :ne two-word)
+                   ;; is it positive?
+                   (inst cmp :byte (ea (+ (- (* bignum-digits-offset n-word-bytes) other-pointer-lowtag)
+                                          (1- n-word-bytes))
+                                       value) 0)
+                   (inst jmp :ns yep))))
 
-        (emit-label not-target)))))
+          two-word
+          ;; If it's other than two, we can't be an (unsigned-byte 64)
+          ;; Leave TEMP holding 0 in the affirmative case.
+          (inst sub temp (bignum-header-for-length 2))
+          (inst jmp :ne nope)
+          ;; Compare the second digit to zero (in TEMP).
+          (inst cmp (object-slot-ea value (1+ bignum-digits-offset) other-pointer-lowtag) temp)
+          (inst jmp (if not-p :nz :z) target))))
+    not-target))
 
-(define-vop (unsigned-byte-x-p type-predicate)
-  (:arg-types * (:constant (integer 1)))
-  (:translate sb-c::unsigned-byte-x-p)
-  (:info target not-p x)
-  (:temporary (:sc unsigned-reg) last-digit)
+(define-vop (unsigned-byte-64-p-move-to-word type-predicate)
+  (:results (r :scs (signed-reg unsigned-reg) :from :load))
+  (:result-types unsigned-num)
   (:generator 10
-    (let* ((type (tn-ref-type args))
-           (fixnum-p (types-equal-or-intersect type (specifier-type 'fixnum)))
-           (integer-p (csubtypep type (specifier-type 'integer)))
-           (unsigned-p (not (types-equal-or-intersect type (specifier-type '(integer * -1))))))
+    (let* ((fixnum-p (types-equal-or-intersect (tn-ref-type args) (specifier-type 'fixnum)))
+           (not-signed-byte-64-p (not (types-equal-or-intersect (tn-ref-type args) (specifier-type 'signed-word))))
+           (unsigned-p (or not-signed-byte-64-p
+                           (not (types-equal-or-intersect (tn-ref-type args) (specifier-type '(integer * -1)))))))
       (multiple-value-bind (yep nope)
           (if not-p
               (values not-target target)
               (values target not-target))
         (assemble ()
           (when fixnum-p
-            (cond (unsigned-p
-                   (inst test :byte value fixnum-tag-mask)
-                   (inst jmp :z yep))
-                  (t ;; Is it a fixnum with the sign bit clear?
-                   (inst test (ea non-negative-fixnum-mask-constant-wired-address) value)
-                   (inst jmp :z yep))))
-          (cond ((fixnum-or-other-pointer-tn-ref-p args t)
-                 (when (and fixnum-p
-                            (not unsigned-p))
-                   (inst test :byte value fixnum-tag-mask)
-                   (inst jmp :z nope)))
-                (t
-                 (%lea-for-lowtag-test temp value other-pointer-lowtag)
-                 (inst test :byte temp lowtag-mask)
-                 (inst jmp :ne nope)))
-          ;; Get the header.
-          (loadw temp value 0 other-pointer-lowtag)
-          (unless integer-p
-            (inst cmp :byte temp bignum-widetag)
+            (move r value)
+            (inst sar r (the (eql 1) n-fixnum-tag-bits))
+            (inst jmp :nc (if unsigned-p
+                              yep
+                              test-sign)))
+          (unless (fixnum-or-other-pointer-tn-ref-p args t)
+            (%lea-for-lowtag-test temp value other-pointer-lowtag)
+            (inst test :byte temp lowtag-mask)
             (inst jmp :ne nope))
-          (inst shr temp n-widetag-bits)
-          (inst cmp :dword temp (1+ (/ x n-word-bits)))
-          (inst jmp :g nope)
-          ;; Is it a sign-extended sign bit
+          ;; Get the header.
+          bignum
+          (loadw r value bignum-digits-offset other-pointer-lowtag)
+          (loadw temp value 0 other-pointer-lowtag)
+
+          (unless not-signed-byte-64-p
+            ;; Is it one?
+            (inst cmp temp (bignum-header-for-length 1))
+            (inst jmp :e (if unsigned-p
+                             yep
+                             test-sign)))
+
+          two-word
+          ;; If it's other than two, we can't be an (unsigned-byte 64)
+          ;; Leave TEMP holding 0 in the affirmative case.
+          (inst sub temp (bignum-header-for-length 2))
+          (inst jmp :ne nope)
+          ;; Compare the second digit to zero (in TEMP).
+          (inst cmp (object-slot-ea value (1+ bignum-digits-offset) other-pointer-lowtag) temp)
           (cond (unsigned-p
-                 (inst jmp :l yep)
-                 (inst cmp :dword (ea (+ (- other-pointer-lowtag) (/ n-word-bytes 2))
-                                      value temp n-word-bytes)
-                       0)
                  (inst jmp (if not-p :nz :z) target))
                 (t
-                 (inst mov last-digit (ea (- other-pointer-lowtag) value temp n-word-bytes))
-                 (inst jmp :l fixnum)
-                 (inst test last-digit last-digit)
-                 (inst jmp :nz nope)))
-          fixnum
+                 (inst jmp :e yep)
+                 (inst jmp nope)))
+
+          test-sign
           (unless unsigned-p
-            (inst test last-digit last-digit)
+            (inst test r r)
             (inst jmp (if not-p :s :ns) target)))))
+    not-target))
+
+(define-vop (unsigned-byte-x-p type-predicate)
+  (:arg-types * (:constant t))
+  (:translate sb-c::unsigned-byte-x-p)
+  (:info target not-p x)
+  (:temporary (:sc unsigned-reg) last-digit)
+  (:generator 10
+    (multiple-value-bind (digits left) (truncate x n-word-bits)
+      (let* ((type (tn-ref-type args))
+             (fixnum-p (types-equal-or-intersect type (specifier-type 'fixnum)))
+             (integer-p (csubtypep type (specifier-type 'integer)))
+             (unsigned-p (not (types-equal-or-intersect type (specifier-type '(integer * -1))))))
+        (multiple-value-bind (yep nope)
+            (if not-p
+                (values not-target target)
+                (values target not-target))
+          (assemble ()
+            (when fixnum-p
+              (cond (unsigned-p
+                     (inst test :byte value fixnum-tag-mask)
+                     (inst jmp :z yep))
+                    (t ;; Is it a fixnum with the sign bit clear?
+                     (inst test (constantize non-negative-fixnum-mask) value)
+                     (inst jmp :z yep))))
+            (cond ((fixnum-or-other-pointer-tn-ref-p args t)
+                   (when (and fixnum-p
+                              (not unsigned-p))
+                     (inst test :byte value fixnum-tag-mask)
+                     (inst jmp :z nope)))
+                  (t
+                   (%lea-for-lowtag-test temp value other-pointer-lowtag)
+                   (inst test :byte temp lowtag-mask)
+                   (inst jmp :ne nope)))
+            ;; Get the header.
+            (cond ((and integer-p unsigned-p)
+                   (inst mov :dword temp (ea (1+ (- other-pointer-lowtag)) value)))
+                  (t
+                   (loadw temp value 0 other-pointer-lowtag)
+                   (unless integer-p
+                     (inst cmp :byte temp bignum-widetag)
+                     (inst jmp :ne nope))
+                   (inst shr temp n-widetag-bits)))
+            (inst cmp :dword temp (1+ digits))
+            (inst jmp :g nope)
+            (if (zerop left)
+                ;; Is it a sign-extended sign bit
+                (cond (unsigned-p
+                       (inst jmp :l yep)
+                       (inst cmp :qword (ea (- other-pointer-lowtag)
+                                            value temp n-word-bytes)
+                             0)
+                       (inst jmp (if not-p :nz :z) target))
+                      (t
+                       (inst mov last-digit (ea (- other-pointer-lowtag) value temp n-word-bytes))
+                       (inst jmp :l fixnum)
+                       (inst test last-digit last-digit)
+                       (inst jmp :nz nope)))
+                ;; Check if the remaining high bits are zero
+                (let ((bits (dpb 0 (byte left 0) -1)))
+                  (cond ((< left 32)
+                         (inst mov last-digit (ea (- other-pointer-lowtag) value temp n-word-bytes))
+                         (inst jmp :l fixnum)
+                         (inst test last-digit bits))
+                        (t
+                         (inst movsx '(:dword :qword) last-digit (ea (+ (- other-pointer-lowtag)
+                                                                        (/ n-word-bytes 2))
+                                                                     value temp n-word-bytes))
+                         (inst jmp :l fixnum)
+                         (if (= left 32)
+                             (inst test last-digit last-digit)
+                             (inst test last-digit (ash bits -32)))))
+                  (inst jmp :z yep)
+                  (inst jmp nope)))
+            fixnum
+            (unless unsigned-p
+              (inst test last-digit last-digit)
+              (inst jmp (if not-p :s :ns) target))))))
     not-target))
 
 ;;; SINGLE-FLOAT-P, CHARACTERP, UNBOUND-MARKER-P produce a flag result
@@ -538,11 +650,20 @@
 (macrolet ((define (name lowtag)
              `(define-vop (,name pointerp)
                 (:translate ,name)
+                (:arg-refs value-ref)
+                (:vop-var vop)
                 (:generator 2
-                  (if (location= temp value)
-                      (inst sub :dword value ,lowtag)
-                      (inst lea :dword temp (ea (- ,lowtag) value)))
-                  (inst test :byte temp lowtag-mask)))))
+                  (multiple-value-bind (bit set) (tn-ref-lowtag-bit ,lowtag value-ref)
+                    (cond
+                      (bit
+                       (inst test :byte value (ash 1 bit))
+                       (when (eq set 1)
+                         (change-vop-flags vop '(:nz))))
+                      (t
+                       (if (location= temp value)
+                           (inst sub :dword value ,lowtag)
+                           (inst lea :dword temp (ea (- ,lowtag) value)))
+                       (inst test :byte temp lowtag-mask))))))))
   (define functionp fun-pointer-lowtag)
   (define listp list-pointer-lowtag)
   (define %instancep instance-pointer-lowtag)
@@ -671,7 +792,7 @@
           (%lea-for-lowtag-test temp value other-pointer-lowtag :qword)
           (inst test :byte temp lowtag-mask)
           (inst jmp :e compare-widetag)
-          (inst cmp value nil-value)
+          (inst cmp value null-tn)
           (inst jmp out)
           compare-widetag
           (inst cmp :byte (ea temp) symbol-widetag)))
@@ -689,7 +810,8 @@
 ;;; but hey at least this provides the IR2 support for it.
 (define-vop (car-eq-if-listp)
   (:args (value :scs (descriptor-reg))
-         (obj :scs (immediate any-reg descriptor-reg)))
+         (obj :scs (any-reg descriptor-reg
+                            (immediate (reg-or-legal-imm32-p tn)))))
   (:temporary (:sc unsigned-reg) temp)
   (:conditional :z)
   (:policy :fast-safe)
@@ -709,10 +831,13 @@
            (inst cmp :word (ea (- 1 other-pointer-lowtag) value)
                  sb-impl::+package-id-keyword+))
           (t
-           (inst lea temp (ea (- other-pointer-lowtag) value))
-           (inst test :byte temp lowtag-mask)
-           (inst jmp :ne out)
-           (inst mov :dword temp (ea temp))
+           (cond ((other-pointer-tn-ref-p args t)
+                  (inst mov :dword temp (object-slot-ea value 0 other-pointer-lowtag)))
+                 (t
+                  (inst lea temp (ea (- other-pointer-lowtag) value))
+                  (inst test :byte temp lowtag-mask)
+                  (inst jmp :ne out)
+                  (inst mov :dword temp (ea temp))))
            (inst shl :dword temp 8) ; zeroize flag/generation bits
            (inst cmp :dword temp
                  (ash (logior (ash sb-impl::+package-id-keyword+ 8) symbol-widetag) 8))))
@@ -722,7 +847,7 @@
   (:translate consp)
   (:generator 8
     (let ((is-not-cons-label (if not-p target DROP-THRU)))
-      (inst cmp value nil-value)
+      (inst cmp value null-tn)
       (inst jmp :e is-not-cons-label)
       (test-type value temp target not-p (list-pointer-lowtag)))
     DROP-THRU))
@@ -903,8 +1028,7 @@
                                               (setf comparison :le))))
                                 (setf value (- value one)))
                                (t
-                                (inst mov temp value)
-                                temp)))
+                                value)))
                        fixnum)))
       (multiple-value-bind (yep nope)
           (if not-p
@@ -930,6 +1054,22 @@
                (inst jmp :z (if (eq comparison :l)
                                 nope
                                 yep)))
+              ((and (eql fixnum (fixnumize most-positive-fixnum))
+                    (case comparison
+                      (:g
+                       (inst jmp :z nope)
+                       t)
+                      (:le
+                       (inst jmp :z yep)
+                       t))))
+              ((and (eql fixnum (fixnumize most-negative-fixnum))
+                    (case comparison
+                      (:l
+                       (inst jmp :z nope)
+                       t)
+                      (:ge
+                       (inst jmp :z yep)
+                       t))))
               (t
                (inst jmp :nz BIGNUM)
                (cond ((eql fixnum 0)
@@ -946,19 +1086,22 @@
                                         (setf comparison :le)))))
                       (inst test integer integer))
                      (t
-                      (inst cmp integer fixnum)))
+                      (inst cmp integer (if (plausible-signed-imm32-operand-p fixnum)
+                                            fixnum
+                                            (progn
+                                              (inst mov temp fixnum)
+                                              temp)))))
                (inst jmp comparison yep)
                (inst jmp nope))))
           bignum
           (unless (fixnum-or-other-pointer-tn-ref-p integer-ref t)
             (test-type integer temp nope t (other-pointer-lowtag)))
-          (loadw temp integer 0 other-pointer-lowtag)
           (unless integer-p
-            (inst cmp :byte temp bignum-widetag)
+            (inst cmp :byte (object-slot-ea integer 0 other-pointer-lowtag) bignum-widetag)
             (inst jmp :ne nope))
-          #.(assert (= (integer-length bignum-widetag) 5))
-          (inst shr temp 5)
-          (inst cmp :dword (ea (+ (- other-pointer-lowtag) (/ n-word-bytes 2)) integer temp) 0)
+          #.(assert (subtypep 'sb-bignum:bignum-length '(unsigned-byte 32)))
+          (inst mov :dword temp (ea (1+ (- other-pointer-lowtag)) integer))
+          (inst cmp :dword (ea (+ (- other-pointer-lowtag) (/ n-word-bytes 2)) integer temp 8) 0)
           (inst jmp (case comparison
                       ((:l :le) (if not-p :ge :l))
                       (t (if not-p :l :ge)))
@@ -1003,11 +1146,15 @@
   (:result-types unsigned-num)
   (:generator 1
     (when null-label
+      ;; Since the comparison against a register, not an imm8 or imm32 any more,
+      ;; there is probably no reason to distinguish the two cases here.
+      ;; The only conceivable reason would be if null-tn were in a low register
+      ;; then it's theoretically possible that a REX prefix could be avoided.
       (if (types-equal-or-intersect
            (type-difference (tn-ref-type value-ref) (specifier-type 'null))
            (specifier-type 'cons))
-          (inst cmp value nil-value)
-          (inst cmp :byte value (logand nil-value #xff)))
+          (inst cmp value null-tn)
+          (inst cmp :byte value null-tn)) ; was: (logand nil-value #xff)
       (inst jmp :e null-label))
     (cond ((other-pointer-tn-ref-p value-ref t)
            (if zero-extend
@@ -1024,14 +1171,15 @@
 (define-vop (test-widetag)
   (:args (value :scs (unsigned-reg) :target temp))
   (:temporary (:sc unsigned-reg :from (:argument 1)) temp)
-  (:info target not-p type-codes)
+  (:info target not-p type-codes object-tn-ref)
   (:generator 1
     (move temp value :dword)
     (%test-headers nil temp target not-p nil
       (if (every #'integerp type-codes)
           (canonicalize-widetags type-codes)
           type-codes)
-      :load-widetag nil)))
+      :load-widetag nil
+      :value-tn-ref object-tn-ref)))
 
 (macrolet ((read-depthoid ()
              `(ea (- (+ 4 (ash (+ instance-slots-offset

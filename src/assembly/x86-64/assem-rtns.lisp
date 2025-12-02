@@ -72,16 +72,14 @@
   (loadw rsi rbx -3)
 
   ;; And back we go.
-  (inst stc)
-  (inst push rax)
-  (inst ret)
+  (emit-mv-return rax t)
 
   ;; Handle the register arg cases.
   ZERO-VALUES
   (inst lea rbx (ea (* sp->fp-offset n-word-bytes) rbp-tn))
-  (inst mov rdx nil-value)
-  (inst mov rdi rdx)
-  (inst mov rsi rdx)
+  (inst mov rdx null-tn)
+  (inst mov rdi null-tn)
+  (inst mov rsi null-tn)
   (inst stc)
   (inst leave)
   (inst ret)
@@ -98,7 +96,7 @@
   (inst lea rbx (ea (* sp->fp-offset n-word-bytes) rbp-tn))
   (loadw rdx rsi -1)
   (loadw rdi rsi -2)
-  (inst mov rsi nil-value)
+  (inst mov rsi null-tn)
   (inst stc)
   (inst leave)
   (inst ret)
@@ -168,7 +166,7 @@
     ;; And jump into the function.
     (if jump-to-the-end
         (inst jmp end)
-        (inst jmp (ea (- (* closure-fun-slot n-word-bytes) fun-pointer-lowtag) fun)))
+        (inst jmp (object-slot-ea fun closure-fun-slot fun-pointer-lowtag)))
 
     ;; All the arguments fit in registers, so load them.
     REGISTER-ARGS
@@ -198,7 +196,7 @@
      (:temp r10 unsigned-reg r10-offset))
   (prepare-for-tail-call-variable fun temp nargs rdx rdi rsi r8 r9 r10)
 
-  (inst jmp (ea (- (* closure-fun-slot n-word-bytes) fun-pointer-lowtag) fun)))
+  (inst jmp (object-slot-ea fun closure-fun-slot fun-pointer-lowtag)))
 
 #+sb-assembling
 (define-assembly-routine
@@ -218,7 +216,7 @@
   (%lea-for-lowtag-test rbx-tn fun fun-pointer-lowtag)
   (inst test :byte rbx-tn lowtag-mask)
   (inst jmp :nz (make-fixup 'call-symbol :assembly-routine))
-  (inst jmp (ea (- (* closure-fun-slot n-word-bytes) fun-pointer-lowtag) fun)))
+  (inst jmp (object-slot-ea fun closure-fun-slot fun-pointer-lowtag)))
 
 #+sb-assembling
 (define-assembly-routine (call-symbol
@@ -239,7 +237,7 @@
   (inst mov fun tmp) ; needed if the JMP invokes UNDEFINED-TRAMP
   (inst jmp (object-slot-ea tmp closure-fun-slot fun-pointer-lowtag))
   NOT-CALLABLE
-  (inst cmp fun nil-value) ;; NIL doesn't have SYMBOL-WIDETAG
+  (inst cmp fun null-tn) ;; NIL doesn't have SYMBOL-WIDETAG
   (inst jmp :e UNDEFINED-TRAMP)
   ;; Not a symbol
   (inst pop (ea n-word-bytes rbp-tn))
@@ -248,41 +246,31 @@
   (%lea-for-lowtag-test tmp fun fun-pointer-lowtag) ; test FUNCTIONP
   (inst test :byte tmp lowtag-mask)
   (inst jmp :nz RETRY)
-  (inst jmp (ea (- (* closure-fun-slot n-word-bytes) fun-pointer-lowtag) fun))
+  (inst jmp (object-slot-ea fun closure-fun-slot fun-pointer-lowtag))
   (inst .align 3)
   UNDEFINED-TRAMP
   (inst pop (ea n-word-bytes rbp-tn))
   (emit-error-break nil cerror-trap (error-number-or-lose 'undefined-fun-error) (list fun))
   (inst push (ea n-word-bytes rbp-tn))
-  (inst jmp (ea (- (* closure-fun-slot n-word-bytes) fun-pointer-lowtag) fun)))
+  (inst jmp (object-slot-ea fun closure-fun-slot fun-pointer-lowtag)))
 
 
 (define-assembly-routine (throw
-                          (:return-style :full-call-no-return))
-                         ((:arg target (descriptor-reg any-reg) rdx-offset)
-                          (:arg start any-reg rbx-offset)
-                          (:arg count any-reg rcx-offset)
-                          (:temp bsp-temp any-reg r11-offset)
-                          (:temp catch any-reg rax-offset))
+                             (:return-style :full-call-no-return)
+                           (:save-p :compute-only))
+    ((:arg target (descriptor-reg any-reg) rdx-offset)
+     (:arg start any-reg rbx-offset)
+     (:arg count any-reg rcx-offset)
+     (:temp bsp-temp any-reg r11-offset)
+     (:temp catch any-reg rax-offset))
 
   (declare (ignore start count bsp-temp))
 
   (load-tl-symbol-value catch *current-catch-block*)
   LOOP
 
-  (let ((error (gen-label)))
-    (assemble (:elsewhere)
-      (emit-label error)
-
-      ;; Fake up a stack frame so that backtraces come out right.
-      (inst push rbp-tn)
-      (inst mov rbp-tn rsp-tn)
-
-      (emit-error-break nil error-trap
-                        (error-number-or-lose 'unseen-throw-tag-error)
-                        (list target)))
-    (inst test catch catch)             ; check for NULL pointer
-    (inst jmp :z error))
+  (inst test catch catch)               ; check for NULL pointer
+  (inst jmp :z (generate-error-code nil 'unseen-throw-tag-error target))
 
   (inst cmp target (object-slot-ea catch catch-block-tag-slot 0))
   ;; Here RAX points to catch block containing symbol pointed to by RDX.
@@ -293,6 +281,7 @@
 
 ;;; Simply return and enter the loop in UNWIND instead of calling
 ;;; UNWIND directly
+#-sb-assembling
 (define-vop ()
   (:translate %continue-unwind)
   (:policy :fast-safe)
@@ -302,7 +291,8 @@
 (define-assembly-routine (unwind
                           (:return-style :none)
                           (:translate %unwind)
-                          (:policy :fast-safe))
+                          (:policy :fast-safe)
+                          (:save-p :compute-only))
                          ((:arg block (any-reg descriptor-reg) rax-offset)
                           (:arg start (any-reg descriptor-reg) rbx-offset)
                           (:arg count (any-reg descriptor-reg) rcx-offset)
@@ -314,9 +304,9 @@
                           (:temp bsp-temp unsigned-reg r11-offset)
                           (:temp zero complex-double-reg float0-offset))
   AGAIN
-  (let ((error (generate-error-code nil 'invalid-unwind-error)))
-    (inst test block block)             ; check for NULL pointer
-    (inst jmp :z error))
+
+  (inst test block block)               ; check for NULL pointer
+  (inst jmp :z (generate-error-code nil 'invalid-unwind-error))
 
   (load-tl-symbol-value uwp *current-unwind-protect-block*)
 
@@ -351,7 +341,7 @@
 
   ;; Go to uwp-entry, it can fetch the pushed above values if it needs
   ;; to.
-  (inst call (ea (* unwind-block-entry-pc-slot n-word-bytes) uwp))
+  (inst call (object-slot-ea uwp unwind-block-entry-pc-slot 0))
   (inst pop count)
   (inst pop start)
   (inst pop block)
@@ -367,7 +357,7 @@
   (store-tl-symbol-value uwp *current-catch-block*)
 
   ;; nlx-entry expects start in RBX and count in RCX
-  (inst jmp (ea (* unwind-block-entry-pc-slot n-word-bytes) block)))
+  (inst jmp (object-slot-ea block unwind-block-entry-pc-slot 0)))
 
 ;;; These are trampolines, but they benefit from not being in the 'tramps' file
 ;;; because they'll automatically get a vop and an assembly routine this way,
@@ -380,17 +370,17 @@
      (:res r (descriptor-reg) rdx-offset))
   (progn x r)
   (with-registers-preserved (lisp :except rdx)
-    (call-static-fun 'update-object-layout 1)))
+    (call-static-fun 'update-object-layout 1 nil)))
 
-(define-assembly-routine (sb-impl::install-hash-table-lock
+(define-assembly-routine (sb-impl:install-hash-table-lock
                           (:policy :fast-safe)
-                          (:translate sb-impl::install-hash-table-lock)
+                          (:translate sb-impl:install-hash-table-lock)
                           (:return-style :raw))
     ((:arg x (descriptor-reg) rdx-offset)
      (:res r (descriptor-reg) rdx-offset))
   (progn x r)
   (with-registers-preserved (lisp :except rdx)
-    (call-static-fun 'sb-impl::install-hash-table-lock 1)))
+    (call-static-fun 'sb-impl:install-hash-table-lock 1)))
 
 (define-assembly-routine
     (return-values-list (:return-style :none))
@@ -401,9 +391,9 @@
      (:temp rdi unsigned-reg rdi-offset)
      (:temp rsi unsigned-reg rsi-offset)
      (:temp count unsigned-reg rcx-offset)
-     (:temp null unsigned-reg r8-offset)
      (:temp temp unsigned-reg r9-offset)
      (:temp return unsigned-reg r10-offset))
+  (symbol-macrolet ((null null-tn))
   (flet ((check (label)
            (assemble ()
              (%test-lowtag list temp skip nil list-pointer-lowtag)
@@ -411,7 +401,6 @@
              (inst jmp label)
              skip)))
     (assemble ()
-      (inst mov null nil-value)
       (%test-lowtag list temp ZERO-VALUES-ERROR t list-pointer-lowtag)
       (inst cmp list null)
       (inst jmp :e ZERO-VALUES)
@@ -455,13 +444,11 @@
       (pushw list cons-car-slot list-pointer-lowtag)
       (loadw list list cons-cdr-slot list-pointer-lowtag)
       (check DONE)
-      (inst cmp list nil-value)
+      (inst cmp list null-tn)
       (inst jmp :ne LOOP)
 
       DONE
-      (inst stc)
-      (inst push return)
-      (inst ret)
+      (emit-mv-return return t)
 
       ZERO-VALUES-ERROR
       (cerror-call nil 'bogus-arg-to-values-list-error list)
@@ -477,7 +464,7 @@
       (inst lea rbx (ea (* sp->fp-offset n-word-bytes) rbp-tn))
       (inst stc)
       (inst leave)
-      (inst ret))))
+      (inst ret)))))
 
 ;; Adding to the thread-local remset has to be pseudo-atomic because GC takes
 ;; ownership of the the vector when it inserts rememberd objects into the common
@@ -509,7 +496,7 @@
   ;;     RCX spill
   ;; Filter out non-permgen objects. RAX is the object
   ;; (inst mov rbx-tn (rip-relative-ea (make-fixup "permgen_bounds" :foreign-dataref)))
-  (inst mov rbx-tn (ea (make-fixup "permgen_bounds" :foreign-dataref)))
+  (inst mov rbx-tn (ea (make-fixup "permgen_bounds" :foreign-dataref) null-tn))
   (inst cmp rax-tn (ea rbx-tn))
   (inst jmp :b SET-BIT-AND-DONE)
   (inst cmp rax-tn (ea 8 rbx-tn))
@@ -535,7 +522,7 @@
    INSTANCEP
    (inst bts :lock :dword (ea (- instance-pointer-lowtag) rax-tn) 31)
    MAYBE-SKIP (inst jmp :c DONE-PA)
-   (inst add :byte (ea (- (ash vector-data-offset word-shift) other-pointer-lowtag) rbx-tn)
+   (inst add :byte (object-slot-ea rbx-tn vector-data-offset other-pointer-lowtag)
          (fixnumize 1))
    (inst mov (ea (- (ash (+ 2 vector-data-offset) word-shift) other-pointer-lowtag)
                  rbx-tn rcx-tn 4)
@@ -553,9 +540,9 @@
   (inst jmp DONE)
   GROW
   ;; if temps regs were needed here, RAX or RBX would be fine to use and reload
-  (allocation simple-vector-widetag (ash remset-vector-words word-shift)
-              ;; lowtag, result-tn, node, allocation-temp
-              0 rcx-tn nil nil thread-tn :systemp t)
+  (emit-allocation nil thread-tn simple-vector-widetag (ash remset-vector-words word-shift)
+                   ;; lowtag, result-tn, allocation-temp
+                   0 rcx-tn nil :systemp t)
   ;; ASSUMPTION: pre-zeroed memory
   (inst mov :byte (object-slot-ea rcx-tn 0 0) simple-vector-widetag) ; header
   (inst mov :byte (object-slot-ea rcx-tn vector-length-slot 0) remset-vector-len)

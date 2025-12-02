@@ -28,6 +28,9 @@
 #include "genesis/symbol.h"
 
 #define REAL_LRA_SLOT 0
+#ifdef reg_LRA
+#define KNOWN_RETURN_P_SLOT 1
+#endif
 
 static void *compute_pc(lispobj code_obj, int pc_offset)
 {
@@ -64,14 +67,9 @@ void breakpoint_do_displaced_inst(os_context_t* context,
 
 lispobj find_code(os_context_t *context)
 {
-#ifdef reg_CODE
+#if (defined(reg_LRA) && !defined(LISP_FEATURE_PPC) && !defined(LISP_FEATURE_PPC64))
     lispobj code = *os_context_register_addr(context, reg_CODE);
     lispobj header;
-
-#ifdef LISP_FEATURE_PPC64
-    if (lowtag_of(code) == 0)
-        code |= OTHER_POINTER_LOWTAG;
-#endif
 
     if (lowtag_of(code) != OTHER_POINTER_LOWTAG)
         return NIL;
@@ -114,12 +112,12 @@ void handle_breakpoint(os_context_t *context)
 
     fake_foreign_function_call(context);
 
-#ifndef LISP_FEATURE_SB_SAFEPOINT
+#if HAVE_GC_STW_SIGNAL
     unblock_gc_stop_signal();
 #endif
     code = find_code(context);
 
-#ifndef LISP_FEATURE_WIN32
+#ifdef LISP_FEATURE_UNIX
     /* Don't disallow recursive breakpoint traps. Otherwise, we can't
      * use debugger breakpoints anywhere in here. */
     thread_sigmask(SIG_SETMASK, os_context_sigmask_addr(context), 0);
@@ -141,14 +139,14 @@ void *handle_fun_end_breakpoint(os_context_t *context)
 
     fake_foreign_function_call(context);
 
-#ifndef LISP_FEATURE_SB_SAFEPOINT
+#if HAVE_GC_STW_SIGNAL
     unblock_gc_stop_signal();
 #endif
 
     code = find_code(context);
     codeptr = (struct code *)native_pointer(code);
 
-#ifndef LISP_FEATURE_WIN32
+#ifdef LISP_FEATURE_UNIX
     /* Don't disallow recursive breakpoint traps. Otherwise, we can't
      * use debugger breakpoints anywhere in here. */
     thread_sigmask(SIG_SETMASK, os_context_sigmask_addr(context), 0);
@@ -166,8 +164,14 @@ void *handle_fun_end_breakpoint(os_context_t *context)
      * platforms should as well, but haven't been fixed yet. */
     *os_context_register_addr(context, reg_LRA) = lra;
 #else
-#ifdef reg_CODE
-    *os_context_register_addr(context, reg_CODE) = lra;
+#ifdef reg_LRA
+    /*
+     * With the known-return convention, we definitely do NOT want to
+     * mangle the CODE register because it isn't pointing to the bogus
+     * LRA but to the actual routine.
+     */
+    if (codeptr->constants[KNOWN_RETURN_P_SLOT] == NIL)
+        *os_context_register_addr(context, reg_CODE) = lra;
 #endif
 #endif
 

@@ -928,4 +928,104 @@
                        (declare (optimize (sb-c:insert-array-bounds-checks 0)))
                        (array-row-major-index array i j))
                      nil))
+             0))
+  (assert (= (count 'sb-kernel:%check-bound
+                    (ctu:ir1-named-calls
+                     '(lambda (v)
+                       (declare ((simple-array t (4 4)) v))
+                       (aref v 3 2))
+                     nil))
              0)))
+
+(with-test (:name :make-simple-array-not-displaced)
+  (assert (not (array-displacement (funcall (checked-compile `(lambda (d) (make-array d))) '(1 2))))))
+
+(with-test (:name :data-vector-pop-fill-pointer-check)
+  (checked-compile-and-assert
+   (:optimize :safe)
+   `(lambda (array)
+      (declare ((array t) array))
+      (vector-pop array))
+   (((make-array 5)) (condition 'type-error))
+   (((make-array 5 :adjustable t)) (condition 'type-error))
+   (((make-array '(5 5))) (condition 'type-error))
+   (((make-array '(5 5) :adjustable t)) (condition 'type-error))
+   (((make-array 5 :fill-pointer t :initial-element 3)) 3)))
+
+(with-test (:name :make-array+array-dimensions)
+  (assert-type
+   (lambda (x)
+     (declare ((simple-array t (1 2)) x))
+     (make-array (array-dimensions x)))
+   (simple-array t (1 2)))
+  (assert-type
+   (lambda (x)
+     (declare ((or (array single-float (1 2))
+                   (array double-float (1 2))) x))
+     (make-array (array-dimensions x) :element-type 'fixnum))
+   (simple-array fixnum (* *)))
+  (assert-type
+   (lambda (x e)
+     (declare ((array * (*)) x))
+     (make-array (array-dimensions x) :element-type e))
+   (simple-array * (*)))
+  (assert-type
+   (lambda (n e)
+     (make-array (list n) :element-type e))
+   (simple-array * (*)))
+  (assert-type
+   (lambda (n e)
+     (make-array (cons n nil) :element-type e))
+   (simple-array * (*)))
+  (assert-type
+   (lambda (e)
+     (make-array (list* 10 nil) :element-type e))
+   (simple-array * (10))))
+
+(with-test (:name :make-array-list-adjustable)
+  (assert-type
+   (lambda (a b)
+     (make-array (list a b) :adjustable t))
+   (and (array t (* *)) (not simple-array)))
+  (assert-type
+   (lambda (a b)
+     (make-array (list a b) :adjustable nil))
+   (simple-array t (* *)))
+  (checked-compile-and-assert
+      ()
+      `(lambda (a b s)
+         (make-array (list a b) :initial-contents s :adjustable t))
+    ((2 2 '((1 2) (3 4))) #2a((1 2) (3 4)) :test #'equalp))
+  ;; (assert-type
+  ;;  (lambda (a b n)
+  ;;    (make-array (list a b) :adjustable n))
+  ;;  (array t (* *)))
+  )
+
+(with-test (:name :make-array-list-derive-type)
+  (assert-type
+   (lambda (a b p)
+     (make-array (list a b) :displaced-to p))
+   (array t (* *)))
+  (assert-type
+   (lambda (a b p)
+     (make-array (list* a b nil) :displaced-to p))
+   (array t (* *))))
+
+(with-test (:name :make-array-member-element-type)
+  (assert-type
+   (lambda (d)
+     (make-array 1 :element-type (if d
+                                     'double-float
+                                     'single-float)))
+   (or (simple-array double-float (1)) (simple-array single-float (1))))
+  (assert-type
+   (lambda (a n)
+     (declare ((or (array single-float) (array double-float)) a))
+     (setf (aref a 0) n))
+   float)
+  (assert-type
+   (lambda (d)
+     (make-array 2 :element-type (if d 'a 'b)))
+   (simple-array * (2))
+   :allow-style-warnings t))

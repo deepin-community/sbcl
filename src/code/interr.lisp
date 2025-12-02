@@ -300,8 +300,9 @@
     (when (listp tag)
       (binding* ((frame (find-interrupted-frame))
                  (name (sb-di:debug-fun-name (sb-di:frame-debug-fun frame)))
-                 (down (and (eq name 'throw) ; is this tautological ?
-                            (sb-di:frame-down frame)) :exit-if-null))
+                 (down (if (eq name 'throw)
+                           (sb-di:frame-down frame)
+                           frame)))
         (case (sb-di:debug-fun-name (sb-di:frame-debug-fun down))
          ((return-from)
           (setq text "attempt to RETURN-FROM an exited block: ~S"
@@ -329,6 +330,8 @@
          :operation '/
          :operands (list number 0)))
 
+(defvar *type-error-no-check-restart* nil)
+
 (defun restart-type-error (type condition &optional pc-offset)
   (let ((tn-offset (car *current-internal-error-args*)))
     (labels ((retry-value (value)
@@ -340,7 +343,7 @@
                                         :context "while restarting a type error."))))
              (set-value (value)
                (sb-di::sub-set-debug-var-slot
-                nil tn-offset (retry-value value)
+                nil tn-offset value
                 *current-internal-error-context*)
                (when pc-offset
                  (sb-vm::incf-context-pc *current-internal-error-context*
@@ -352,8 +355,9 @@
                    :report (lambda (stream)
                              (format stream "Use specified value."))
                    :interactive read-evaluated-form
-                   (set-value value)))))
-      (try condition))))
+                   (set-value (retry-value value))))))
+      (let ((*type-error-no-check-restart* #'set-value))
+        (try condition)))))
 
 (defun object-not-type-error (object type &optional (context nil context-p))
   (if (invalid-array-p object)
@@ -395,9 +399,9 @@
                                                       (cdr context)
                                                       context)))))
               (cond ((typep context '(cons integer))
-                     (restart-type-error type condition (car context)))
+                     (restart-type-error expected-type condition (car context)))
                     ((eq context 'cerror)
-                     (restart-type-error type condition))
+                     (restart-type-error expected-type condition))
                     (t
                      (error condition))))))))
 
@@ -582,9 +586,9 @@
   (deferr ash-overflow2-error (x y)
     (let ((type (or (sb-di:error-context)
                     'fixnum)))
-      (if (numberp x)
+      (if (integerp x)
           (object-not-type-error (ash x y) type nil)
-          (object-not-type-error x 'number nil))))
+          (object-not-type-error x 'integer nil))))
 
   (deferr negate-overflow-error (x)
     (let ((type (or (sb-di:error-context)
@@ -592,6 +596,36 @@
       (if (numberp x)
           (object-not-type-error (- x) type nil)
           (object-not-type-error x 'number nil)))))
+
+(deferr op-not-type1-error (a)
+  (let* ((context-p (sb-di:error-context))
+         (context (or context-p
+                      a)))
+    (multiple-value-bind (type op) (if (consp context)
+                                       (values (car context) (cdr context))
+                                       (values 'fixnum context))
+      (cond (context-p
+             (unless (typep a 'number)
+               (object-not-type-error a 'number nil))
+             (object-not-type-error (funcall op a) type nil))
+            (t
+             (object-not-type-error "#<no debug info>" type nil))))))
+
+(deferr op-not-type2-error (a b)
+  (let* ((context-p (sb-di:error-context))
+         (context (or context-p
+                      b)))
+    (multiple-value-bind (type op) (if (consp context)
+                                       (values (car context) (cdr context))
+                                       (values 'fixnum context))
+      (cond (context-p
+             (unless (typep a 'number)
+               (object-not-type-error a 'number nil))
+             (unless (typep b 'number)
+               (object-not-type-error b 'number nil))
+             (object-not-type-error (funcall op a b) type nil))
+            (t
+             (object-not-type-error "#<no debug info>" type nil))))))
 
 (deferr fill-pointer-error (array)
   (declare (notinline fill-pointer-error))

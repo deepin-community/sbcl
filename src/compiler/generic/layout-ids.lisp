@@ -259,18 +259,20 @@ SB-C::DXABLE-ARGS
        (setq id (if (= id -1) 6 ; hop over the wired IDs
                     (1+ id)))))))
 
-(defvar *general-layout-uniqueid-counter*  ; incremented before use
+(defglobal *general-layout-uniqueid-counter*  ; incremented before use
   (ecase sb-kernel::layout-id-type
     (signed-byte 127) ; predefined IDs range from -128 to 127
     (unsigned-byte 255))) ; all IDs are unsigned integers
 ;;; Conditions are numbered from -128 downward,
 ;;; but only if layout IDs can be negative.
-(defvar *condition-layout-uniqueid-counter* -128) ; decremented before use
+(defglobal *condition-layout-uniqueid-counter* -128) ; decremented before use
 
+#-sb-xc
 (defun choose-layout-id (name conditionp)
   (case name
     ((t) 0)
     (structure-object 1)
+    (sb-impl::buffer 2)
     (layout 3)
     (sb-lockless::list-node 4)
     (sb-brothertree::unary-node 5)

@@ -164,9 +164,6 @@
   ;; first.
   (start-stack () :type list)
   (end-stack () :type list)
-  ;; list of all lvars ever pushed onto the stack when control reaches
-  ;; the start of this block.
-  (stack-mess-up () :type list)
   ;; the first and last VOP in this block. If there are none, both
   ;; slots are null.
   (start-vop nil :type (or vop null))
@@ -747,9 +744,12 @@
   (targets nil :type (or null (simple-array (unsigned-byte 16) 1)))
   (optimizer nil :type (or null function (cons function symbol)))
   (optional-results nil :type list)
-  move-vop-p
+  (move-vop-p nil)
   (after-sc-selection nil :type (or null function) :read-only t)
-  gc-barrier)
+  (gc-barrier nil)
+  (translate nil)
+  ;; A bit mask of arguments for which this VOP checks the type
+  (check-type 0 :type fixnum))
 (!set-load-form-method vop-info (:xc :target) :ignore-it)
 
 (declaim (inline vop-name))
@@ -1116,6 +1116,8 @@
   ;; environment that the TN is live throughout.
   (environment nil :type (or environment null))
   ;; Used by pack-iterative
+  ;; Aliased TNs have :ALIAS there temporarily, to detected any extra
+  ;; writers.
   (vertex nil))
 
 (declaim (freeze-type tn))

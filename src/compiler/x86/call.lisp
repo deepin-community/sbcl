@@ -764,7 +764,7 @@
                                  :from (:argument 0)
                                  :to :eval)
                                 ,name))
-                 *register-arg-names* *register-arg-offsets*))
+                 register-arg-names *register-arg-offsets*))
 
      ,@(when (eq return :tail)
          '((:temporary (:sc unsigned-reg :from (:argument 1) :to (:argument 2))
@@ -791,7 +791,7 @@
                               ;; Move the necessary args to registers,
                               ;; this moves them all even if they are
                               ;; not all needed.
-               ,@(loop for name in *register-arg-names*
+               ,@(loop for name in register-arg-names
                        for index downfrom -1
                        collect `(loadw ,name new-fp ,index)))
              '((if (zerop nargs)
@@ -863,7 +863,7 @@
        ,@(unless (eq named :direct)  ;; handle-single-step-around-trap can't handle it
            `((when step-instrumenting
                (emit-single-step-test)
-               (inst jmp :eq DONE)
+               (inst jmp :e DONE)
                (inst break single-step-around-trap))))
        DONE
 
@@ -1219,7 +1219,7 @@
         (if (zerop i)
             (inst test ecx-tn ecx-tn)
             (inst cmp ecx-tn (fixnumize i)))
-        (inst jmp :eq DONE)))
+        (inst jmp :e DONE)))
 
     (inst jmp DONE)
 
@@ -1433,7 +1433,7 @@
   (:vop-var vop)
   (:generator 3
      (emit-single-step-test)
-     (inst jmp :eq DONE)
+     (inst jmp :e DONE)
      (inst break single-step-before-trap)
      DONE
      (note-this-location vop :internal-error)))

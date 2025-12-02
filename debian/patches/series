@@ -8,3 +8,4 @@ fix-chill-test.patch
 disable-genheaders.test.sh-under-autopkgtest.patch
 Exclude-Debian-specific-stage1-from-whitespace-canonicali.patch
 Enable-debug-printing-in-WASTE-HEAP-test.patch
+0011-Skip-chill.impure.lisp-tests-under-autopkgtest.patch

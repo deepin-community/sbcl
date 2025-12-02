@@ -116,10 +116,8 @@
   (sc-case dst-tn
     ((descriptor-reg any-reg)
      'move-if/t)
-    (unsigned-reg
-     'move-if/unsigned)
-    (signed-reg
-     'move-if/signed)
+    ((unsigned-reg signed-reg)
+     'move-if/word)
     ;; FIXME: Can't use CMOV with byte registers, and characters live
     ;; in such outside of unicode builds. A better solution then just
     ;; disabling MOVE-IF/CHAR should be possible, though.
@@ -145,14 +143,16 @@
         (setf not-p (not not-p)))
       (flet ((load-immediate (dst constant-tn
                               &optional (sc-reg dst))
-               (let ((encode (encode-value-if-immediate constant-tn
-                                                        (sc-is sc-reg any-reg descriptor-reg))))
-                 (if (typep encode '(unsigned-byte 31))
+               (let ((bits (immediate-tn-repr constant-tn
+                                              (sc-is sc-reg any-reg descriptor-reg))))
+                 (if (typep bits '(unsigned-byte 31))
                      (unless size
                        (setf size :dword))
                      (setf size :qword))
+                 (if (nil-relative-p bits)
+                     (move-immediate dst bits)
                  ;; Can't use ZEROIZE, since XOR will affect the flags.
-                 (inst mov dst encode))))
+                     (inst mov dst bits)))))
         (cond ((null (rest flags))
                (cond ((sc-is else immediate)
                       (load-immediate res else))
@@ -198,28 +198,27 @@
 
 (macrolet ((def-move-if (name type reg stack)
              `(define-vop (,name move-if)
-                (:args (then :scs (immediate ,@(ensure-list reg) ,stack) :to :eval
+                (:args (then :scs (immediate ,@(ensure-list reg) ,@stack) :to :eval
                              :load-if (not (or (sc-is then immediate)
-                                               (and (sc-is then ,stack)
+                                               (and (sc-is then ,@stack)
                                                     (not (location= else res))))))
-                       (else :scs (immediate ,@(ensure-list reg) ,stack) :target res
-                             :load-if (not (sc-is else immediate ,stack))))
+                       (else :scs (immediate ,@(ensure-list reg) ,@stack) :target res
+                             :load-if (not (sc-is else immediate ,@stack))))
                 (:arg-types ,type ,type)
                 (:results (res :scs ,(ensure-list reg)))
                 (:result-types ,type))))
-  (def-move-if move-if/t t (descriptor-reg any-reg) control-stack)
-  (def-move-if move-if/unsigned unsigned-num unsigned-reg unsigned-stack)
-  (def-move-if move-if/signed signed-num signed-reg signed-stack)
+  (def-move-if move-if/t t (descriptor-reg any-reg) (control-stack))
+  (def-move-if move-if/word (:or unsigned-num signed-num) (unsigned-reg signed-reg) (unsigned-stack signed-stack))
   ;; FIXME: See convert-conditional-move-p above.
   #+sb-unicode
-  (def-move-if move-if/char character character-reg character-stack)
-  (def-move-if move-if/sap system-area-pointer sap-reg sap-stack))
+  (def-move-if move-if/char character character-reg (character-stack))
+  (def-move-if move-if/sap system-area-pointer sap-reg (sap-stack)))
 
 ;;; Return a hint about how to calculate the answer from X,Y and flags.
 ;;; Return NIL to give up.
 (defun computable-from-flags-p (res x y flags)
   ;; TODO: handle unsigned-reg
-  (unless (and (singleton-p flags)
+  (unless (and (singleton-p (conditional-flags-flags flags))
                (sc-is res sb-vm::any-reg sb-vm::descriptor-reg))
     (return-from computable-from-flags-p nil))
   ;; There are plenty more algebraic transforms possible,
@@ -240,8 +239,15 @@
                 (typep (fixnumize y) '(signed-byte 32))
                 (member (abs (fixnumize (- x y))) '(2 4 8))
                 'add)))
-    (or #+sb-thread (or (and (eq x t) (eq y nil) 'boolean)
-                        (and (eq x nil) (eq y t) 'boolean))
+    ;; FIXME: the BOOLEAN case has little benefit, except that converting to
+    ;; a CMOV in the general way unnecessarily loads both inputs even when
+    ;; one of them is NIL, e.g. (lambda (x) (eql x 1)) becomes
+    ;;   CMP RSI, 2
+    ;;   MOV RDX, R12 ; <-- this is completely superfluous
+    ;;   LEA RAX, [R12-56]
+    ;;   CMOVEQ RDX, RAX
+    (or (or (and (eq x t) (eq y nil) 'boolean)
+            (and (eq x nil) (eq y t) 'boolean))
         (try-shift x y)
         (try-shift y x)
         (try-add x y))))
@@ -254,23 +260,13 @@
   (:generator 3
     (let* ((x (tn-value x-tn))
            (y (tn-value y-tn))
-           #+gs-seg (thread-tn nil)
            (hint (computable-from-flags-p res x y flags))
-           (flag (car flags)))
+           (flag (car (conditional-flags-flags flags))))
       (ecase hint
         (boolean
-         ;; FIXNUMP -> {T,NIL} could be special-cased, reducing the instruction count by
-         ;; 1 or 2 depending on whether the argument and result are in the same register.
-         ;; Best case would be "AND :dword res, arg, 1 ; MOV res, [ea]".
-         (when (eql x t)
-           ;; T is at the lower address, so to pick it out we need index=0
-           ;; which makes the condition in (IF BIT T NIL) often flipped.
-           (setq flag (negate-condition flag)))
-         (inst set flag res)
-         (inst movzx '(:byte :dword) res res)
-         (inst mov :dword res
-               (ea thread-segment-reg (ash thread-t-nil-constants-slot word-shift)
-                   thread-tn res 4)))
+         (when (eql x t) (setq flag (negate-condition flag)))
+         (load-symbol res t) ; doesn't mess up flags
+         (inst cmov flag res null-tn))
         (shl
          (when (eql x 0)
            (setq flag (negate-condition flag)))
@@ -303,12 +299,14 @@
   (:policy :fast-safe)
   (:translate eq)
   (:arg-refs x-tn-ref)
-  (:temporary (:sc unsigned-reg) temp)
+  (:temporary (:sc unsigned-reg) temp) ; TODO: add :unused-if
   (:generator 6
     (cond
       ((sc-is y constant)
        (inst cmp x (cond ((sc-is x descriptor-reg any-reg) y)
                          (t (inst mov temp y) temp))))
+      ((and (sc-is y immediate) (nil-relative-p (immediate-tn-repr y)))
+       (inst cmp x (move-immediate temp (immediate-tn-repr y))))
       ((sc-is y immediate)
        (let* ((value (encode-value-if-immediate y))
               (immediate (plausible-signed-imm32-operand-p value)))
@@ -325,14 +323,14 @@
            (when (not (types-equal-or-intersect
                        (type-difference (tn-ref-type x-tn-ref) (specifier-type 'null))
                        (specifier-type 'cons)))
-             (inst cmp :byte x (logand nil-value #xff))
+             (inst cmp :byte x null-tn)
              (return-from if-eq)))
-         (cond ((fixup-p value) ; immobile object
+         (cond ((or (fixup-p value) (tn-p value)) ; immobile object or NIL
                 (inst cmp x value))
                ((and (zerop value) (sc-is x any-reg descriptor-reg))
                 (inst test x x))
                (immediate
-                (inst cmp x immediate))
+                (emit-optimized-cmp x value temp (tn-ref-type x-tn-ref)))
                ((not (sc-is x control-stack))
                 (inst cmp x (constantize value)))
                (t
@@ -358,8 +356,6 @@
                 (:variant-cost ,cost))))
   (def fast-if-eq-character fast-char=/character 3)
   (def fast-if-eq-character/c fast-char=/character/c 2)
-  (def fast-if-eq-fixnum fast-eql/fixnum 3)
-  (def fast-if-eq-fixnum/c fast-eql-c/fixnum 2)
   (def fast-if-eq-signed fast-if-eql/signed 5)
   (def fast-if-eq-signed/c fast-if-eql-c/signed 4)
   (def fast-if-eq-unsigned fast-if-eql/unsigned 5)
@@ -371,7 +367,8 @@
             :load-if (or (not (sc-is x immediate))
                          (typep (tn-value x)
                                 '(and integer
-                                  (not (signed-byte #.(- 32 n-fixnum-tag-bits))))))))
+                                  (not (signed-byte #.(- 32 n-fixnum-tag-bits)))))
+                         (nil-relative-p (immediate-tn-repr x)))))
   (:arg-types * (:constant (unsigned-byte 16)) *)
   (:info slot)
   (:translate %instance-ref-eq)
@@ -383,6 +380,37 @@
                 (ash (+ slot instance-slots-offset) word-shift))
              instance)
          (encode-value-if-immediate x))))
+
+(define-vop (%instance-types=)
+  (:args (a :scs (descriptor-reg))
+         (b :scs (descriptor-reg)))
+  (:arg-refs args)
+  (:translate %instance-types=)
+  (:temporary (:sc unsigned-reg) temp)
+  (:conditional :e)
+  (:policy :fast-safe)
+  (:generator 1
+    (let* ((t1 (tn-ref-type args))
+           (t2 (tn-ref-type (tn-ref-across args)))
+           (check1 (not (csubtypep t1 (specifier-type 'instance))))
+           (check2 (not (csubtypep t2 (specifier-type 'instance)))))
+      ;; Since we know that at least one arg is STRUCTURE-OBJECT, then if both are INSTANCE,
+      ;; no lowtag check is required on either arg. Just read and compare layouts
+      (cond ((and check1 check2) (bug "~S on two unknowns" '%instance-types=))
+            ((or check1 check2)
+             ;; Whichever is not INSTANCE, check it. INSTANCEP has an interesting capability
+             ;; that can't be replicated, which is that if the object is known to be
+             ;; a pointer, then a bit test can reject incorrect lowtags.
+             ;; To do that, it changes the conditional flags which won't work here.
+             (inst lea :dword temp (ea (- instance-pointer-lowtag) (if check2 b a)))
+             (inst test :byte temp lowtag-mask)
+             (inst jmp :ne OUT))))
+    (multiple-value-bind (operand-size disp)
+        #+compact-instance-header (values :dword (- 4 instance-pointer-lowtag))
+        #-compact-instance-header (values :qword (- 8 instance-pointer-lowtag))
+      (inst mov operand-size temp (ea disp a))
+      (inst cmp operand-size temp (ea disp b)))
+    OUT))
 
 ;;; See comment below about ASSUMPTIONS
 (eval-when (:compile-toplevel)
@@ -416,7 +444,8 @@
     (inst cmp x y)
     (inst jmp :e done)                  ; affirmative
     (let ((x-ratiop (csubtypep (tn-ref-type x-ref) (specifier-type 'ratio)))
-          (y-ratiop (csubtypep (tn-ref-type y-ref) (specifier-type 'ratio))))
+          (y-ratiop (csubtypep (tn-ref-type y-ref) (specifier-type 'ratio)))
+          (routine 'generic-eql))
       (cond ((and x-ratiop y-ratiop)
              (move rdi x)
              (move rsi y)
@@ -439,13 +468,12 @@
              ;; This ANDing trick would be wrong if, e.g., the OTHER-POINTER tag
              ;; were #b0011 and the two inputs had lowtags #b0111 and #b1011
              ;; which when ANDed look like #b0011.
-             ;; We use :BYTE rather than :DWORD here because byte-sized
-             ;; operations on the accumulator encode more compactly.
-             (inst mov :byte rax x)
-             (inst and :byte rax y) ; now AL = #x_F only if both lowtags were #xF
-             (inst not :byte rax)  ; now AL = #x_0 only if it was #x_F
-             (inst and :byte rax #b00001111) ; will be all 0 if ok
-             (inst jmp :ne done)             ; negative
+             ;; AND EAX, ESI is more compact than AND AL, SIL
+             (inst mov :dword rax x)
+             (inst and :dword rax y) ; now AL = #x_F only if both lowtags were #xF
+             (inst not :dword rax) ; now AL = #x_0 only if it was #x_F
+             (inst test :byte rax #b00001111) ; will be all 0 if ok
+             (inst jmp :ne done)              ; negative
 
              ;; If the widetags are not the same, return false.
              ;; Using a :dword compare gets us the bignum length check almost for free
@@ -454,16 +482,17 @@
              (inst mov :dword rax (ea (- other-pointer-lowtag) x))
              (inst cmp :dword rax (ea (- other-pointer-lowtag) y))
              (inst jmp :ne done)        ; negative
-
-             ;; If not a numeric widetag, return false. See ASSUMPTIONS re widetag order.
-             (inst sub :byte rax bignum-widetag)
-             (inst cmp :byte rax (- complex-double-float-widetag bignum-widetag))
-             ;; "above" means CF=0 and ZF=0 so we're returning the right thing here
-             (inst jmp :a done)
+             (unless (or (csubtypep (tn-ref-type x-ref) (specifier-type 'number))
+                         (csubtypep (tn-ref-type y-ref) (specifier-type 'number)))
+               ;; If not a numeric widetag, return false. See ASSUMPTIONS re widetag order.
+               (inst sub :byte rax bignum-widetag)
+               (inst cmp :byte rax (- complex-double-float-widetag bignum-widetag))
+               (setf routine 'generic-eql*) ;; expects widetag-bignum in AL
+               ;; "above" means CF=0 and ZF=0 so we're returning the right thing here
+               (inst jmp :a done))
              ;; The hand-written assembly code receives args in the C arg registers.
-             ;; It also receives AL holding the biased down widetag.
              ;; Anything else it needs will be callee-saved.
              (move rdi x)               ; load the C call args
              (move rsi y)
-             (invoke-asm-routine 'call 'generic-eql vop))))
+             (invoke-asm-routine 'call routine vop))))
     DONE))

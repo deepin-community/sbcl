@@ -490,8 +490,7 @@ static void print_slots(char **slots, int count, lispobj *ptr, iochannel_t io)
 static void print_fun_or_otherptr(lispobj obj, iochannel_t io)
 {
     lispobj *ptr;
-    unsigned long header;
-    int count, type, index;
+    int index;
     char buffer[16];
 
     ptr = native_pointer(obj);
@@ -500,9 +499,11 @@ static void print_fun_or_otherptr(lispobj obj, iochannel_t io)
         return;
     }
 
-    header = *ptr++;
-    count = HeaderValue(header);
-    type = header_widetag(header);
+    lispobj header = *ptr;
+    unsigned char type = header_widetag(header);
+    // recall that object_size deliberately croaks on simple-funs
+    int count = (type != SIMPLE_FUN_WIDETAG) ? (object_size(ptr) - 1) : 0;
+    ++ptr;
 
     print_obj("header: ", header, io);
     if (!other_immediate_lowtag_p(header)) {
@@ -513,7 +514,6 @@ static void print_fun_or_otherptr(lispobj obj, iochannel_t io)
 
     switch (type) {
     case BIGNUM_WIDETAG:
-        count &= 0x7fffff;
         ptr += count;
         NEWLINE_OR_RETURN;
         fprintf(IO.out, "0x");
@@ -536,9 +536,7 @@ static void print_fun_or_otherptr(lispobj obj, iochannel_t io)
         break;
 
     case SYMBOL_WIDETAG:
-        // Only 1 byte of a symbol header conveys its size.
-        // The other bytes may be freely used by the backend.
-        print_slots(symbol_slots, count & 0xFF, ptr, io);
+        print_slots(symbol_slots, count, ptr, io);
         struct symbol* sym = (void*)(ptr - 1);
         if (symbol_function(sym) != NIL) print_obj("fun: ", symbol_function(sym), io);
 #ifdef LISP_FEATURE_SB_THREAD
@@ -664,11 +662,16 @@ static void print_fun_or_otherptr(lispobj obj, iochannel_t io)
         print_slots(code_slots, count-1, ptr, io);
         break;
 
-    case SIMPLE_FUN_WIDETAG:
-        print_obj("code: ", fun_code_tagged(ptr-1), io);
+    case SIMPLE_FUN_WIDETAG: {
+        struct simple_fun* fun = (void*)native_pointer(obj);
+        struct code* code = fun_code_header(fun);
+        print_obj("code: ", make_lispobj(code,OTHER_POINTER_LOWTAG), io);
         print_slots(simple_fun_slots,
                     sizeof simple_fun_slots/sizeof(char*)-1, ptr, io);
+        lispobj name = debug_function_name_from_pc(code, (char*)(2 + (lispobj*)fun));
+        print_obj("name: ", name, io);
         break;
+    }
 
 #ifdef RETURN_PC_WIDETAG
     case RETURN_PC_WIDETAG:
@@ -677,13 +680,11 @@ static void print_fun_or_otherptr(lispobj obj, iochannel_t io)
 #endif
 
     case CLOSURE_WIDETAG:
-        print_slots(closure_slots,
-                    count & SHORT_HEADER_MAX_WORDS, ptr, io);
+        print_slots(closure_slots, count, ptr, io);
         break;
 
     case FUNCALLABLE_INSTANCE_WIDETAG:
-        print_slots(funcallable_instance_slots,
-                    count & SHORT_HEADER_MAX_WORDS, ptr, io);
+        print_slots(funcallable_instance_slots, count, ptr, io);
         break;
 
     case VALUE_CELL_WIDETAG:
@@ -706,7 +707,7 @@ static void print_fun_or_otherptr(lispobj obj, iochannel_t io)
         break;
 
     case FDEFN_WIDETAG:
-        print_slots(fdefn_slots, 3, ptr, io);
+        print_slots(fdefn_slots, count, ptr, io);
         break;
 
     // Make some vectors printable from C, for when all hell breaks lose
@@ -766,6 +767,8 @@ static void print_obj(char *prefix, lispobj obj, iochannel_t io)
         fprintf(IO.out, "%s0x%08lx: ", prefix, (unsigned long) obj);
         if (cur_depth < brief_depth) {
             fputs(lowtag_names[type], IO.out);
+            if (obj == LISP_T)
+                fprintf(IO.out, " (T)");
             fns = print_fns;
         }
         else
